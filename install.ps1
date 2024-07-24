@@ -327,6 +327,7 @@ function Get-Arg {
 
     $envListString = $envList -join " "
 
+    Write-Host "---Arguments: $envListString"
     return $envListString
 }
 

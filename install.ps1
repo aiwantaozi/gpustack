@@ -604,7 +604,7 @@ function Setup-GPUStackService {
         }
 
         Log-Info "Starting ${serviceName} service..."
-        $null = nssm start $serviceName -y
+        $null = nssm start $serviceName
 
         # Wait for the service to start for 120 seconds.
         $startTime = Get-Date

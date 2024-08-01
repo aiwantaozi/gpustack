@@ -119,7 +119,10 @@ function Get-Arg {
                 $i++
             }
             "--system-reserved" {
-                $envList += "GPUSTACK_SYSTEM_RESERVED=`"$value`""
+                Write-Host "------reserverd"
+                
+                $escapedJsonString = $value -replace '"', '\`"'
+                $envList += "GPUSTACK_SYSTEM_RESERVED=`"$escapedJsonString`""
                 $i++
             }
             "--ssl-keyfile" {
@@ -164,6 +167,8 @@ function Get-Arg {
     $envList += "APPDATA=$env:APPDATA"
 
     $envListString = $envList -join " "
+
+    Write-Host "---envListString: $envListString"
 
     return $envListString
 }
@@ -637,6 +642,7 @@ catch {
 
 
 try {
+    $envListString = Get-Arg @args
     Check-AdminPrivilege
     Check-OS
     Check-CUDA
@@ -645,7 +651,7 @@ try {
     Install-NSSM
     Install-GPUStack
     Create-UninstallScript
-    $envListString = Get-Arg @args
+    
     Setup-GPUStackService -envListString $envListString
 }
 catch {

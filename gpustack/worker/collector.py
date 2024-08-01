@@ -276,30 +276,33 @@ class WorkerStatusCollector:
 
     def _run_fastfetch_and_parse_result(self):
         command = self._fastfetch_command()
+        result = None
+
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, check=True, encoding="utf-8"
             )
-            output = result.stdout
+
+            if result is None or result.stdout is None or result.stdout == "":
+                raise Exception(
+                    f"Output is empty, return code: {result.returncode if result else 'N/A'}"
+                )
 
             if result.returncode != 0:
                 raise Exception(f"Unexpected return code: {result.returncode}")
 
-            if output == "" or output is None:
-                raise Exception(f"Output is empty, return code: {result.returncode}")
-
         except Exception as e:
             raise Exception(
                 f"Failed to execute {command.__str__()}: {e},"
-                f" stdout: {result.stdout}, stderr: {result.stderr}"
+                f" stdout: {result.stdout if result else 'N/A'}, stderr: {result.stderr if result else 'N/A'}"
             )
 
         try:
-            parsed_json = json.loads(output)
+            parsed_json = json.loads(result.stdout)
             return parsed_json
         except Exception as e:
             raise Exception(
-                f"Failed to parse the output of {command.__str__()}: {e}, output: {output}"
+                f"Failed to parse the output of {command.__str__()}: {e}, output: {result.stdout}"
             )
 
     def _fastfetch_command(self):

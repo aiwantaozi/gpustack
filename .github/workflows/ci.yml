@@ -14,98 +14,98 @@ on:
       - "**.gif"
 
 jobs:
-  linux-macos:
-    timeout-minutes: 20
-    runs-on: ubuntu-latest
+  # linux-macos:
+  #   timeout-minutes: 20
+  #   runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-        os: [linux, darwin]
-    steps:
-      - uses: actions/checkout@v4
-        name: Checkout code
+  #   strategy:
+  #     matrix:
+  #       python-version: ["3.10", "3.11", "3.12"]
+  #       os: [linux, darwin]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       name: Checkout code
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ matrix.python-version }}
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pypoetry/artifacts
-            ~/.cache/pypoetry/repository
-            ~/.cache/pypoetry/virtualenvs
-          key: ${{ runner.os }}-poetry-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-poetry-${{ matrix.python-version }}-
+  #     - name: Cache dependencies
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #           ~/.cache/pypoetry/artifacts
+  #           ~/.cache/pypoetry/repository
+  #           ~/.cache/pypoetry/virtualenvs
+  #         key: ${{ runner.os }}-poetry-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-poetry-${{ matrix.python-version }}-
 
-      - name: Run CI build
-        run: |
-          make ci
-        env:
-          BUILD_OS: ${{ matrix.os }}
+  #     - name: Run CI build
+  #       run: |
+  #         make ci
+  #       env:
+  #         BUILD_OS: ${{ matrix.os }}
 
-      - name: Upload wheel as artifact
-        if: matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.os }}-dist
-          path: dist/*.whl
-          retention-days: 5
+  #     - name: Upload wheel as artifact
+  #       if: matrix.python-version == '3.11'
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: ${{ matrix.os }}-dist
+  #         path: dist/*.whl
+  #         retention-days: 5
 
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.CI_PYPI_API_TOKEN }}
-          PUBLISH_SOURCE: ${{ matrix.os == 'linux' && '1' || '' }}
-        run: |
-          make publish-pypi
+  #     - name: Publish to PyPI
+  #       if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'
+  #       env:
+  #         TWINE_USERNAME: __token__
+  #         TWINE_PASSWORD: ${{ secrets.CI_PYPI_API_TOKEN }}
+  #         PUBLISH_SOURCE: ${{ matrix.os == 'linux' && '1' || '' }}
+  #       run: |
+  #         make publish-pypi
 
-  windows-amd64:
-    timeout-minutes: 20
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+  # windows-amd64:
+  #   timeout-minutes: 20
+  #   runs-on: windows-latest
+  #   strategy:
+  #     matrix:
+  #       python-version: ["3.10", "3.11", "3.12"]
 
-    steps:
-      - uses: actions/checkout@v4
-        name: Checkout code
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       name: Checkout code
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ matrix.python-version }}
 
-      - name: CI
-        shell: powershell
-        run: |
-          make ci
+  #     - name: CI
+  #       shell: powershell
+  #       run: |
+  #         make ci
 
-      - name: Upload wheel as artifact
-        if: matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-dist
-          path: dist/*.whl
-          retention-days: 5
+  #     - name: Upload wheel as artifact
+  #       if: matrix.python-version == '3.11'
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-dist
+  #         path: dist/*.whl
+  #         retention-days: 5
 
-      - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'
-        shell: powershell
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.CI_PYPI_API_TOKEN }}
-        run: |
-          make publish-pypi
+  #     - name: Publish to PyPI
+  #       if: startsWith(github.ref, 'refs/tags/') && matrix.python-version == '3.11'
+  #       shell: powershell
+  #       env:
+  #         TWINE_USERNAME: __token__
+  #         TWINE_PASSWORD: ${{ secrets.CI_PYPI_API_TOKEN }}
+  #       run: |
+  #         make publish-pypi
   
   publish-docker:
-    needs:
-      - linux-macos
+    # needs:
+    #   - linux-macos
     permissions:
       contents: write
       actions: read
@@ -148,5 +148,6 @@ jobs:
           platforms: "linux/amd64,linux/arm64"
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && format('GPUSTACK_VERSION={0}', github.ref_name) || '' }}
           provenance: true
           sbom: true

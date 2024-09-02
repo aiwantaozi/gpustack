@@ -57,15 +57,18 @@ class Worker:
             username=f"system/worker/{self._worker_name}",
             password=cfg.token,
         )
+        self._serve_manager = ServeManager(
+            worker_ip=self._worker_ip,
+            worker_name=self._worker_name,
+            clientset=self._clientset,
+            cfg=cfg,
+        )
         self._worker_manager = WorkerManager(
             worker_ip=self._worker_ip,
             worker_name=self._worker_name,
             system_reserved=self._system_reserved,
             clientset=self._clientset,
-        )
-        self._serve_manager = ServeManager(
-            clientset=self._clientset,
-            cfg=cfg,
+            serve_manager=self._serve_manager,
         )
         self._exporter = MetricExporter(
             worker_ip=self._worker_ip,
@@ -117,6 +120,8 @@ class Worker:
         run_periodically_in_thread(self._serve_manager.monitor_processes, 60)
         # Watch model instances with retry.
         run_periodically_in_thread(self._serve_manager.watch_model_instances, 5)
+        # Start rpc server instances with restart.
+        run_periodically_in_thread(self._serve_manager.start_rpc_servers, 20)
 
         # Start the worker server to expose APIs.
         await self._serve_apis()

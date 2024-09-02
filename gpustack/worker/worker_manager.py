@@ -8,6 +8,7 @@ from gpustack.api.exceptions import (
 from gpustack.client import ClientSet
 from gpustack.schemas.workers import SystemReserved, Worker, WorkerStateEnum
 from gpustack.worker.collector import WorkerStatusCollector
+from gpustack.worker.serve_manager import ServeManager
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +20,14 @@ class WorkerManager:
         worker_name: str,
         system_reserved: SystemReserved,
         clientset: ClientSet,
+        serve_manager: ServeManager,
     ):
         self._registration_completed = False
         self._worker_name = worker_name
         self._worker_ip = worker_ip
         self._clientset = clientset
         self._system_reserved = system_reserved
+        self._serve_manager = serve_manager
 
     def sync_worker_status(self):
         """
@@ -41,6 +44,7 @@ class WorkerManager:
             worker_ip=self._worker_ip,
             worker_name=self._worker_name,
             clientset=self._clientset,
+            serve_manager=self._serve_manager,
         )
 
         try:
@@ -55,7 +59,9 @@ class WorkerManager:
             return
 
         current = result.items[0]
+        worker.name = current.name
         worker.id = current.id
+        worker.labels = current.labels
         worker.state = WorkerStateEnum.READY
         worker.system_reserved = self._system_reserved
 
@@ -96,6 +102,7 @@ class WorkerManager:
                 worker_ip=self._worker_ip,
                 worker_name=self._worker_name,
                 clientset=self._clientset,
+                serve_manager=self._serve_manager,
             )
             worker = collector.collect()
 

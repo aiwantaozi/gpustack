@@ -13,6 +13,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
 from gpustack.utils import network
+from gpustack.utils.signal import signal_handler
 from gpustack.worker.inference_server import InferenceServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
@@ -21,33 +22,33 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
 )
 from gpustack.server.bus import Event, EventType
+from gpustack.worker.rpc_server import RPCServer, RPCServerProcessInfo
 
 
 logger = logging.getLogger(__name__)
 
 
-def signal_handler(signum, frame):
-    pid = os.getpid()
-    try:
-        parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-    children = parent.children(recursive=True)
-    for process in children:
-        process.send_signal(signum)
-    os._exit(0)
-
-
 class ServeManager:
-    def __init__(self, clientset: ClientSet, cfg: Config):
+    def __init__(
+        self,
+        worker_ip: str,
+        worker_name: str,
+        clientset: ClientSet,
+        cfg: Config,
+    ):
+        self._worker_ip = worker_ip
+        self._worker_name = worker_name
         self._hostname = socket.gethostname()
         self._config = cfg
         self._serve_log_dir = f"{cfg.log_dir}/serve"
+        self._rpc_server_log_dir = f"{cfg.log_dir}/rpc_server"
         self._serving_model_instances: Dict[str, multiprocessing.Process] = {}
         self._clientset = clientset
         self._cache_dir = os.path.join(cfg.data_dir, "cache")
+        self._rpc_servers: Dict[int, RPCServerProcessInfo] = {}
 
         os.makedirs(self._serve_log_dir, exist_ok=True)
+        os.makedirs(self._rpc_server_log_dir, exist_ok=True)
 
     def _get_current_worker_id(self):
         for _ in range(3):
@@ -211,3 +212,64 @@ class ServeManager:
                 except Exception:
                     logger.error(f"Failed to update model instance {id} state.")
                 self._serving_model_instances.pop(id)
+
+    def start_rpc_servers(self):
+        try:
+            self._start_rpc_servers()
+        except Exception as e:
+            logger.error(f"Failed to start rpc servers: {e}")
+            return
+
+    def _start_rpc_servers(self):
+        from gpustack.worker.collector import WorkerStatusCollector
+
+        try:
+            collector = WorkerStatusCollector(self._worker_ip, self._worker_name)
+            gpu_devices = collector.collect_gpu_devices()
+        except Exception as e:
+            logger.error(f"Failed to get GPU devices while start rpc servers: {e}")
+            return
+
+        for gpu_device in gpu_devices:
+            if gpu_device.index is None:
+                logger.warning(
+                    f"GPU device {gpu_device.name} does not have an index. Skipping start rpc server."
+                )
+                continue
+
+            current = self._rpc_servers.get(gpu_device.index)
+            if current:
+                if current.process.is_alive():
+                    continue
+
+                pid = current.process.pid
+                logger.warning(
+                    f"RPC server for GPU {gpu_device.index} is not running, pid {pid}, restarting."
+                )
+                try:
+                    self._terminate_process_tree(pid)
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception as e:
+                    logger.error(f"Failed to terminate process {pid}: {e}")
+                self._rpc_servers.pop(gpu_device.index)
+
+            log_file_path = f"{self._rpc_server_log_dir}/gpu-{gpu_device.index}.log"
+            port = network.get_free_port(start=50000, end=51024)
+            process = multiprocessing.Process(
+                target=RPCServer.start,
+                args=(port, gpu_device.index, log_file_path),
+            )
+
+            process.daemon = True
+            process.start()
+
+            self._rpc_servers[gpu_device.index] = RPCServerProcessInfo(
+                process=process, port=port, gpu_index=gpu_device.index
+            )
+            logger.info(
+                f"Started RPC server for GPU {gpu_device.index} on port {port}, pid {process.pid}"
+            )
+
+    def get_rpc_servers(self) -> Dict[int, RPCServerProcessInfo]:
+        return self._rpc_servers

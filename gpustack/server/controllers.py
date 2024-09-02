@@ -2,6 +2,8 @@ import logging
 import random
 import string
 from sqlmodel.ext.asyncio.session import AsyncSession
+from gpustack.config.config import Config
+from gpustack.scheduler.scheduler import Scheduler
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
@@ -17,8 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 class ModelController:
-    def __init__(self):
+    def __init__(self, cfg: Config):
         self._engine = get_engine()
+        self._config = cfg
+
         pass
 
     async def start(self):
@@ -37,14 +41,16 @@ class ModelController:
         model: Model = event.data
         try:
             async with AsyncSession(self._engine) as session:
-                await sync_replicas(session, model)
+                await sync_replicas(session, model, self._config)
         except Exception as e:
             logger.error(f"Failed to reconcile model {model.name}: {e}")
 
 
 class ModelInstanceController:
-    def __init__(self):
+    def __init__(self, cfg: Config):
         self._engine = get_engine()
+        self._config = cfg
+
         pass
 
     async def start(self):
@@ -68,7 +74,7 @@ class ModelInstanceController:
                     return
 
                 if event.type == EventType.DELETED:
-                    await sync_replicas(session, model)
+                    await sync_replicas(session, model, self._config)
 
                 await model.refresh(session)
                 await sync_ready_replicas(session, model)
@@ -79,7 +85,7 @@ class ModelInstanceController:
             )
 
 
-async def sync_replicas(session: AsyncSession, model: Model):
+async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
     """
     Synchronize the replicas.
     """
@@ -107,9 +113,15 @@ async def sync_replicas(session: AsyncSession, model: Model):
             logger.debug(f"Created model instance for model {model.name}")
 
     elif len(instances) > model.replicas:
-        for instance in instances[model.replicas :]:
-            await instance.delete(session)
-            logger.debug(f"Deleted model instance {instance.name}")
+        scheduler = Scheduler(cfg)
+        candidates = await scheduler.find_scale_down_candidates(model)
+
+        scale_down_count = len(candidates) - model.replicas
+        if scale_down_count > 0:
+            for candidate in candidates[:scale_down_count]:
+                instance = candidate.instance
+                await instance.delete(session)
+                logger.debug(f"Deleted model instance {instance.name}")
 
 
 async def sync_ready_replicas(session: AsyncSession, model: Model):

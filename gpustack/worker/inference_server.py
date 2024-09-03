@@ -117,7 +117,12 @@ class InferenceServer:
             sys.exit(1)
 
     def start(self):  # noqa: C901
-        compute_mode = "gpu" if self._model_instance.gpu_indexes else "cpu"
+        compute_mode = (
+            "gpu"
+            if self._model_instance.gpu_indexes
+            and len(self._model_instance.gpu_indexes) > 0
+            else "cpu"
+        )
 
         command_path = pkg_resources.files(
             "gpustack.third_party.bin.llama-box"

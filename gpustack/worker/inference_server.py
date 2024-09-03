@@ -293,7 +293,7 @@ def get_cuda_env(gpu_indexes: List[int] = None):
 
     if system == "Darwin":
         return None
-    elif system == "Linux" or system == "Windows" and gpu_indexes:
+    elif (system == "Linux" or system == "Windows") and gpu_indexes:
         return {"CUDA_VISIBLE_DEVICES": ",".join([str(i) for i in gpu_indexes])}
     else:
         # TODO: support more.

@@ -77,8 +77,9 @@ async def test_label_matching_policy():
 
     labels = {"os": "Darwin"}
     m = new_model(1, "test", 1, worker_selector=labels)
+    mi = new_model_instance(1, "test", 1)
 
-    policy = LabelMatchingPolicy(model=m)
+    policy = LabelMatchingPolicy(m, mi)
     candidates = await policy.filter(workers)
 
     assert len(candidates) == 1
@@ -360,19 +361,19 @@ async def test_schedule_to_single_worker_multi_gpu_with_binpack_spread(config):
         expected_candidates = [
             {
                 "gpu_indexes": [0, 1, 2],
-                "score": 88.33333333333333,
+                "score": 85.0,
             },
             {
                 "gpu_indexes": [0, 1, 3],
-                "score": 88.33333333333333,
+                "score": 85.0,
             },
             {
                 "gpu_indexes": [0, 2, 3],
-                "score": 86.66666666666667,
+                "score": 84.0,
             },
             {
                 "gpu_indexes": [1, 2, 3],
-                "score": 86.66666666666667,
+                "score": 84.0,
             },
         ]
 

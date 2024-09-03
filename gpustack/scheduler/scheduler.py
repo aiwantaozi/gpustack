@@ -204,7 +204,7 @@ class Scheduler:
         estimate: estimate = None,
     ) -> ModelInstanceScheduleCandidate:
         try:
-            label_matching_policy = LabelMatchingPolicy(model)
+            label_matching_policy = LabelMatchingPolicy(model, instance)
             workers = await label_matching_policy.filter(workers)
 
             resource_fit_policy = ResourceFitPolicy(
@@ -252,7 +252,7 @@ class Scheduler:
                     copy.deepcopy(candidates)
                 )
 
-                offload_layer_policy = OffloadLayerPolicy()
+                offload_layer_policy = OffloadLayerPolicy(model)
                 offload_candidates = await offload_layer_policy.score(
                     copy.deepcopy(candidates)
                 )
@@ -366,6 +366,9 @@ class Scheduler:
         Args:
             candidates: List of ModelInstanceScheduleCandidate.
         """
+
+        logger.debug(f"Pick highest score candidate from {len(candidates)} candidates")
+
         if len(candidates) == 0:
             return None
 

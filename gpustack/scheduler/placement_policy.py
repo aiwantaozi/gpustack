@@ -1,6 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
+import logging
 from typing import List, Optional
 
 from gpustack.scheduler.policy import Allocatable, ModelInstanceScheduleCandidate
@@ -16,6 +17,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 MaxScore = 100
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,6 +65,15 @@ class PlacementPolicy:
         """
         Score the candidate with placement strategy.
         """
+
+        logger.debug(
+            f"model {self._model.name} {self._scale_type}, score canidates with placement policy"
+            + (
+                f", model_instance: {self._model_instance.name}"
+                if self._model_instance
+                else ""
+            )
+        )
 
         if self._model.placement_strategy == PlacementStrategyEnum.SPREAD:
             return await self.score_spread(candidates)
@@ -189,8 +201,11 @@ class PlacementPolicy:
             else:
                 update_count(model_instance.worker_id, None, is_current_model)
 
-            if model_instance.distributes_servers:
-                for rpc_server in model_instance.distributes_servers:
+            if (
+                model_instance.distributes_servers
+                and model_instance.distributes_servers.rpc_servers
+            ):
+                for rpc_server in model_instance.distributes_servers.rpc_servers:
                     update_count(
                         rpc_server.worker_id, rpc_server.gpu_index, is_current_model
                     )
@@ -211,14 +226,15 @@ class PlacementPolicy:
             for gpu_index in instance_count_map.keys()
         )
 
+        worker_gpu_count = len(candidate.worker.status.gpu_devices)
+        each_gpu_max_score = 10 / (worker_gpu_count + 1)
+
         if (
             worker_current_model_instance_count == 0
             and worker_other_model_instance_count > 0
         ):
             # level 2: 90 < score < 100, only have other model's instances
             score = 90
-
-            each_gpu_max_score = 10 / len(candidate.gpu_indexes)
             for gpu_index in candidate.gpu_indexes:
                 if gpu_index not in instance_count_map:
                     score += each_gpu_max_score / 1
@@ -233,7 +249,6 @@ class PlacementPolicy:
             # level 3: 80 < score < 90, only have current model's instances
             score = 80
 
-            each_gpu_max_score = 10 / len(candidate.gpu_indexes)
             for gpu_index in candidate.gpu_indexes:
                 if gpu_index not in instance_count_map:
                     score += each_gpu_max_score / 1
@@ -245,7 +260,6 @@ class PlacementPolicy:
             # level 4: 70 < score < 80, have both current model's instances and other model's instances
             score = 70
 
-            each_gpu_max_score = 10 / len(candidate.gpu_indexes)
             for gpu_index in candidate.gpu_indexes:
                 if gpu_index not in instance_count_map:
                     score += each_gpu_max_score / 1

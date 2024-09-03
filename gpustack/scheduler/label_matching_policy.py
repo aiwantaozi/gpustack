@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, List
-from gpustack.schemas.models import Model
+from gpustack.schemas.models import Model, ModelInstance
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_engine
 
@@ -8,8 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 class LabelMatchingPolicy:
-    def __init__(self, model: Model):
-        self.model = model
+    def __init__(self, model: Model, model_instance: ModelInstance):
+        self._model = model
+        self._model_instance = model_instance
         self._engine = get_engine()
 
     async def filter(self, workers: List[Worker]) -> List[Worker]:
@@ -17,12 +18,16 @@ class LabelMatchingPolicy:
         Filter the workers with the worker selector.
         """
 
-        if self.model.worker_selector is None:
+        logger.debug(
+            f"model {self._model.name}, filter canidates with label matching policy, instance {self._model_instance.name}"
+        )
+
+        if self._model.worker_selector is None:
             return workers
 
         candidates = []
         for worker in workers:
-            if label_matching(self.model.worker_selector, worker.labels):
+            if label_matching(self._model.worker_selector, worker.labels):
                 candidates.append(worker)
         return candidates
 

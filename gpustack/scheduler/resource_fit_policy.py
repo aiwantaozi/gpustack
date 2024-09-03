@@ -75,7 +75,10 @@ class ResourceFitPolicy:
             ):
                 continue
 
-            logger.debug(f"filter candidates with {candidate_func.__name__}")
+            logger.debug(
+                f"model {self._model.name}, filter candidates with resource fit policy: {candidate_func.__name__}, instance {self._model_instance.name}"
+            )
+
             candidates = await candidate_func(workers)
             if candidates:
                 return candidates
@@ -913,8 +916,11 @@ async def get_worker_allocatable_resource(  # noqa: C901
         if model_instance.gpu_indexes:
             update_allocated_vram(allocated, model_instance.computed_resource_claim)
 
-        if model_instance.distributes_servers:
-            for rpc_server in model_instance.distributes_servers:
+        if (
+            model_instance.distributes_servers
+            and model_instance.distributes_servers.rpc_servers
+        ):
+            for rpc_server in model_instance.distributes_servers.rpc_servers:
                 if rpc_server.computed_resource_claim:
                     # rpc server only consider the vram
                     update_allocated_vram(allocated, rpc_server.computed_resource_claim)

@@ -129,7 +129,10 @@ class InferenceServer:
             layers = claim.get("offload_layers")
 
         tensor_split = []
-        if len(self._model_instance.gpu_indexes) > 1:
+        if (
+            self._model_instance.gpu_indexes
+            and len(self._model_instance.gpu_indexes) > 1
+        ):
             vram_claims = claim.get("vram").values()
             tensor_split = vram_claims
 
@@ -175,7 +178,9 @@ class InferenceServer:
         env = get_cuda_env(self._model_instance.gpu_indexes)
         try:
             logger.info("Starting llama-box server")
-            logger.debug(f"Run llama-box with arguments: {' '.join(arguments)}")
+            logger.debug(
+                f"Run llama-box: {command_path} with arguments: {' '.join(arguments)}"
+            )
             subprocess.run(
                 [command_path] + arguments,
                 stdout=sys.stdout,
@@ -283,7 +288,7 @@ def get_cuda_env(gpu_indexes: List[int] = None):
 
     if system == "Darwin":
         return None
-    elif system == "Linux" or system == "Windows":
+    elif system == "Linux" or system == "Windows" and gpu_indexes:
         return {"CUDA_VISIBLE_DEVICES": ",".join([str(i) for i in gpu_indexes])}
     else:
         # TODO: support more.

@@ -963,7 +963,10 @@ def new_model(
     **kargs,
 ) -> Model:
     worker_selector = kargs.get("worker_selector")
-    partial_offload = kargs.get("partial_offload")
+    partial_offload = kargs.get("partial_offload", True)
+    distributed_inference_across_workers = kargs.get(
+        "distributed_inference_across_workers", True
+    )
     return Model(
         id=id,
         name=name,
@@ -973,4 +976,5 @@ def new_model(
         placement_strategy=placement_strategy,
         worker_selector=worker_selector,
         partial_offload=partial_offload,
+        distributed_inference_across_workers=distributed_inference_across_workers,
     )

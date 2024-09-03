@@ -53,6 +53,7 @@ class ModelBase(SQLModel, ModelSource):
     embedding_only: bool = False
     placement_strategy: PlacementStrategyEnum = PlacementStrategyEnum.SPREAD
     partial_offload: bool = True
+    distributed_inference_across_workers: bool = True
     worker_selector: Optional[Dict[str, str]] = Field(
         sa_column=Column(JSON), default={}
     )

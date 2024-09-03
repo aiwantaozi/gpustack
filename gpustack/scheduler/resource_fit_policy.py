@@ -75,6 +75,11 @@ class ResourceFitPolicy:
             ):
                 continue
 
+            if (
+                not self._model.distributed_inference_across_workers
+            ) and candidate_func == self.find_multi_worker_multi_gpu_candidates:
+                continue
+
             logger.debug(
                 f"model {self._model.name}, filter candidates with resource fit policy: {candidate_func.__name__}, instance {self._model_instance.name}"
             )

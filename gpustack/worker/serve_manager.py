@@ -13,6 +13,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
 from gpustack.utils import network
+from gpustack.utils.signal import signal_handler
 from gpustack.worker.inference_server import InferenceServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
@@ -21,33 +22,33 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
 )
 from gpustack.server.bus import Event, EventType
+from gpustack.worker.rpc_server import RPCServerProcessInfo
 
 
 logger = logging.getLogger(__name__)
 
 
-def signal_handler(signum, frame):
-    pid = os.getpid()
-    try:
-        parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-    children = parent.children(recursive=True)
-    for process in children:
-        process.send_signal(signum)
-    os._exit(0)
-
-
 class ServeManager:
-    def __init__(self, clientset: ClientSet, cfg: Config):
+    def __init__(
+        self,
+        worker_ip: str,
+        worker_name: str,
+        clientset: ClientSet,
+        cfg: Config,
+    ):
+        self._worker_ip = worker_ip
+        self._worker_name = worker_name
         self._hostname = socket.gethostname()
         self._config = cfg
         self._serve_log_dir = f"{cfg.log_dir}/serve"
+        self._rpc_server_log_dir = f"{cfg.log_dir}/rpc_server"
         self._serving_model_instances: Dict[str, multiprocessing.Process] = {}
         self._clientset = clientset
         self._cache_dir = os.path.join(cfg.data_dir, "cache")
+        self._rpc_servers: Dict[int, RPCServerProcessInfo] = {}
 
         os.makedirs(self._serve_log_dir, exist_ok=True)
+        os.makedirs(self._rpc_server_log_dir, exist_ok=True)
 
     def _get_current_worker_id(self):
         for _ in range(3):

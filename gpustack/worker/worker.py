@@ -57,13 +57,16 @@ class Worker:
             username=f"system/worker/{self._worker_name}",
             password=cfg.token,
         )
+        self._serve_manager = ServeManager(
+            worker_ip=self._worker_ip,
+            worker_name=self._worker_name,
+            clientset=self._clientset,
+            cfg=cfg,
+        )
         self._worker_manager = WorkerManager(
             worker_ip=self._worker_ip,
             worker_name=self._worker_name,
             system_reserved=self._system_reserved,
-            clientset=self._clientset,
-        )
-        self._serve_manager = ServeManager(
             clientset=self._clientset,
             cfg=cfg,
         )
@@ -113,6 +116,8 @@ class Worker:
 
         # Report the worker node status to the server every 30 seconds.
         run_periodically_in_thread(self._worker_manager.sync_worker_status, 30)
+        # Start rpc server instances with restart.
+        run_periodically_in_thread(self._worker_manager.start_rpc_servers, 20)
         # Monitor the processes of model instances every 60 seconds.
         run_periodically_in_thread(self._serve_manager.monitor_processes, 60)
         # Watch model instances with retry.

@@ -153,8 +153,9 @@ class WorkerManager:
             detector_factory = (
                 DetectorFactory(detector, {}) if detector else DetectorFactory()
             )
-
+            logger.info("----rpc before detect_gpus.")
             gpu_devices = detector_factory.detect_gpus()
+            logger.info("----rpc after detect_gpus.")
         except Exception as e:
             logger.error(f"Failed to get GPU devices while start rpc servers: {e}")
             return

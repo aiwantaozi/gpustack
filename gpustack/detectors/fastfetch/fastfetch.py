@@ -28,15 +28,8 @@ binary_lock = threading.Lock()
 
 class Fastfetch(GPUDetector):
     def is_available(self) -> bool:
-        try:
-            self._run_command(
-                self._command_version(), parse_output=False, check_return_code_only=True
-            )
-
-            return True
-        except Exception as e:
-            logger.warning(f"Fastfetch is not available: {e}")
-            return False
+        # built in tool.
+        return True
 
     def gather_gpu_vendor_info(self) -> List[str]:
         gpu_devices = self.gather_gpu_info()
@@ -306,14 +299,6 @@ class Fastfetch(GPUDetector):
             "gpustack.third_party.bin.fastfetch", command
         ) as executable_path:
             return str(executable_path)
-
-    def _command_version(self):
-        executable_path = self._command_executable_path()
-        executable_command = [
-            executable_path,
-            "--version",
-        ]
-        return executable_command
 
     def _command_gather_gpu(self):
         with pkg_resources.path(

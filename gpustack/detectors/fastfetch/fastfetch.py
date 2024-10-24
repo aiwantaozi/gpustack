@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 class Fastfetch(GPUDetector):
     def is_available(self) -> bool:
         try:
-            self._run_command(self._command_version(), parse_output=False)
+            self._run_command(
+                self._command_version(), parse_output=False, check_return_code_only=True
+            )
+
             return True
         except Exception as e:
             logger.warning(f"Fastfetch is not available: {e}")
@@ -233,34 +236,61 @@ class Fastfetch(GPUDetector):
 
         return devices
 
-    def _run_command(self, command, parse_output=True):
+    def _run_command(  # noqa: C901
+        self, command, parse_output=True, check_return_code_only=False
+    ):
+        if check_return_code_only:
+            try:
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+                return None
+            except Exception as e:
+                raise Exception(
+                    f"Failed to execute {command}, return code: {result.returncode}, error: {e}"
+                )
+
         try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, check=True, encoding="utf-8"
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
             )
-            output = result.stdout
+            stdout, stderr = proc.communicate(timeout=5)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, command, output=stdout, stderr=stderr
+                )
 
-            if result.returncode != 0:
-                raise Exception(f"Unexpected return code: {result.returncode}")
+            if stdout == "" or stdout is None:
+                raise Exception(f"Output is empty, return code: {proc.returncode}")
 
-            if output == "" or output is None:
-                raise Exception(f"Output is empty, return code: {result.returncode}")
+        except subprocess.TimeoutExpired as e:
+            proc.kill()
+            proc.communicate()
+            raise Exception(f"Command {command} timed out, error: {e}")
 
         except Exception as e:
+            proc.terminate()
+            proc.communicate()
             raise Exception(
-                f"Failed to execute {command}: {e},"
-                f" stdout: {result.stdout}, stderr: {result.stderr}"
+                f"Failed to execute {command}, stdout: {stdout}, stderr: {stderr}, error: {e}"
             )
 
         if not parse_output:
-            return output
+            return stdout
 
         try:
-            parsed_json = json.loads(output)
+            parsed_json = json.loads(stdout)
             return parsed_json
         except Exception as e:
             raise Exception(
-                f"Failed to parse the output of {command}: {e}, output: {output}"
+                f"Failed to parse the output of {command}, stdout: {stdout}, error: {e}"
             )
 
     def _command_executable_path(self):

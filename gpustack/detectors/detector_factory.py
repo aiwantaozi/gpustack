@@ -19,8 +19,6 @@ class DetectorFactory:
         gpu_detectors: Dict[VendorEnum, GPUDetector] = None,
     ):
         fastfetch = Fastfetch()
-        self._check_detector_availability(fastfetch, "default detector")
-
         self.system_info_detector = fastfetch
         self.gpu_vendor_detector = fastfetch
         self.default_gpu_detector = default_gpu_detector or fastfetch
@@ -34,11 +32,22 @@ class DetectorFactory:
                 VendorEnum.MTHREADS: fastfetch,
             }
 
+        self.system_info_detector_available = None
+        self.gpu_vendor_detector_available = None
+
     def detect_gpus(self) -> GPUDevicesInfo:
         gpu_devices = []
         if len(self.gpu_detectors) == 0:
             gpu_devices.extend(self.default_gpu_detector.gather_gpu_info())
         else:
+            if self.gpu_vendor_detector_available is None:
+                self.gpu_vendor_detector_available = (
+                    self.gpu_vendor_detector.is_available()
+                )
+
+            if not self.gpu_vendor_detector_available:
+                raise Exception("GPU vendor detector is not available")
+
             vendors = self.gpu_vendor_detector.gather_gpu_vendor_info()
             filtered_vendors = [
                 v
@@ -53,6 +62,14 @@ class DetectorFactory:
         return gpu_devices
 
     def detect_system_info(self) -> SystemInfo:
+        if self.system_info_detector_available is None:
+            self.system_info_detector_available = (
+                self.system_info_detector.is_available()
+            )
+
+        if not self.system_info_detector_available:
+            raise Exception("System info detector is not available")
+
         return self.system_info_detector.gather_system_info()
 
     def _filter_gpu_devices(

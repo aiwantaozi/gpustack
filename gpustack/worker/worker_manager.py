@@ -45,6 +45,8 @@ class WorkerManager:
         os.makedirs(self._rpc_server_log_dir, exist_ok=True)
 
     def sync_worker_status(self):
+        logger.info("----before sync_worker_status")
+
         """
         Should be called periodically to sync the worker node status with the server.
         It registers the worker node with the server if necessary.
@@ -53,6 +55,7 @@ class WorkerManager:
         # Register the worker node with the server.
         self.register_with_server()
         self._update_worker_status()
+        logger.info("----finished sync_worker_status")
 
     def _update_worker_status(self):
         collector = WorkerStatusCollector(
@@ -150,8 +153,9 @@ class WorkerManager:
             detector_factory = (
                 DetectorFactory(detector, {}) if detector else DetectorFactory()
             )
-
+            logger.info("----rpc before detect_gpus.")
             gpu_devices = detector_factory.detect_gpus()
+            logger.info("----rpc after detect_gpus.")
         except Exception as e:
             logger.error(f"Failed to get GPU devices while start rpc servers: {e}")
             return

@@ -38,8 +38,12 @@ class Fastfetch(GPUDetector):
         return vendors
 
     def gather_gpu_info(self) -> GPUDevicesInfo:
+        logger.info("----before gather_gpu_info.")
         command = self._command_gather_gpu()
+        logger.info(f"----before gather_gpu_info, command: {command}.")
+
         results = self._run_command(command)
+        logger.info(f"----gather_gpu_info, after run command: {command}.")
 
         for result in results:
             typ = result.get("type")
@@ -51,10 +55,13 @@ class Fastfetch(GPUDetector):
             if typ == "GPU":
                 gpu_devices = self._decode_gpu_devices(r)
                 return gpu_devices
+        logger.info("----finished gather_gpu_info.")
 
     def gather_system_info(self) -> SystemInfo:  # noqa: C901
+        logger.info("----before gather_system_info.")
         command = self._command_gather_system()
         results = self._run_command(command)
+        logger.info("---- gather_system_info, after run command {command}.")
 
         system_info = SystemInfo()
         for result in results:
@@ -141,6 +148,7 @@ class Fastfetch(GPUDetector):
                     )
 
                 system_info.filesystem = mountpoints
+        logger.info("----finished gather_system_info.")
 
         return system_info
 

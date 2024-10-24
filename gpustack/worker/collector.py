@@ -40,6 +40,7 @@ class WorkerStatusCollector:
     def collect(self) -> Worker:  # noqa: C901
         """Collect worker status information."""
 
+        logger.info("----begin collect.")
         system_info = self._detector_factory.detect_system_info()
         gpu_devices = self._detector_factory.detect_gpus()
 
@@ -66,7 +67,7 @@ class WorkerStatusCollector:
                     pid=process.process.pid, port=process.port, gpu_index=gpu_index
                 )
             status.rpc_servers = rps_server
-
+        logger.info("----finished collect.")
         return Worker(
             name=self._worker_name,
             hostname=self._hostname,

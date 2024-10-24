@@ -2,6 +2,7 @@ import json
 import logging
 import platform
 import subprocess
+import threading
 from typing import List
 from gpustack.detectors.base import GPUDetector
 from gpustack.schemas.workers import (
@@ -21,6 +22,8 @@ from gpustack.schemas.workers import (
 from gpustack.utils.compat_importlib import pkg_resources
 
 logger = logging.getLogger(__name__)
+
+binary_lock = threading.Lock()
 
 
 class Fastfetch(GPUDetector):
@@ -239,59 +242,60 @@ class Fastfetch(GPUDetector):
     def _run_command(  # noqa: C901
         self, command, parse_output=True, check_return_code_only=False
     ):
-        if check_return_code_only:
+        with binary_lock:
+            if check_return_code_only:
+                try:
+                    result = subprocess.run(
+                        command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True,
+                    )
+                    return None
+                except Exception as e:
+                    raise Exception(
+                        f"Failed to execute {command}, return code: {result.returncode}, error: {e}"
+                    )
+
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
                 )
-                return None
+                stdout, stderr = proc.communicate(timeout=5)
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, command, output=stdout, stderr=stderr
+                    )
+
+                if stdout == "" or stdout is None:
+                    raise Exception(f"Output is empty, return code: {proc.returncode}")
+
+            except subprocess.TimeoutExpired as e:
+                proc.kill()
+                proc.communicate()
+                raise Exception(f"Command {command} timed out, error: {e}")
+
+            except Exception as e:
+                proc.terminate()
+                proc.communicate()
+                raise Exception(
+                    f"Failed to execute {command}, stdout: {stdout}, stderr: {stderr}, error: {e}"
+                )
+
+            if not parse_output:
+                return stdout
+
+            try:
+                parsed_json = json.loads(stdout)
+                return parsed_json
             except Exception as e:
                 raise Exception(
-                    f"Failed to execute {command}, return code: {result.returncode}, error: {e}"
+                    f"Failed to parse the output of {command}, stdout: {stdout}, error: {e}"
                 )
-
-        try:
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-            )
-            stdout, stderr = proc.communicate(timeout=5)
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    proc.returncode, command, output=stdout, stderr=stderr
-                )
-
-            if stdout == "" or stdout is None:
-                raise Exception(f"Output is empty, return code: {proc.returncode}")
-
-        except subprocess.TimeoutExpired as e:
-            proc.kill()
-            proc.communicate()
-            raise Exception(f"Command {command} timed out, error: {e}")
-
-        except Exception as e:
-            proc.terminate()
-            proc.communicate()
-            raise Exception(
-                f"Failed to execute {command}, stdout: {stdout}, stderr: {stderr}, error: {e}"
-            )
-
-        if not parse_output:
-            return stdout
-
-        try:
-            parsed_json = json.loads(stdout)
-            return parsed_json
-        except Exception as e:
-            raise Exception(
-                f"Failed to parse the output of {command}, stdout: {stdout}, error: {e}"
-            )
 
     def _command_executable_path(self):
         command = "fastfetch"

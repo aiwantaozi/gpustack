@@ -3,14 +3,16 @@
 # https://github.com/ROCm/rocm-examples/blob/rocm-6.3.0/Dockerfiles/hip-libraries-rocm-ubuntu.Dockerfile
 ARG UBUNTU_VERSION=22.04
 ARG ROCM_VERSION=6.2.4
-ARG BASE_IMAGE=rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}
+
+ARG ROCM_BINARY_IMAGE=rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}-complete
+ARG BASE_IMAGE=ubuntu:${UBUNTU_VERSION}
 
 # Default ROCm ARCHes to build vLLM for.
 ARG PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1100"
 
 # Whether to install CK-based flash-attention
 # If 0, will not install flash-attention
-ARG BUILD_FA="1"
+ARG BUILD_FA="0"
 ARG FA_GFX_ARCHS="gfx90a;gfx942"
 ARG FA_BRANCH="3cea2fb"
 
@@ -18,38 +20,43 @@ ARG FA_BRANCH="3cea2fb"
 ARG BUILD_TRITON="1"
 ARG TRITON_BRANCH="e192dba"
 
+### Rocm binary image build stage
+FROM ${ROCM_BINARY_IMAGE} as rocm_binary
+
 ### Base image build stage
-FROM $BASE_IMAGE AS base
+FROM ${BASE_IMAGE} as base
 
 # Import arg(s) defined before this build stage
 ARG PYTORCH_ROCM_ARCH
+ARG ROCM_VERSION
+
+COPY --from=rocm_binary /opt/rocm-${ROCM_VERSION} /opt/rocm-${ROCM_VERSION}
+RUN ln -s /opt/rocm-${ROCM_VERSION} /opt/rocm
 
 # Install some basic utilities
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv \
-    g++ \
-    tzdata \
-    curl \
-    ca-certificates \
+ARG APT_PREF
+RUN echo "$APT_PREF" > /etc/apt/preferences.d/rocm-pin-600
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libnuma-dev gnupg \
+  && curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | apt-key add - \
+  && printf "deb [arch=amd64] https://repo.radeon.com/rocm/apt/$ROCM_VERSION/ jammy main" | tee /etc/apt/sources.list.d/rocm.list \
+  && printf "deb [arch=amd64] https://repo.radeon.com/amdgpu/$ROCM_VERSION/ubuntu jammy main" | tee /etc/apt/sources.list.d/amdgpu.list \
+  && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     sudo \
+    libelf1 \
+    kmod \
+    file \
     git \
     bzip2 \
     libx11-6 \
-    build-essential \
     wget \
     unzip \
     tmux \
     ccache \
-    miopen-hip \
-    rocrand-dev hiprand-dev \
-    rocprim-dev hipcub-dev \
-    rocblas-dev hipblas-dev hipblaslt \
-    rocsolver-dev hipsolver-dev \
-    rocfft-dev hipfft-dev hipsparse \
-    rocsparse-dev \
-    rocthrust-dev \
     rocm-smi-lib \
+    amd-smi-lib \
+    build-essential \
+    clang \
+    python3-dev python3-pip \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # When launching the container, mount the code directory to /vllm-workspace
@@ -77,19 +84,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Set environment variables
 ENV LLVM_SYMBOLIZER_PATH=/opt/rocm/llvm/bin/llvm-symbolizer
-ENV PATH=$PATH:/opt/rocm/bin:/libtorch/bin:
+ENV PATH=$PATH:/opt/rocm/bin:/opt/rocm-${ROCM_VERSION}/bin:/libtorch/bin:
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rocm/lib/:/libtorch/lib:
 ENV CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/libtorch/include:/libtorch/include/torch/csrc/api/include/:/opt/rocm/include/:
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV CCACHE_DIR=/root/.cache/ccache
 
-
-### AMD-SMI build stage
-FROM base AS build_amdsmi
-# Build amdsmi wheel always
-RUN cd /opt/rocm/share/amd_smi \
-    && python3 -m pip wheel . --wheel-dir=/install
-
+RUN echo $PATH
+RUN echo $(which python3)
 
 ### Flash-Attention wheel build stage
 FROM base AS build_fa
@@ -105,7 +107,9 @@ RUN --mount=type=cache,target=${CCACHE_DIR} \
         && cd flash-attention \
         && git checkout "${FA_BRANCH}" \
         && git submodule update --init \
-        && GPU_ARCHS="${FA_GFX_ARCHS}" python3 setup.py bdist_wheel --dist-dir=/install; \
+        && GPU_ARCHS="${FA_GFX_ARCHS}" python3 setup.py bdist_wheel --dist-dir=/install \
+        && cd .. \
+        && rm -rf flash-attention; \
     # Create an empty directory otherwise as later build stages expect one
     else mkdir -p /install; \
     fi
@@ -125,16 +129,18 @@ RUN --mount=type=cache,target=${CCACHE_DIR} \
     && cd triton \
     && git checkout "${TRITON_BRANCH}" \
     && cd python \
-    && python3 setup.py bdist_wheel --dist-dir=/install; \
+    && python3 setup.py bdist_wheel --dist-dir=/install \
+    && cd ../.. \
+    && rm -rf triton; \
     # Create an empty directory otherwise as later build stages expect one
     else mkdir -p /install; \
     fi
 
-
-### GPUStack wheel build stage
-FROM base AS build_gpustack
-COPY . /workspace/gpustack
-RUN cd /workspace/gpustack && make build
+### AMD-SMI build stage
+FROM base AS build_amdsmi
+# Build amdsmi wheel always
+RUN cd /opt/rocm/share/amd_smi \
+    && python3 -m pip wheel . --wheel-dir=/install
 
 
 ### Final image
@@ -183,32 +189,12 @@ RUN --mount=type=bind,from=build_fa,src=/install,target=/install \
         # Preemptively uninstall to avoid same-version no-installs
         && python3 -m pip uninstall -y flash-attn; fi
 
-# Copy GPUStack into final image if they were built
-RUN --mount=type=bind,from=build_gpustack,src=/workspace/gpustack/dist,target=/install \
-    mkdir -p dist \
-    && if ls /install/*.whl; then \
-        cp /install/*.whl dist; fi
-
 # Install wheels that were built to the final image
 RUN --mount=type=cache,target=/root/.cache/pip \
     if ls libs/*.whl; then \
     python3 -m pip install libs/*.whl; fi
 
-# Install GPUStack
-RUN python3 -m pip install pipx \
-    && USER_BASE_BIN=$(python3 -m site --user-base)/bin \
-    && export PATH="$USER_BASE_BIN:$PATH" \
-    && pipx ensurepath --force \
-    && WHEEL_PACKAGE="$(ls dist/*.whl)[audio]" \
-    && pipx install $WHEEL_PACKAGE \
-    && rm -rf /workspace/gpustack
-
 # Clean packages
-RUN apt-get purge -y build-essential gcc bzip2 libx11-6 tmux unzip && apt-get autoremove -y \
-    && rm -rf /root/.cache /install /libs /dist
-
-RUN /root/.local/bin/gpustack download-tools
-
-RUN ln -s $(which vllm) /root/.local/share/pipx/venvs/gpustack/bin/vllm
-
-ENTRYPOINT [ "/root/.local/bin/gpustack", "start" ]
+RUN apt-get purge -y bzip2 libx11-6 tmux unzip && apt-get autoremove -y \
+    && rm -rf /root/.cache /install /libs \
+    && python3 -m pip uninstall -y cmake

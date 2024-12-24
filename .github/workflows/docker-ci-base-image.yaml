@@ -1,0 +1,63 @@
+name: Docker Base Image CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.rocm.base"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile.rocm.base"
+
+jobs:
+  publish-docker:
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    timeout-minutes: 180
+    runs-on: ubuntu-22.04-16c64g
+    env:
+      PACKAGE_REGISTRY: ${{ vars.PACKAGE_REGISTRY || 'gpustack'}}
+      PACKAGE_IMAGE: ${{ vars.PACKAGE_IMAGE || 'rocm_dev-ubuntu-22.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Maximize Docker Build Space
+        uses: gpustack/.github/.github/actions/maximize-docker-build-space@main
+        with:
+          deep-clean: false
+          root-reserve-mb: 20480
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login DockerHub
+        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          username: ${{ secrets.CI_DOCKERHUB_USERNAME }}
+          password: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
+      - name: Get Metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.PACKAGE_REGISTRY }}/${{ env.PACKAGE_IMAGE }}
+          tags: |
+            type=raw,value=6.2.4,enable=true
+      - name: Package
+        uses: docker/build-push-action@v5
+        id: package
+        with:
+          push: ${{ github.event_name != 'pull_request' }}
+          file: ${{ github.workspace }}/Dockerfile.rocm.base
+          context: ${{ github.workspace }}
+          platforms: 'linux/amd64'
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: true
+          sbom: true
+          build-args: |
+            'BUILD_FA="0"

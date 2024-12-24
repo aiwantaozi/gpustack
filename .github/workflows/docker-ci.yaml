@@ -12,12 +12,14 @@ on:
       - "**.png"
       - "**.jpg"
       - "**.gif"
+      - "Dockerfile.rocm.base"
   pull_request:
     branches: [main]
     paths:
       - "Dockerfile"
       - "Dockerfile.*"
       - ".github/workflows/docker-ci.yaml"
+      - "!Dockerfile.rocm.base"
 
 jobs:
   publish-docker:
@@ -29,7 +31,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        device: ["cuda", "musa", "npu", "rocm", "cpu"]
+        device: ["rocm"]
     env:
       PACKAGE_REGISTRY: ${{ vars.PACKAGE_REGISTRY || 'gpustack'}}
       PACKAGE_IMAGE: ${{ vars.PACKAGE_IMAGE || 'gpustack' }}
@@ -41,6 +43,8 @@ jobs:
           persist-credentials: false
       - name: Free Space
         uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
         with:

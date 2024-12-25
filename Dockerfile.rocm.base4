@@ -35,14 +35,7 @@ RUN apt-get update && apt-get install -y \
     unzip \
     tmux \
     ccache \
-    miopen-hip \
-    rocrand-dev hiprand-dev \
-    rocprim-dev hipcub-dev \
-    rocblas-dev hipblas-dev hipblaslt \
-    rocsolver-dev hipsolver-dev \
-    rocfft-dev hipfft-dev hipsparse \
-    rocsparse-dev \
-    rocthrust-dev \
+    rocm-libs \
     rocm-smi-lib \
     amd-smi-lib \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -124,7 +117,7 @@ RUN --mount=type=cache,target=${CCACHE_DIR} \
 
 ### AMD-SMI build stage
 FROM base AS build_amdsmi
-# Build amdsmi wheel
+# Build amdsmi wheel always
 RUN cd /opt/rocm/share/amd_smi \
     && python3 -m pip wheel . --wheel-dir=/install
 
@@ -184,15 +177,3 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN apt-get purge -y bzip2 libx11-6 tmux unzip && apt-get autoremove -y \
     && rm -rf /root/.cache /install /libs \
     && python3 -m pip uninstall -y cmake
-
-### Squashed final image
-FROM scratch AS squashed-final
-COPY --from=final / /
-
-# Set environment variables
-ENV LLVM_SYMBOLIZER_PATH=/opt/rocm/llvm/bin/llvm-symbolizer
-ENV PATH=$PATH:/opt/rocm/bin:/libtorch/bin:
-ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rocm/lib/:/libtorch/lib:
-ENV CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/libtorch/include:/libtorch/include/torch/csrc/api/include/:/opt/rocm/include/:
-ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
-ENV CCACHE_DIR=/root/.cache/ccache

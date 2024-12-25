@@ -1,5 +1,5 @@
 # ARG BASE_IMAGE=micheliac/vllm-base:latest
-ARG BASE_IMAGE=vllm-rocm-fa-0-base3-1
+ARG BASE_IMAGE=vllm-rocm-fa-0-base4-1
 
 FROM $BASE_IMAGE
 

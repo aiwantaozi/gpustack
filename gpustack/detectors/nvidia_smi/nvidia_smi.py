@@ -1,6 +1,8 @@
 import csv
 import logging
+import re
 import subprocess
+from typing import Callable, Optional
 import xml.etree.ElementTree as ET
 from gpustack.detectors.base import GPUDetectExepction, GPUDetector
 from gpustack.schemas.workers import (
@@ -19,6 +21,17 @@ logger = logging.getLogger(__name__)
 
 
 class NvidiaSMI(GPUDetector):
+    def __init__(self, gather_system_info_func: Optional[Callable] = None):
+        if gather_system_info_func is not None:
+            self.gather_system_info_func = gather_system_info_func
+        else:
+            from gpustack.detectors.fastfetch.fastfetch import Fastfetch
+
+            fastfetch = Fastfetch()
+            self.gather_system_info_func = (
+                fastfetch.gather_system_info if fastfetch.is_available() else None
+            )
+
     def is_available(self) -> bool:
         return is_command_available("nvidia-smi")
 
@@ -482,6 +495,55 @@ class NvidiaSMI(GPUDetector):
                 type=platform.DeviceTypeEnum.CUDA.value,
             )
             devices.append(device)
+
+        self._inject_memory_for_grace_series(devices)
+        return devices
+
+    def _is_grace_series(self, device_name: str) -> bool:
+        """
+        Check if the devices is NVIDIA grace  series, which combining GPU with ARM CPU,
+        * Grace CPU + Hopper GPU: NVIDIA GH200
+        * Grace CPU + Blackwell GPU: NVIDIA GB10, NVIDIA GB200, NVIDIA GB300
+        """
+        for word in device_name.lower().split():
+            if re.match(r"g[bh]\d+", word):
+                return True
+        return False
+
+    def _inject_memory_for_grace_series(self, devices: GPUDevicesInfo):
+        """
+        Inject memory information for NVIDIA grace series GPUs.
+        Since nvidia-smi does not report memory usage for grace series,
+        we set the memory info to total system memory.
+        """
+
+        if self.gather_system_info_func is None:
+            return devices
+
+        system_info = self.gather_system_info_func()
+        if system_info is None or system_info.memory is None:
+            return devices
+
+        for device in devices:
+            if (
+                device.memory
+                and device.memory.total is not None
+                and device.memory.total > 0
+            ):
+                continue
+
+            if self._is_grace_series(device.name):
+                device.memory = MemoryInfo(
+                    is_unified_memory=True,
+                    used=system_info.memory.used if system_info.memory else 0,
+                    total=system_info.memory.total if system_info.memory else 0,
+                    utilization_rate=(
+                        system_info.memory.utilization_rate
+                        if system_info.memory
+                        else 0.0
+                    ),
+                )
+
         return devices
 
     def _run_command(self, command):

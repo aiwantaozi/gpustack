@@ -84,12 +84,19 @@ def gpu_device(
     core_util: float,
     temp: float,
     llvm: str,
+    is_uma: bool = False,
 ) -> GPUDeviceInfo:
     mem_total = mem_total_in_mib * 1024 * 1024
     mem_used = mem_used_in_mib * 1024 * 1024
     device_type = DeviceTypeEnum.ROCM.value
     if vendor == VendorEnum.Hygon.value:
         device_type = DeviceTypeEnum.DCU.value
+    elif vendor == VendorEnum.NVIDIA.value:
+        device_type = DeviceTypeEnum.CUDA.value
+
+    labels = {}
+    if llvm is not None and llvm != "":
+        labels["llvm"] = llvm
     return GPUDeviceInfo(
         uuid=uuid,
         index=index,
@@ -105,8 +112,9 @@ def gpu_device(
             total=mem_total,
             used=mem_used,
             utilization_rate=mem_used / mem_total * 100 if mem_total > 0 else 0,
+            is_unified_memory=is_uma,
         ),
         temperature=temp,
         type=device_type,
-        labels={"llvm": llvm},
+        labels=labels,
     )

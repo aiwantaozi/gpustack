@@ -1,0 +1,8 @@
+#!/command/execlineb -P
+
+# TODO(michelia): change to bash and skip to sleep if DATABASE_URL is set
+
+with-contenv
+s6-setuidgid postgres
+fdmove -c 2 1
+/usr/bin/postgres   -D /var/lib/gpustack/postgresql/data   -c config_file=/etc/postgresql/main/postgresql.conf   -c hba_file=/etc/postgresql/main/pg_hba.conf

@@ -1,0 +1,17 @@
+#!/command/with-contenv /bin/bash
+# ================================
+# GPUStack longrun service
+# ================================
+
+source /etc/profile
+
+ARGS_FILE="/var/lib/gpustack/run/args/gpustack"
+if [ ! -s "$ARGS_FILE" ]; then
+    echo "No arguments file found or file is empty. Starting gpustack with no additional arguments."
+    exec gpustack start
+else
+    GPUSTACK_ARGS=$(cat "$ARGS_FILE")
+    echo "Executing: gpustack start $GPUSTACK_ARGS"
+    exec gpustack start $GPUSTACK_ARGS
+    # TODO（michelia): test /n
+fi

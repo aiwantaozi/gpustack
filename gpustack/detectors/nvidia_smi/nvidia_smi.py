@@ -66,17 +66,22 @@ class NvidiaSMI(GPUDetector):
         if not csv_results:
             return True
 
+        device_existed = False
+        # Check if any device has invalid memory values (0 or very small)
+        for device in devices:
+            if device.memory.total <= 0:
+                return True
+            device_existed = True
+
+        if device_existed:
+            return False
+
         # Check for permission issues or N/A values in CSV output
         csv_lower = csv_results.lower()
         if (
             'insufficient permissions' in csv_lower or 'n/a' in csv_lower or not devices
         ):  # No devices parsed from CSV
             return True
-
-        # Check if any device has invalid memory values (0 or very small)
-        for device in devices:
-            if device.memory.total <= 0:
-                return True
 
         return False
 

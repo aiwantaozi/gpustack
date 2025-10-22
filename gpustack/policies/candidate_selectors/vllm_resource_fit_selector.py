@@ -154,6 +154,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         self._largest_multi_gpu_utilization_satisfied_count = 0
 
         self._num_attention_heads = None
+        self._tensor_parallel_size = None
         self._messages = []
         self._event_collector = EventCollector(self._model, logger)
         self._workers_allocatable_resource: Dict[int, Allocatable] = {}
@@ -275,15 +276,22 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         self._num_attention_heads = get_model_num_attention_heads(
             self._pretrained_config
         )
+
+        tp = find_parameter(
+            self._model.backend_parameters, ["tensor-parallel-size", "tp"]
+        )
+        self._tensor_parallel_size = int(tp) if tp else None
+
         if (
-            self._gpu_count
+            self._tensor_parallel_size
+            and self._tensor_parallel_size > 0
             and self._num_attention_heads
-            and self._num_attention_heads % self._gpu_count != 0
+            and self._num_attention_heads % self._tensor_parallel_size != 0
         ):
             raise ValueError(
                 f"Total number of attention heads ({self._num_attention_heads})"
-                " must be divisible by gpu count "
-                f"({self._gpu_count})."
+                " must be divisible by tensor parallel size "
+                f"({self._tensor_parallel_size})."
             )
 
     def _cal_effective_vram(self) -> float:
@@ -608,7 +616,11 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             gpu_sum += 1
             vram_sum += vram_claim[gpu.index]
 
-            if self._num_attention_heads and self._num_attention_heads % gpu_sum != 0:
+            if (
+                self._num_attention_heads
+                and not self._tensor_parallel_size
+                and self._num_attention_heads % gpu_sum != 0
+            ):
                 continue
 
             if self._gpu_count and gpu_sum >= self._gpu_count:
@@ -634,6 +646,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         event_msg_list = []
         if (
             self._num_attention_heads
+            and not self._tensor_parallel_size
             and self._largest_multi_gpu_utilization_satisfied_count != 0
             and self._num_attention_heads
             % self._largest_multi_gpu_utilization_satisfied_count
@@ -826,6 +839,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
 
                 if (
                     self._num_attention_heads
+                    and not self._tensor_parallel_size
                     and self._num_attention_heads % gpu_sum == 0
                 ) and (vram_sum >= self._vram_claim):
                     return [

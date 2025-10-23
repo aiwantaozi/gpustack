@@ -17,8 +17,13 @@ if [ "$ROLE" != "server" ] || [ "$POSTGRES_FLAG" != "1" ]; then
 	exit 0
 fi
 
+DB_PORT=5432
+if [ -n "$POSTGRES_PORT" ]; then
+    DB_PORT="$POSTGRES_PORT"
+fi
+
 echo "[INFO] Checking Postgres readiness."
-if gosu postgres pg_isready -q; then
+if gosu postgres pg_isready -p "$DB_PORT" -q; then
     echo "[INFO] Postgres is ready."
     exit 0
 else

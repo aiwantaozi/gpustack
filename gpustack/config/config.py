@@ -10,6 +10,7 @@ from gpustack_runtime.detector import (
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 import requests
+from gpustack.config.envs import DB_PORT
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
     CPUInfo,
@@ -503,7 +504,7 @@ class Config(BaseSettings):
     def init_database_url(self):
         if self.database_url is None:
             self.database_url = (
-                "postgresql://root@127.0.0.1:5432/gpustack?sslmode=disable"
+                f"postgresql://root@127.0.0.1:{DB_PORT}/gpustack?sslmode=disable"
             )
             return
 

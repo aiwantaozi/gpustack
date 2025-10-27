@@ -18,6 +18,7 @@ class ClientSet:
         username: Optional[str] = None,
         password: Optional[str] = None,
         headers: Optional[dict] = None,
+        timeout: Optional[float] = 30.0,
     ):
         if headers is None:
             headers = {}
@@ -38,8 +39,10 @@ class ClientSet:
         if parsed_url.hostname == "127.0.0.1" and parsed_url.scheme == "https":
             verify = False
 
-        http_client = HTTPClient(base_url=base_url, verify_ssl=verify).with_headers(
-            headers
+        http_client = (
+            HTTPClient(base_url=base_url, verify_ssl=verify)
+            .with_headers(headers)
+            .with_timeout(timeout)
         )
         self.http_client = http_client
 

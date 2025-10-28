@@ -183,6 +183,23 @@ async def delete_model_file(
         raise InternalServerErrorException(message=f"Failed to delete model file: {e}")
 
 
+@router.patch("/{id}", response_model=ModelFilePublic)
+async def patch_model_file(session: SessionDep, id: int, payload: dict):
+    model_file = await ModelFile.one_by_id(session, id)
+    if not model_file:
+        raise NotFoundException(message=f"Model file {id} not found")
+
+    try:
+        model_file_update = ModelFileUpdate(**model_file.model_dump())
+        for key, value in payload.items():
+            setattr(model_file_update, key, value)
+        await model_file.update(session, model_file_update)
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to patch model file: {e}")
+
+    return model_file
+
+
 @router.post("/{id}/reset", response_model=ModelFilePublic)
 async def reset_model_file(session: SessionDep, id: int):
     model_file = await ModelFile.one_by_id(session, id)

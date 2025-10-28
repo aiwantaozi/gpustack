@@ -297,7 +297,7 @@ class ModelFileDownloadTask:
         self._download_completed = False
         # Time control for log updates
         self._last_log_update_time = 0
-        self._log_update_interval = 2.0  # 2 seconds interval
+        self._log_update_interval = 5.0  # 5 seconds interval
         # Multi-file progress tracking with ANSI cursor control
         # Counter for generating unique tqdm IDs
         self._tqdm_counter = 0
@@ -489,7 +489,7 @@ class ModelFileDownloadTask:
                 f"Download task failed: {self._model_file.readable_source} - {str(e)}",
                 is_error=True,
             )
-            self._update_model_file(
+            self._patch_model_file(
                 self._model_file.id,
                 state=ModelFileStateEnum.ERROR,
                 state_message=str(e),
@@ -507,7 +507,7 @@ class ModelFileDownloadTask:
             huggingface_token=self._config.huggingface_token,
         )
         self._download_completed = True
-        self._update_model_file(
+        self._patch_model_file(
             self._model_file.id,
             state=ModelFileStateEnum.READY,
             download_progress=100,
@@ -619,8 +619,8 @@ class ModelFileDownloadTask:
             progress_change = abs(file_progress - file_tracking['last_progress'])
 
             should_log = (
-                time_elapsed >= self._log_update_interval  # 2 seconds elapsed
-                or progress_change >= 1.0  # 1% progress change
+                time_elapsed >= self._log_update_interval  # 5 seconds elapsed
+                or progress_change >= 2.0  # 2% progress change
                 or file_progress >= 100.0  # Always log when complete
                 or (
                     tqdm_instance.total is not None
@@ -714,18 +714,19 @@ class ModelFileDownloadTask:
         )
 
         self._model_file.size = size
-        self._update_model_file(
+        self._patch_model_file(
             self._model_file.id, size=size, resolved_paths=file_paths
         )
 
     def _update_model_file_progress(self, model_file_id: int, progress: float):
-        self._update_model_file(model_file_id, download_progress=progress)
+        self._patch_model_file(model_file_id, download_progress=progress)
 
-    def _update_model_file(self, id: int, **kwargs):
-        model_file_public = self._clientset.model_files.get(id=id)
-
-        model_file_update = ModelFileUpdate(**model_file_public.model_dump())
-        for key, value in kwargs.items():
-            setattr(model_file_update, key, value)
-
-        self._clientset.model_files.update(id=id, model_update=model_file_update)
+    def _patch_model_file(self, id: int, **kwargs):
+        resp = self._clientset.http_client.get_httpx_client().patch(
+            f"{self._clientset.base_url}/v1/model-files/{id}",
+            json=kwargs,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                f"Failed to patch model file {id}, status: {resp.status_code}"
+            )

@@ -4,5 +4,4 @@ EXIT_CODE="$1"
 
 echo "[INFO] gateway exited with code $EXIT_CODE, shutting down all services..." >&2
 
-s6-svscanctl -t /run/service
 exit "$EXIT_CODE"

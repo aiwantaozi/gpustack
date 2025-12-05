@@ -13,5 +13,4 @@ if [ "$EXIT_CODE" -ne 0 ]; then
     tail -n 50 "${LOG_DIR}/apiserver/current" >&2
 fi
 
-s6-svscanctl -t /run/service
 exit "$EXIT_CODE"

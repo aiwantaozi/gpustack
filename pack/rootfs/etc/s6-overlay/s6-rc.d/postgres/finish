@@ -26,5 +26,4 @@ if [ -f "$PGDATA/postmaster.pid" ]; then
     gosu postgres pg_ctl -D "$PGDATA" -m immediate stop
 fi
 
-s6-svscanctl -t /run/service
 exit "$EXIT_CODE"

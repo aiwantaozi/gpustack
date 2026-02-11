@@ -13,7 +13,7 @@ By default, GPUStack starts with an embedded Prometheus and Grafana. You can acc
 - **Prometheus**: `http://your_gpustack_server_host_ip/prometheus`
 - **Grafana**: `http://your_gpustack_server_host_ip/grafana`
 
-Built-in Grafana is configured for anonymous Viewer access and has the login form disabled. Admin credentials remain `admin` / `grafana` by default.
+Built-in Grafana is configured for anonymous Viewer access. Admin credentials remain `admin` / `grafana` by default.
 
 ## External Observability (Optional)
 

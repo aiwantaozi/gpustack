@@ -1,0 +1,156 @@
+items:
+  - id: tiny-check
+    name: Tiny Check
+    description: Tiny check.
+    category: tiny check
+    tasks:
+      - leaderboard_bbh
+      - leaderboard_gpqa
+      - leaderboard_instruction_following
+      - leaderboard_math_hard
+    estimated_runtime_level: short
+    recommended_for:
+      - smoke test after deployment
+      - quick quantization comparison
+      - backend regression check
+    default_enabled: true
+  - id: quick-check
+    name: Quick Check
+    description: Fast baseline across reasoning, math, and instruction following.
+    category: general_knowledge_reasoning
+    tasks:
+      - tinyArc
+      - tinyGSM8k
+    estimated_runtime_level: short
+    recommended_for:
+      - smoke test after deployment
+      - quick quantization comparison
+      - backend regression check
+    default_enabled: true
+
+  - id: standard-general
+    name: Standard General
+    description: Recommended suite for model selection and regression checks.
+    category: general_knowledge_reasoning
+    tasks:
+      - mmlu
+      - hellaswag
+      - arc_challenge
+      - winogrande
+      - gsm8k
+      - ifeval
+    estimated_runtime_level: medium
+    recommended_for:
+      - formal model comparison
+      - release readiness
+      - quality regression tracking
+    default_enabled: true
+
+  - id: chinese-general
+    name: Chinese General
+    description: Recommended suite for Chinese-language model evaluation.
+    category: chinese_east_asian
+    tasks:
+      - cmmlu
+      - agieval_cn
+      - mmmlu_zh_cn
+      - aclue
+      - mmlu
+    estimated_runtime_level: medium
+    recommended_for:
+      - Chinese model selection
+      - Chinese quality regression checks
+    default_enabled: true
+
+  - id: advanced-reasoning
+    name: Advanced Reasoning
+    description: Hard reasoning and multi-step problem solving.
+    category: math_complex_reasoning
+    tasks:
+      - leaderboard_gpqa
+      - leaderboard_musr
+      - leaderboard_bbh
+      - agieval
+      - libra_complex_reasoning_and_mathematical_problems
+      - libra_multi_hop_question_answering
+    estimated_runtime_level: long
+    recommended_for:
+      - frontier model differentiation
+      - hard reasoning analysis
+    default_enabled: true
+
+  - id: math-stem
+    name: Math & STEM
+    description: Mathematical and science-heavy tasks.
+    category: math_complex_reasoning
+    tasks:
+      - gsm8k
+      - leaderboard_math_hard
+      - leaderboard_gpqa
+      - mmlu
+    estimated_runtime_level: medium
+    recommended_for:
+      - math-focused evaluation
+      - STEM-oriented model comparison
+    default_enabled: true
+
+  - id: instruction-following
+    name: Instruction Following
+    description: Format adherence and instruction compliance.
+    category: instruction_following
+    tasks:
+      - ifeval
+      - leaderboard_instruction_following
+    estimated_runtime_level: short
+    recommended_for:
+      - assistant tuning checks
+      - format compliance validation
+    default_enabled: true
+
+  - id: east-asian-general
+    name: East Asian General
+    description: Chinese, Japanese, and Korean general capability.
+    category: chinese_east_asian
+    tasks:
+      - japanese_leaderboard
+      - kmmlu
+      - mmmlu_ja_jp
+      - mmmlu_ko_kr
+      - mmmlu_zh_cn
+    estimated_runtime_level: long
+    recommended_for:
+      - East Asian language comparison
+      - regional model evaluation
+    default_enabled: true
+
+  - id: multilingual-lite
+    name: Multilingual Lite
+    description: Lightweight multilingual generalization check.
+    category: multilingual
+    tasks:
+      - mmmlu_zh_cn
+      - mmmlu_ja_jp
+      - mmmlu_ko_kr
+      - mmmlu_fr_fr
+      - mmlu
+    estimated_runtime_level: medium
+    recommended_for:
+      - multilingual smoke tests
+      - localization readiness checks
+    default_enabled: true
+
+  - id: long-context-experimental
+    name: Long Context Experimental
+    description: Experimental long-context evaluation.
+    category: experimental
+    tasks:
+      - longbench
+      - longbench2
+      - longbench2_single
+      - longbench2_multi
+      - longbench2_structured
+    estimated_runtime_level: long
+    recommended_for:
+      - long-context experiments
+      - structured context retrieval analysis
+    default_enabled: true

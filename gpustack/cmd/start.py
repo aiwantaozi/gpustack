@@ -138,6 +138,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("BENCHMARK_IMAGE_REPO"),
     )
     common_group.add_argument(
+        "--evaluation-image-repo",
+        type=str,
+        help="Override the default evaluation image repository gpustack/evaluation-runner for the GPUStack evaluation container.",
+        default=get_gpustack_env("EVALUATION_IMAGE_REPO"),
+    )
+    common_group.add_argument(
         "--gateway-mode",
         type=str,
         help="Gateway running mode. Options: embedded, in-cluster, external, disabled, or auto (default).",
@@ -538,6 +544,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("BENCHMARK_MAX_DURATION_SECONDS"),
     )
     worker_group.add_argument(
+        "--evaluation-max-duration-seconds",
+        type=int,
+        help="Max duration for an evaluation before timeout. Disabled when unset.",
+        default=get_gpustack_env("EVALUATION_MAX_DURATION_SECONDS"),
+    )
+    worker_group.add_argument(
         "--disable-worker-metrics",
         action=OptionalBoolAction,
         help="Disable worker metrics.",
@@ -562,6 +574,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=str,
         help="Directory to store benchmark results.",
         default=get_gpustack_env("BENCHMARK_DIR"),
+    )
+    worker_group.add_argument(
+        "--evaluation-dir",
+        type=str,
+        help="Directory to store evaluation results.",
+        default=get_gpustack_env("EVALUATION_DIR"),
     )
     worker_group.add_argument(
         "--system-reserved",
@@ -688,6 +706,7 @@ def set_common_options(args, config_data: dict):
         "image_name_override",
         "image_repo",
         "benchmark_image_repo",
+        "evaluation_image_repo",
         "advertise_address",
         "port",
         "tls_port",
@@ -773,8 +792,10 @@ def set_worker_options(args, config_data: dict):
         "service_port_range",
         "ray_port_range",
         "benchmark_max_duration_seconds",
+        "evaluation_max_duration_seconds",
         "log_dir",
         "benchmark_dir",
+        "evaluation_dir",
         "system_reserved",
         "tools_download_base_url",
         "enable_hf_transfer",

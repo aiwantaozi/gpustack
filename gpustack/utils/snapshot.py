@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from gpustack.schemas.benchmark import (
     GPUSnapshot,
@@ -9,6 +9,7 @@ from gpustack.schemas.benchmark import (
 )
 from gpustack.schemas.models import Model, ModelInstance
 from gpustack.schemas.workers import Worker
+from gpustack.server.services import WorkerService
 from gpustack.utils.gpu import make_gpu_id
 
 
@@ -115,3 +116,41 @@ def create_worker_snapshot(
             gpu_snapshots[gpu_id] = gpu_snapshot
 
     return worker_snapshot, gpu_snapshots
+
+
+async def get_model_runtime_snapshot(session, mi: ModelInstance, model: Model) -> Dict:
+    worker_snapshots = {}
+    gpu_snapshots = {}
+    instance_snapshots = {mi.name: create_model_instance_snapshot(mi, model)}
+
+    if mi.worker_id is not None:
+        worker = await WorkerService(session).get_by_id(mi.worker_id)
+        if worker is not None:
+            worker_snapshot, current_gpu_snapshots = create_worker_snapshot(
+                worker, mi.gpu_type, mi.gpu_indexes
+            )
+            if worker_snapshot is not None:
+                worker_snapshots[worker.name] = worker_snapshot
+            if current_gpu_snapshots is not None:
+                gpu_snapshots.update(current_gpu_snapshots)
+
+    if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
+        for sub in mi.distributed_servers.subordinate_workers:
+            if sub.worker_id is None:
+                continue
+            worker = await WorkerService(session).get_by_id(sub.worker_id)
+            if worker is None:
+                continue
+            worker_snapshot, current_gpu_snapshots = create_worker_snapshot(
+                worker, sub.gpu_type, sub.gpu_indexes
+            )
+            if worker_snapshot is not None:
+                worker_snapshots[worker.name] = worker_snapshot
+            if current_gpu_snapshots is not None:
+                gpu_snapshots.update(current_gpu_snapshots)
+
+    return {
+        "instances": instance_snapshots,
+        "workers": worker_snapshots,
+        "gpus": gpu_snapshots,
+    }

@@ -104,7 +104,9 @@ class Config(WorkerConfig, BaseSettings):
         log_dir: Directory to store logs.
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
         benchmark_dir: Directory to store benchmark results.
+        evaluation_dir: Directory to store evaluation results.
         benchmark_max_duration_seconds: Max duration for a benchmark before timeout. Disabled when unset.
+        evaluation_max_duration_seconds: Max duration for an evaluation before timeout. Disabled when unset.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
@@ -225,6 +227,9 @@ class Config(WorkerConfig, BaseSettings):
         self.benchmark_dir = prepare_dir(
             self.benchmark_dir, os.path.join(self.data_dir, "benchmarks")
         )
+        self.evaluation_dir = prepare_dir(
+            self.evaluation_dir, os.path.join(self.data_dir, "evaluations")
+        )
         if isinstance(self.grafana_url, str) and not self.grafana_url.strip():
             self.grafana_url = None
 
@@ -336,6 +341,7 @@ class Config(WorkerConfig, BaseSettings):
         os.makedirs(self.bin_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.benchmark_dir, exist_ok=True)
+        os.makedirs(self.evaluation_dir, exist_ok=True)
         # prepare gateway dirs
         os.makedirs(
             os.getenv("GPUSTACK_GATEWAY_DIR", self.higress_base_dir()),

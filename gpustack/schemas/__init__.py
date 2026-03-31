@@ -100,6 +100,26 @@ from gpustack.schemas.model_routes import (
     ModelRouteTargetPublic,
     ModelRouteTargetsPublic,
 )
+from gpustack.schemas.evaluation_suites import (
+    EvaluationSuite,
+    EvaluationSuitesPublic,
+)
+from gpustack.schemas.evaluations import (
+    Evaluation,
+    EvaluationCreate,
+    EvaluationDeploymentMetadata,
+    EvaluationResult,
+    EvaluationStateUpdate,
+    EvaluationTaskUpsert,
+    EvaluationUpdate,
+    EvaluationPublic,
+    EvaluationsPublic,
+    EvaluationTask,
+    EvaluationTaskPublic,
+    EvaluationTasksPublic,
+    EvaluationSnapshot,
+    EvaluationStateEnum,
+)
 
 
 __all__ = [
@@ -194,4 +214,20 @@ __all__ = [
     "ModelRouteTargetUpdate",
     "ModelRouteTargetPublic",
     "ModelRouteTargetsPublic",
+    "EvaluationSuite",
+    "EvaluationSuitesPublic",
+    "Evaluation",
+    "EvaluationCreate",
+    "EvaluationDeploymentMetadata",
+    "EvaluationResult",
+    "EvaluationStateUpdate",
+    "EvaluationTaskUpsert",
+    "EvaluationUpdate",
+    "EvaluationPublic",
+    "EvaluationsPublic",
+    "EvaluationTask",
+    "EvaluationTaskPublic",
+    "EvaluationTasksPublic",
+    "EvaluationSnapshot",
+    "EvaluationStateEnum",
 ]

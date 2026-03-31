@@ -7,6 +7,8 @@ from gpustack.routes import (
     dashboard,
     debug,
     draft_models,
+    evaluation_suites,
+    evaluations,
     gpu_devices,
     inference_backend,
     metrics,
@@ -149,6 +151,21 @@ admin_routers = model_routers + [
     {"router": dashboard.router, "prefix": "/dashboard", "tags": ["Dashboard"]},
     {"router": workers.router, "prefix": "/workers", "tags": ["Workers"]},
     {"router": users.router, "prefix": "/users", "tags": ["Users"]},
+    {
+        "router": evaluation_suites.router,
+        "prefix": "/evaluation-suites",
+        "tags": ["Evaluation Suites"],
+    },
+    {
+        "router": evaluations.router,
+        "prefix": "/evaluations",
+        "tags": ["Evaluations"],
+    },
+    {
+        "router": evaluations.task_router,
+        "prefix": "/evaluation-tasks",
+        "tags": ["Evaluation Tasks"],
+    },
     {"router": model_sets.router, "prefix": "/model-sets", "tags": ["Model Sets"]},
     {
         "router": draft_models.router,

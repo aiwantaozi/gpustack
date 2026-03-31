@@ -1,6 +1,10 @@
 import argparse
 
-from gpustack import __version__, __benchmark_runner_version__
+from gpustack import (
+    __benchmark_runner_version__,
+    __evaluation_runner_version__,
+    __version__,
+)
 
 from gpustack_runtime.cmds import (
     CopyImagesSubCommand,
@@ -14,6 +18,7 @@ from gpustack_runtime.cmds import (
 append_images(
     f"gpustack/gpustack:{'dev' if __version__.removeprefix('v') == '0.0.0' else __version__}",
     f"gpustack/benchmark-runner:{__benchmark_runner_version__}",
+    f"gpustack/evaluation-runner:{__evaluation_runner_version__}",
 )
 
 

@@ -41,14 +41,10 @@ from gpustack.schemas.benchmark import (
     BenchmarksPublic,
 )
 
-from gpustack.server.services import (
-    WorkerService,
-)
 from gpustack.utils.gpu import summary_gpu_snapshots
 from gpustack.utils.network import use_proxy_env_for_url
 from gpustack.utils.snapshot import (
-    create_model_instance_snapshot,
-    create_worker_snapshot,
+    get_model_runtime_snapshot,
 )
 from gpustack.worker.logs import LogOptionsDep
 from sqlalchemy.orm import defer
@@ -311,37 +307,8 @@ async def update_benchmark_state(
 async def get_benchmark_snapshot(
     session: SessionDep, mi: ModelInstance, model: Model
 ) -> BenchmarkSnapshot:
-    # instance snapshot
-
-    worker_snapshots = {}
-    gpu_snapshots = {}
-    instance_snapshots = {}
-
-    instance_snapshots[mi.name] = create_model_instance_snapshot(mi, model)
-
-    w: Worker = await WorkerService(session).get_by_id(mi.worker_id)
-    w_snapshot, gpus_snapshots = create_worker_snapshot(w, mi.gpu_type, mi.gpu_indexes)
-    if w_snapshot is not None:
-        worker_snapshots[w.name] = w_snapshot
-    if gpus_snapshots is not None:
-        gpu_snapshots.update(gpus_snapshots)
-
-    if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
-        for sub in mi.distributed_servers.subordinate_workers:
-            sw: Worker = await WorkerService(session).get_by_id(sub.worker_id)
-            w_snapshot, gpus_snapshots = create_worker_snapshot(
-                sw, sub.gpu_type, sub.gpu_indexes
-            )
-            if w_snapshot is not None:
-                worker_snapshots[sw.name] = w_snapshot
-            if gpus_snapshots is not None:
-                gpu_snapshots.update(gpus_snapshots)
-
-    return BenchmarkSnapshot(
-        instances=instance_snapshots,
-        workers=worker_snapshots,
-        gpus=gpu_snapshots,
-    )
+    snapshot = await get_model_runtime_snapshot(session, mi, model)
+    return BenchmarkSnapshot.model_validate(snapshot)
 
 
 @router.post("/{id}/metrics", response_model=BenchmarkPublic)

@@ -2,7 +2,7 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
 
-from gpustack import __benchmark_runner_version__
+from gpustack import __benchmark_runner_version__, __evaluation_runner_version__
 
 
 class GatewayModeEnum(str, Enum):
@@ -52,11 +52,15 @@ class PredefinedConfig(SensitivePredefinedConfig):
     log_dir: Optional[str] = None
     bin_dir: Optional[str] = None
     benchmark_dir: Optional[str] = None
+    evaluation_dir: Optional[str] = None
     system_default_container_registry: Optional[str] = None
     image_name_override: Optional[str] = None
     image_repo: str = "gpustack/gpustack"
     benchmark_image_repo: str = (
         f"gpustack/benchmark-runner:{__benchmark_runner_version__}"
+    )
+    evaluation_image_repo: str = (
+        f"gpustack/evaluation-runner:{__evaluation_runner_version__}"
     )
     gateway_mode: GatewayModeEnum = GatewayModeEnum.auto
     gateway_kubeconfig: Optional[str] = None
@@ -71,6 +75,7 @@ class PredefinedConfig(SensitivePredefinedConfig):
     service_port_range: Optional[str] = "40000-40063"
     ray_port_range: Optional[str] = "41000-41999"
     benchmark_max_duration_seconds: Optional[int] = None
+    evaluation_max_duration_seconds: Optional[int] = None
     system_reserved: Optional[dict] = None
     pipx_path: Optional[str] = None
     tools_download_base_url: Optional[str] = None
@@ -89,8 +94,10 @@ class PredefinedConfigNoDefaults(PredefinedConfig):
     service_port_range: Optional[str] = None
     ray_port_range: Optional[str] = None
     benchmark_max_duration_seconds: Optional[int] = None
+    evaluation_max_duration_seconds: Optional[int] = None
     image_repo: Optional[str] = None
     benchmark_image_repo: Optional[str] = None
+    evaluation_image_repo: Optional[str] = None
     gateway_mode: Optional[str] = None
     gateway_namespace: Optional[str] = None
     namespace: Optional[str] = None

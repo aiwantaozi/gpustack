@@ -7,7 +7,6 @@ import time
 from collections import deque
 from typing import Callable, Dict, Optional
 
-import httpx
 import setproctitle
 
 from gpustack.client import ClientSet
@@ -20,12 +19,11 @@ from gpustack.schemas.evaluations import (
     EvaluationStateEnum,
 )
 from gpustack.server.bus import Event, EventType
-from gpustack.utils.process import add_signal_handlers, terminate_process_tree
+from gpustack.utils.process import add_signal_handlers
 from gpustack.worker.evaluation.result_parser import parse_evaluation_results
 from gpustack.worker.evaluation.runner import EvaluationRunner
 from gpustack_runtime.deployer import (
     WorkloadStatusStateEnum,
-    delete_workload,
     get_workload,
 )
 
@@ -70,27 +68,14 @@ class EvaluationManager:
 
         while True:
             try:
-                await self._awatch(callback=self._handle_evaluation_event)
+                await self._clientset.evaluations.awatch(
+                    callback=self._handle_evaluation_event
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error watching evaluations: {e}")
                 await asyncio.sleep(5)
-
-    async def _awatch(self, callback):
-        client = self._clientset.http_client.get_async_httpx_client()
-        async with client.stream(
-            "GET",
-            "/evaluations",
-            params={"watch": "true", "worker_id": self._worker_id},
-            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                event = Event(**json.loads(line))
-                await callback(event)
 
     async def _handle_evaluation_event(self, event: Event):
         evaluation = Evaluation.model_validate(event.data)
@@ -196,15 +181,14 @@ class EvaluationManager:
         response.raise_for_status()
 
     def sync_evaluation_state(self):
-        client = self._clientset.http_client.get_httpx_client()
-        response = client.get(
-            "/evaluations",
-            params={"worker_id": self._worker_id, "state": EvaluationStateEnum.RUNNING},
+        evaluation_page = self._clientset.evaluations.list(
+            params={"worker_id": self._worker_id, "state": EvaluationStateEnum.RUNNING}
         )
-        response.raise_for_status()
-        items = response.json().get("items") or []
-        for item in items:
-            self._sync_single_evaluation_state(Evaluation.model_validate(item))
+        if not evaluation_page.items:
+            return
+
+        for evaluation in evaluation_page.items:
+            self._sync_single_evaluation_state(Evaluation.model_validate(evaluation))
 
     def _sync_single_evaluation_state(self, evaluation: Evaluation):
         if self._is_evaluation_timed_out(evaluation):
@@ -273,11 +257,12 @@ class EvaluationManager:
         return False
 
     def _stop_evaluation(self, evaluation: Evaluation):
-        if self._is_provisioning(evaluation):
-            terminate_process_tree(self._provisioning_processes[evaluation.id].pid)
-        delete_workload(evaluation.name)
-        self._provisioning_processes.pop(evaluation.id, None)
-        self._clear_active_evaluation(evaluation.id)
+        pass
+        # if self._is_provisioning(evaluation):
+        #     terminate_process_tree(self._provisioning_processes[evaluation.id].pid)
+        # delete_workload(evaluation.name)
+        # self._provisioning_processes.pop(evaluation.id, None)
+        # self._clear_active_evaluation(evaluation.id)
 
     def _set_active_evaluation(self, evaluation_id: int):
         self._active_evaluation_id = evaluation_id

@@ -113,6 +113,11 @@ model_routers = [
         "prefix": "/model-route-targets",
         "tags": ["Model Route Targets"],
     },
+    {
+        "router": evaluations.router,
+        "prefix": "/evaluations",
+        "tags": ["Evaluations"],
+    },
 ]
 # worker client have full access to model and model instances
 worker_client_router = APIRouter()
@@ -155,11 +160,6 @@ admin_routers = model_routers + [
         "router": evaluation_suites.router,
         "prefix": "/evaluation-suites",
         "tags": ["Evaluation Suites"],
-    },
-    {
-        "router": evaluations.router,
-        "prefix": "/evaluations",
-        "tags": ["Evaluations"],
     },
     {
         "router": evaluations.task_router,

@@ -1,10 +1,17 @@
-from typing import Optional, Union
+import os
+from typing import List, Optional, Union
 from gpustack_runtime.envs import (
     GPUSTACK_RUNTIME_DOCKER_PAUSE_IMAGE,
     GPUSTACK_RUNTIME_DOCKER_UNHEALTHY_RESTART_IMAGE,
+    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT,
 )
 from gpustack_runtime.deployer.docker import DockerWorkloadPlan
-from gpustack_runtime.deployer import WorkloadPlan, DockerDeployer, WorkloadStatus
+from gpustack_runtime.deployer import (
+    ContainerMount,
+    WorkloadPlan,
+    DockerDeployer,
+    WorkloadStatus,
+)
 
 from gpustack.config.config import Config
 from gpustack.utils.config import apply_registry_override_to_image
@@ -33,6 +40,33 @@ def transform_workload_plan(
         **workload.__dict__,
     )
     return docker_workload
+
+
+def get_configured_mounts(
+    model_path: Optional[str],
+    extra_paths: Optional[List[Optional[str]]] = None,
+) -> List[ContainerMount]:
+    """
+    Build workload mounts for the model directory and optional extra directories.
+    If runtime mirrored deployment is enabled, no mounts will be set up.
+    """
+    if not model_path or GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT:
+        return []
+
+    mount_paths = [os.path.dirname(model_path)]
+    if extra_paths:
+        mount_paths.extend(path for path in extra_paths if path)
+
+    mounts: List[ContainerMount] = []
+    seen = set()
+    for path in mount_paths:
+        normalized_path = os.path.normpath(path)
+        if normalized_path in seen:
+            continue
+        seen.add(normalized_path)
+        mounts.append(ContainerMount(path=normalized_path))
+
+    return mounts
 
 
 def is_benchmark_workload(status: WorkloadStatus) -> bool:

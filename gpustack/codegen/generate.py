@@ -18,6 +18,7 @@ def main():
             "InferenceBackend",
             "Benchmark",
             "ModelRouteTarget",
+            "Evaluation",
         ]
     )
 

@@ -21,7 +21,6 @@ from gpustack.utils.config import apply_registry_override_to_image
 from gpustack.utils.envs import filter_env_vars, sanitize_env
 from gpustack_runtime.logging import setup_logging as setup_runtime_logging
 from gpustack_runtime import envs as runtime_envs
-from gpustack_runtime.deployer import ContainerMount
 
 from gpustack_runtime.deployer import (
     Container,
@@ -34,7 +33,7 @@ from gpustack_runtime.deployer import (
 )
 
 from gpustack.utils.profiling import time_decorator
-from gpustack.utils.runtime import transform_workload_plan
+from gpustack.utils.runtime import get_configured_mounts, transform_workload_plan
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +160,9 @@ class BenchmarkRunner:
         if not image:
             raise ValueError("Failed to get image for benchmark runner workload")
 
-        mounts = self._get_configured_mounts()
+        mounts = get_configured_mounts(
+            self._model_path, extra_paths=[self._benchmark_dir]
+        )
 
         run_container = Container(
             image=image,
@@ -280,30 +281,3 @@ class BenchmarkRunner:
             "/benchmarks/{id}/state".format(id=id), json=kwargs
         )
         resp.raise_for_status()
-
-    def _get_configured_mounts(self) -> List[ContainerMount]:
-        """
-        Get the volume mounts for the model instance.
-        If runtime mirrored deployment is enabled, no mounts will be set up.
-
-        Returns:
-            A list of ContainerMount objects for the model instance.
-        """
-        mounts: List[ContainerMount] = []
-        if (
-            self._model_path
-            and self._benchmark_dir
-            and not runtime_envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT
-        ):
-            model_dir = os.path.dirname(self._model_path)
-            mounts.extend(
-                [
-                    ContainerMount(
-                        path=model_dir,
-                    ),
-                    ContainerMount(
-                        path=self._benchmark_dir,
-                    ),
-                ]
-            )
-        return mounts

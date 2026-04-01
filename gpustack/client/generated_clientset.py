@@ -11,6 +11,7 @@ from .generated_user_client import UserClient
 from .generated_inference_backend_client import InferenceBackendClient
 from .generated_benchmark_client import BenchmarkClient
 from .generated_model_route_target_client import ModelRouteTargetClient
+from .generated_evaluation_client import EvaluationClient
 
 from gpustack.utils.network import use_proxy_env_for_url
 
@@ -86,6 +87,10 @@ class ClientSet:
             enable_cache=enable_cache,
         )
         self.model_route_targets = ModelRouteTargetClient(
+            http_client,
+            enable_cache=enable_cache,
+        )
+        self.evaluations = EvaluationClient(
             http_client,
             enable_cache=enable_cache,
         )

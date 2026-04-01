@@ -22,7 +22,7 @@ from gpustack_runtime.deployer import (
     create_workload,
 )
 
-from gpustack.utils.runtime import transform_workload_plan
+from gpustack.utils.runtime import get_configured_mounts, transform_workload_plan
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +68,10 @@ class EvaluationRunner:
         backend = self._instance_snapshot.backend
         if backend == BackendEnum.SGLANG:
             base_url = f"{base_url}/generate"
-            pretrained = (
-                self._evaluation.model_name or self._evaluation.model_instance_name
-            )
+            pretrained = self._evaluation.model_name
         else:
             base_url = f"{base_url}/v1/completions"
-            pretrained = (
-                self._evaluation.model_instance_name
-                or self._evaluation.model_name
-                or ""
-            )
+            pretrained = self._evaluation.model_name
 
         suite = next(
             (
@@ -129,6 +123,10 @@ class EvaluationRunner:
                 args=command_args,
             ),
             envs=[ContainerEnv(name=name, value=value) for name, value in env.items()],
+            mounts=get_configured_mounts(
+                self._instance_snapshot.resolved_path,
+                extra_paths=[self._config.evaluation_dir],
+            ),
         )
 
         deployment_metadata = self._evaluation.get_deployment_metadata()

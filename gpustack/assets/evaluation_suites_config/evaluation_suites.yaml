@@ -1,237 +1,100 @@
 items:
-  # Hugging Face category: Knowledge
-  # Missing from current lm-eval task inventory:
-  # - MMLU-Redux
-  - id: knowledge
-    name: Knowledge
+  - id: general
+    name: General
     description: >
-      Knowledge suite built from benchmark families with confirmed
-      lm-eval support. Covers MMLU-Pro and C-Eval style evaluation.
-    category: knowledge
+      Recommended default suite for broad model quality checks. Combines
+      general knowledge, hard scientific reasoning, and instruction following
+      into one easy-to-explain entry point for product users.
+    category: general_language
     tasks:
       - mmlu_pro
-      - mmlu_redux
-      - ceval-valid
-      - gpqa
-    estimated_runtime_level: medium
-    recommended_for:
-      - knowledge-heavy regression checks
-      - broad academic benchmark comparison
-      - Chinese and English factual capability tracking
-    default_enabled: true
-
-  # Hugging Face category: Instruction Following
-  # Missing from current lm-eval task inventory:
-  # - IFBench
-  # - MultiChallenge
-  - id: instruction-following
-    name: Instruction Following
-    description: >
-      Instruction-following suite built from benchmark families with
-      confirmed lm-eval support. Currently covers IFEval.
-    category: instruction_following
-    tasks:
-      - ifeval
-    estimated_runtime_level: short
-    recommended_for:
-      - assistant behavior checks
-      - prompt-format compliance validation
-      - quick post-deployment verification
-    default_enabled: true
-
-  # Hugging Face category: Long Context
-  # Missing from current lm-eval task inventory:
-  # - AA-LCR
-  - id: long-context
-    name: Long Context
-    description: >
-      Long-context suite built from benchmark families with confirmed lm-eval
-      support. Currently covers LongBench v2.
-    category: long_context
-    tasks:
-      - longbench2
-    estimated_runtime_level: long
-    recommended_for:
-      - long-context capability checks
-      - retrieval and multi-document stress testing
-      - long-window regression analysis
-    default_enabled: true
-
-  # Hugging Face category: STEM & Reasoning
-  # Supported in current lm-eval task inventory:
-  # - GPQA -> leaderboard_gpqa
-  # Missing from current lm-eval task inventory:
-  # - HLE
-  # - HLE-Verified
-  - id: stem
-    name: STEM
-    description: >
-      STEM suite built from benchmark families with confirmed lm-eval support.
-      Currently covers GPQA via the available leaderboard task.
-    category: stem
-    tasks:
       - leaderboard_gpqa
+      - ifeval
     estimated_runtime_level: medium
     recommended_for:
-      - science and academic reasoning checks
-      - benchmark-aligned STEM comparison
+      - default model comparison
+      - release candidate evaluation
+      - broad capability checks
     default_enabled: true
 
-  # Table category: Reasoning
-  # Missing from current lm-eval task inventory:
-  # - LiveCodeBench v6
-  # - HMMT Feb 25
-  # - HMMT Nov 25
-  # - IMOAnswerBench
-  # Approximate mappings used here:
-  # - AIME26 -> aime
   - id: reasoning
     name: Reasoning
     description: >
-      Reasoning suite built from benchmark families with confirmed lm-eval
-      support. Currently covers AIME-style evaluation.
+      Focused hard-reasoning suite using olympiad-style math problems to
+      highlight a model's step-by-step problem solving ability.
     category: reasoning
     tasks:
       - aime
     estimated_runtime_level: medium
     recommended_for:
-      - math olympiad style checks
       - hard reasoning comparison
+      - math-heavy evaluation
+      - differentiating top-tier models
     default_enabled: true
 
-  # Table category: General Agent
-  # Missing from current lm-eval task inventory:
-  # - BFCL-V4
-  # - TAU2-Bench
-  # - VITA-Bench
-  # - DeepPlanning
-  # - Tool Decathlon
-  # - MCP-Mark
-  - id: general-agent
-    name: General Agent
+  - id: coding
+    name: Coding
     description: >
-      General agent suite placeholder. The benchmark families from this category
-      are not currently confirmed in the local lm-eval task inventory.
-    category: agent
-    tasks: []
+      Coding suite for baseline code generation quality using a widely adopted
+      executable benchmark that is already available in the current lm-eval
+      task inventory.
+    category: coding
+    tasks:
+      - humaneval
+    estimated_runtime_level: medium
+    recommended_for:
+      - code generation checks
+      - developer-facing model selection
+      - lightweight coding regression tests
+    default_enabled: true
+
+  - id: long-context
+    name: Long Context
+    description: >
+      Long-context suite for document-level understanding, retrieval, and
+      multi-span reasoning. Useful for modern long-window models, but more
+      expensive than the default quick checks.
+    category: long_context
+    tasks:
+      - longbench2
     estimated_runtime_level: long
     recommended_for:
-      - agent benchmark coverage planning
-      - future lm-eval task onboarding
-    default_enabled: false
+      - long document analysis
+      - retrieval and synthesis stress testing
+      - long-context regression tracking
+    default_enabled: true
 
-  # Table category: Search Agent
-  # Missing from current lm-eval task inventory:
-  # - HLE w/ tool
-  # - BrowseComp
-  # - BrowseComp-zh
-  # - WideSearch
-  # - Seal-0
-  - id: search-agent
-    name: Search Agent
+  - id: multilingual
+    name: Multilingual
     description: >
-      Search agent suite placeholder. The benchmark families from this category
-      are not currently confirmed in the local lm-eval task inventory.
-    category: search_agent
-    tasks: []
-    estimated_runtime_level: long
-    recommended_for:
-      - search-agent benchmark coverage planning
-      - future lm-eval task onboarding
-    default_enabled: false
-
-  # Table category: Multilingualism
-  # Supported in current lm-eval task inventory:
-  # - MMMLU -> mmmlu
-  # - MMLU-ProX -> mmlu_prox_en (representative single-language variant only)
-  # - Global PIQA -> global_piqa_prompted
-  # Missing from current lm-eval task inventory:
-  # - NOVA-63
-  # - INCLUDE
-  # - PolyMATH
-  # - WMT24++
-  # - MAXIFE
-  - id: multilingualism
-    name: Multilingualism
-    description: >
-      Multilingual suite built from benchmark families with confirmed lm-eval
-      support. Includes MMMLU, a representative MMLU-ProX variant, and Global PIQA.
+      Multilingual suite for cross-language and Chinese capability tracking,
+      using a broad multilingual benchmark together with a commonly used
+      Chinese evaluation set.
     category: multilingual
     tasks:
       - mmmlu
-      - mmlu_prox_en
-      - global_piqa_prompted
+      - ceval-valid
     estimated_runtime_level: medium
     recommended_for:
-      - multilingual capability checks
-      - cross-lingual regression tracking
-      - localization readiness comparison
+      - multilingual comparison
+      - Chinese capability validation
+      - localization readiness checks
     default_enabled: true
 
-  # Table category: Coding Agent
-  # Missing from current lm-eval task inventory:
-  # - SWE-bench Verified
-  # - SWE-bench Multilingual
-  # - SecCodeBench
-  # - Terminal Bench 2
-  - id: coding-agent
-    name: Coding Agent
+  - id: quick
+    name: Quick
     description: >
-      Coding agent suite placeholder. The benchmark families from this category
-      are not currently confirmed in the local lm-eval task inventory.
-    category: coding_agent
-    tasks: []
-    estimated_runtime_level: long
-    recommended_for:
-      - coding-agent benchmark coverage planning
-      - future lm-eval task onboarding
-    default_enabled: false
-
-  # Compact suite from the supported benchmark families above, excluding long-context
-  # and placeholder-only categories.
-  - id: core
-    name: Core
-    description: >
-      Compact suite covering the benchmark families we can
-      currently confirm in lm-eval, excluding long-context evaluation.
-    category: general_language
+      Fast preset for a low-cost first pass. Covers broad general quality,
+      instruction following, and baseline coding ability without the heavier
+      long-context or hard-science tasks.
+    category: preset
     tasks:
       - mmlu_pro
-      - ceval-valid
       - ifeval
-      - leaderboard_gpqa
-      - aime
-      - mmmlu
-      - mmlu_prox_en
-      - global_piqa_prompted
-    estimated_runtime_level: medium
+      - humaneval
+    estimated_runtime_level: short
     recommended_for:
-      - routine regression tracking
-      - release candidate comparison
-      - general-purpose quality checks
-    default_enabled: true
-
-  # Full suite from the supported benchmark families above, including long-context
-  # but excluding placeholder-only categories.
-  - id: full
-    name: Full
-    description: >
-      Full suite built only from benchmark families we can
-      currently confirm in lm-eval task listings.
-    category: general_language
-    tasks:
-      - mmlu_pro
-      - ceval-valid
-      - ifeval
-      - longbench2
-      - leaderboard_gpqa
-      - aime
-      - mmmlu
-      - mmlu_prox_en
-      - global_piqa_prompted
-    estimated_runtime_level: long
-    recommended_for:
-      - formal model comparison
-      - broad release-readiness evaluation
-      - end-to-end language capability tracking
+      - quick smoke tests
+      - default first-run evaluation
+      - low-cost model screening
     default_enabled: true

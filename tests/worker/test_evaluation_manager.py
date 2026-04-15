@@ -54,8 +54,8 @@ def test_sync_evaluation_result_posts_summary_and_tasks(tmp_path, monkeypatch):
     evaluation = Evaluation(
         id=1,
         name="eval-1",
-        suite_id="quick-check",
-        suite_name="Quick Check",
+        suite_id="quick",
+        suite_name="Quick",
         state=EvaluationStateEnum.RUNNING,
         worker_id=1,
     )

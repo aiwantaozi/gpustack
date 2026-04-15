@@ -9,9 +9,10 @@ from gpustack.schemas.evaluations import (
 def test_evaluation_supports_snapshot():
     evaluation = Evaluation(
         name="qwen35-tinybench",
-        suite_id="quick-check",
-        suite_name="Quick Check",
+        suite_id="quick",
+        suite_name="Quick",
         category="general_knowledge_reasoning",
+        limit=10,
         model_id=1,
         model_name="qwen3.5-9b",
         model_instance_name="qwen3.5-9b-vllm",
@@ -24,6 +25,7 @@ def test_evaluation_supports_snapshot():
     )
 
     assert evaluation.snapshot is not None
+    assert evaluation.limit == 10
     assert evaluation.state == EvaluationStateEnum.PENDING
 
 

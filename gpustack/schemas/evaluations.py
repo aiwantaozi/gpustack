@@ -52,6 +52,7 @@ class EvaluationBase(SQLModel):
     )
     suite_id: str
     suite_name: str
+    limit: Optional[float] = Field(default=None, gt=0)
     category: Optional[str] = Field(default=None)
     model_id: Optional[int] = Field(default=None)
     model_name: Optional[str] = Field(default=None)
@@ -117,6 +118,7 @@ class EvaluationUpdate(SQLModel):
         nullable=True,
         default=None,
     )
+    limit: Optional[float] = Field(default=None, gt=0)
     pid: Optional[int] = None
     state: Optional[EvaluationStateEnum] = None
     state_message: Optional[str] = Field(

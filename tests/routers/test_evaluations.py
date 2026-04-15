@@ -12,11 +12,12 @@ from gpustack.schemas.models import ModelInstanceStateEnum
 async def test_create_evaluation_populates_runtime_fields(monkeypatch):
     session = MagicMock()
     evaluation_in = EvaluationCreate(
-        name="qwen35-quick-check",
-        suite_id="quick-check",
-        suite_name="Quick Check",
+        name="qwen35-quick",
+        suite_id="quick",
+        suite_name="Quick",
         category="general",
         model_instance_name="qwen3.5-9b-vllm",
+        limit=5,
     )
 
     instance = SimpleNamespace(
@@ -75,5 +76,6 @@ async def test_create_evaluation_populates_runtime_fields(monkeypatch):
     assert evaluation.model_instance_name == "qwen3.5-9b-vllm"
     assert evaluation.cluster_id == 3
     assert evaluation.worker_id == 4
+    assert evaluation.limit == 5
     assert evaluation.state == EvaluationStateEnum.PENDING
     assert evaluation.snapshot.instances["qwen3.5-9b-vllm"].name == "qwen3.5-9b-vllm"

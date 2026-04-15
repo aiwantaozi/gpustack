@@ -22,9 +22,12 @@ from gpustack.server.bus import Event, EventType
 from gpustack.utils.process import add_signal_handlers
 from gpustack.worker.evaluation.result_parser import parse_evaluation_results
 from gpustack.worker.evaluation.runner import EvaluationRunner
+from gpustack.utils.process import terminate_process_tree
 from gpustack_runtime.deployer import (
     WorkloadStatusStateEnum,
+    delete_workload,
     get_workload,
+    logs_workload,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,11 +89,15 @@ class EvaluationManager:
             self._stop_evaluation(evaluation)
             return
 
-        if evaluation.state == EvaluationStateEnum.PENDING:
+        if evaluation.state in [
+            EvaluationStateEnum.PENDING,
+            EvaluationStateEnum.QUEUED,
+        ]:
             await self._enqueue_evaluation(evaluation)
             return
 
         if evaluation.state == EvaluationStateEnum.STOPPED:
+            self._dump_evaluation_logs_to_file(evaluation)
             self._stop_evaluation(evaluation)
             self._clear_active_evaluation(evaluation.id)
 
@@ -111,7 +118,28 @@ class EvaluationManager:
             if evaluation is None:
                 await asyncio.sleep(1)
                 continue
-            await self._start_evaluation(evaluation)
+            try:
+                await self._start_evaluation(evaluation)
+            except Exception as e:
+                logger.exception(
+                    "Failed to start evaluation %s(id=%s): %s",
+                    evaluation.name,
+                    evaluation.id,
+                    e,
+                )
+                self._stop_evaluation(evaluation)
+                try:
+                    await self._update_evaluation_state(
+                        evaluation.id,
+                        state=EvaluationStateEnum.ERROR,
+                        state_message=f"Failed to start evaluation: {e}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to update evaluation %s(id=%s) to ERROR after start failure",
+                        evaluation.name,
+                        evaluation.id,
+                    )
 
     async def _start_evaluation(self, evaluation: Evaluation):
         log_file_path = f"{self._evaluation_log_dir}/{evaluation.id}.log"
@@ -223,9 +251,11 @@ class EvaluationManager:
             state=EvaluationStateEnum.ERROR,
             state_message="Evaluation timed out.",
         )
+        self._dump_evaluation_logs_to_file(evaluation)
         self._stop_evaluation(evaluation)
 
     def _handle_evaluation_completion(self, evaluation: Evaluation):
+        self._dump_evaluation_logs_to_file(evaluation)
         self._sync_evaluation_result(evaluation)
         self._update_evaluation_state_sync(
             evaluation.id,
@@ -240,6 +270,7 @@ class EvaluationManager:
             state=EvaluationStateEnum.ERROR,
             state_message="Evaluation exited or unhealthy.",
         )
+        self._dump_evaluation_logs_to_file(evaluation)
         self._stop_evaluation(evaluation)
 
     def _sync_evaluation_result(self, evaluation: Evaluation):
@@ -257,12 +288,43 @@ class EvaluationManager:
         return False
 
     def _stop_evaluation(self, evaluation: Evaluation):
-        pass
-        # if self._is_provisioning(evaluation):
-        #     terminate_process_tree(self._provisioning_processes[evaluation.id].pid)
-        # delete_workload(evaluation.name)
-        # self._provisioning_processes.pop(evaluation.id, None)
-        # self._clear_active_evaluation(evaluation.id)
+        if self._is_provisioning(evaluation):
+            terminate_process_tree(self._provisioning_processes[evaluation.id].pid)
+
+        try:
+            delete_workload(evaluation.name)
+        except Exception:
+            logger.debug(
+                "Failed to delete evaluation workload %s(id=%s)",
+                evaluation.name,
+                evaluation.id,
+                exc_info=True,
+            )
+
+        self._provisioning_processes.pop(evaluation.id, None)
+        self._clear_active_evaluation(evaluation.id)
+
+    def _dump_evaluation_logs_to_file(self, evaluation: Evaluation):
+        try:
+            logs = logs_workload(name=evaluation.name)
+        except Exception as e:
+            logger.error(
+                "Failed to fetch workload logs for evaluation %s(id=%s): %s",
+                evaluation.name,
+                evaluation.id,
+                e,
+            )
+            return
+
+        log_file_path = f"{self._evaluation_log_dir}/{evaluation.id}.log"
+        with open(log_file_path, "a", encoding="utf-8") as f:
+            log_str = logs
+            if isinstance(log_str, bytes):
+                log_str = log_str.decode("utf-8", errors="replace")
+            log_str = str(log_str)
+            f.write(log_str)
+            if not log_str.endswith("\n"):
+                f.write("\n")
 
     def _set_active_evaluation(self, evaluation_id: int):
         self._active_evaluation_id = evaluation_id

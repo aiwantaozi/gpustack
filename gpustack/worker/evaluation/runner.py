@@ -91,6 +91,11 @@ class EvaluationRunner:
             tokenizer=self._instance_snapshot.resolved_path or "",
             tasks=suite.tasks,
             batch_size=1,
+            limit=(
+                self._evaluation.limit
+                if self._evaluation.limit is not None
+                else suite.limit
+            ),
         )
         command.extend(
             [

@@ -86,15 +86,40 @@ items:
     description: >
       Fast preset for a low-cost first pass. Covers broad general quality,
       instruction following, and baseline coding ability without the heavier
-      long-context or hard-science tasks.
+      long-context or hard-science tasks. Uses a small per-task sample limit
+      by default instead of running the full dataset.
     category: preset
     tasks:
       - mmlu_pro
       - ifeval
       - humaneval
+    limit: 10
     estimated_runtime_level: short
     recommended_for:
       - quick smoke tests
       - default first-run evaluation
       - low-cost model screening
+    default_enabled: true
+
+  - id: all-tasks
+    name: All Tasks
+    description: >
+      Full preset that runs every task from the built-in suites without any
+      default sample limit. Use this when you want the complete built-in
+      evaluation coverage rather than a quick screening pass.
+    category: preset
+    tasks:
+      - mmlu_pro
+      - leaderboard_gpqa
+      - ifeval
+      - aime
+      - humaneval
+      - longbench2
+      - mmmlu
+      - ceval-valid
+    estimated_runtime_level: long
+    recommended_for:
+      - full regression runs
+      - pre-release validation
+      - maximum built-in task coverage
     default_enabled: true

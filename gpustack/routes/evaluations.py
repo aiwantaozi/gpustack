@@ -184,6 +184,18 @@ async def update_evaluation_result(
     return evaluation
 
 
+@router.delete("/{id}")
+async def delete_evaluation(session: SessionDep, id: int):
+    evaluation = await Evaluation.one_by_id(session, id)
+    if not evaluation:
+        raise NotFoundException(message="Evaluation not found")
+
+    try:
+        await evaluation.delete(session)
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to delete evaluation: {e}")
+
+
 task_router = APIRouter()
 
 

@@ -9,6 +9,7 @@ class EvaluationSuite(BaseModel):
     description: str
     category: str
     tasks: List[str] = Field(default_factory=list)
+    limit: Optional[float] = Field(default=None, gt=0)
     estimated_runtime_level: str
     recommended_for: Optional[List[str]] = Field(default=None)
     default_enabled: bool = Field(default=True)

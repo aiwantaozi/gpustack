@@ -15,11 +15,12 @@ def build_lm_eval_command(
     tokenizer: str,
     tasks: Iterable[str],
     batch_size: int,
+    limit: Optional[float] = None,
 ) -> List[str]:
     model = _resolve_lm_eval_model(backend)
     model_args = f"pretrained={pretrained},base_url={base_url},tokenizer={tokenizer}"
 
-    return [
+    command = [
         "lm-eval",
         "--model",
         model,
@@ -29,4 +30,11 @@ def build_lm_eval_command(
         ",".join(tasks),
         "--batch_size",
         str(batch_size),
+        "--confirm-run-unsafe-code",
+        "--trust-remote-code",
     ]
+
+    if limit is not None:
+        command.extend(["--limit", str(limit)])
+
+    return command

@@ -21,6 +21,8 @@ def test_build_lm_eval_command_for_default_backend():
         "tinyHellaswag",
         "--batch_size",
         "1",
+        "--confirm-run-unsafe-code",
+        "--trust-remote-code",
     ]
 
 
@@ -44,4 +46,20 @@ def test_build_lm_eval_command_for_sglang_backend():
         "tinyHellaswag",
         "--batch_size",
         "1",
+        "--confirm-run-unsafe-code",
+        "--trust-remote-code",
     ]
+
+
+def test_build_lm_eval_command_with_limit():
+    command = build_lm_eval_command(
+        backend="vLLM",
+        pretrained="qwen3.5-9b-vllm",
+        base_url="http://192.168.50.16:40057/v1/completions",
+        tokenizer="/data/gpustack_cache/huggingface/Qwen/Qwen3.5-9B",
+        tasks=["tinyHellaswag"],
+        batch_size=1,
+        limit=10,
+    )
+
+    assert command[-2:] == ["--limit", "10"]

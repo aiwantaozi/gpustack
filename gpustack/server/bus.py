@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
 # Re-export from coordinator.base for backward compatibility
 from gpustack.server.coordinator.base import Event, EventType
@@ -9,10 +10,21 @@ from gpustack.server.coordinator.models import get_model_for_topic
 
 logger = logging.getLogger(__name__)
 
+
+class EventCountKind(Enum):
+    """Subscriber-side counter buckets surfaced as Prometheus labels."""
+
+    RECEIVED = "received"
+    COALESCED = "coalesced"
+    ENQUEUED = "enqueued"
+    DROPPED = "dropped"
+
+
 # Re-export for backward compatibility
 __all__ = [
     'Event',
     'EventType',
+    'EventCountKind',
     'Subscriber',
     'EventBus',
     'event_bus',
@@ -28,22 +40,34 @@ def event_decoder(obj):
 
 
 class Subscriber:
-    def __init__(self):
+    def __init__(self, topic: Optional[str] = None, source: Optional[str] = None):
+        self.topic = topic
+        self.source = source
         self.queue = asyncio.Queue(maxsize=1024)
         self.latest_by_key = {}
         self.lock = asyncio.Lock()
+        # Read by ``BusMetricsCollector`` and reflected as Prometheus counters.
+        self.event_counts: Dict[Tuple[EventCountKind, str], int] = {}
+
+    def _bump(self, kind: EventCountKind, event_type: EventType) -> None:
+        key = (kind, event_type.name)
+        self.event_counts[key] = self.event_counts.get(key, 0) + 1
 
     async def enqueue(self, event: Event):
+        self._bump(EventCountKind.RECEIVED, event.type)
+
         # Squash UPDATED events by keeping only the latest per key
         if event.type == EventType.UPDATED and event.id is not None:
             async with self.lock:
                 if event.id in self.latest_by_key:
                     self.latest_by_key[event.id] = event
+                    self._bump(EventCountKind.COALESCED, event.type)
                     return
                 self.latest_by_key[event.id] = event
 
             try:
                 self.queue.put_nowait(event)
+                self._bump(EventCountKind.ENQUEUED, event.type)
             except asyncio.QueueFull:
                 # If the queue is full, skip adding the event, relying on latest_by_key, could receive it later
                 logger.warning(
@@ -51,10 +75,12 @@ class Subscriber:
                     id(self),
                     event.id,
                 )
+                self._bump(EventCountKind.DROPPED, event.type)
             return
 
         # For other event types, enqueue directly
         await self.queue.put(event)
+        self._bump(EventCountKind.ENQUEUED, event.type)
 
     async def receive(self) -> Any:
         event = await self.queue.get()
@@ -100,9 +126,9 @@ class EventBus:
                 pass
         logger.info("EventBus stopped")
 
-    def subscribe(self, topic: str) -> Subscriber:
-        """Subscribe to a topic."""
-        subscriber = Subscriber()
+    def subscribe(self, topic: str, source: Optional[str] = None) -> Subscriber:
+        """Subscribe to a topic. ``source`` is a free-form label for metrics."""
+        subscriber = Subscriber(topic=topic, source=source)
         if topic not in self.subscribers:
             self.subscribers[topic] = []
             # Subscribe to coordinator if available

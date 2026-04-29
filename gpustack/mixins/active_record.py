@@ -748,7 +748,7 @@ class ActiveRecordMixin:
         cls, source: str, options: Optional[List] = None
     ) -> AsyncGenerator[Event, None]:
         topic = cls.__name__.lower()
-        subscriber = event_bus.subscribe(cls.__name__.lower())
+        subscriber = event_bus.subscribe(topic, source=source)
         logger.info(
             "subscribed, source=%s topic=%s subscriber=%s",
             source,

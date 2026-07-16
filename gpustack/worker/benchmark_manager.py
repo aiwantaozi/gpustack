@@ -18,9 +18,11 @@ from gpustack.config.config import Config
 from gpustack.config import registration
 from gpustack.logging import RedirectStdoutStderr
 from gpustack.schemas.benchmark import (
+    DATASET_CUSTOM,
     Benchmark,
     BenchmarkStateEnum,
 )
+from gpustack.schemas.datasets import DatasetStateEnum
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.benchmark.runner import BenchmarkRunner
 from gpustack.client import ClientSet
@@ -40,6 +42,10 @@ HTTP_ERROR_PATTERN = re.compile(
 TRUNCATION_SUFFIX = "..."
 BENCHMARK_STATE_MESSAGE_MAX_LEN = 1024
 BENCHMARK_FAILURE_REASON_MAX_LEN = 220
+# Snapshot the running container's logs to disk at most this often, so logs are
+# preserved even if the container is garbage-collected before we poll a terminal
+# state (see _maybe_snapshot_logs).
+BENCHMARK_LOG_SNAPSHOT_INTERVAL_SECONDS = 30
 
 
 class BenchmarkManager:
@@ -106,6 +112,10 @@ class BenchmarkManager:
         self._worker_task = None
         self._active_benchmark_id = None
         self._active_benchmark_started_at = None
+        # Per-benchmark: byte offset where the container logs begin (after the
+        # provisioning logs the subprocess wrote), and the last snapshot time.
+        self._container_log_offset: Dict[int, int] = {}
+        self._last_log_snapshot_at: Dict[int, float] = {}
 
         os.makedirs(self._benchmark_log_dir, exist_ok=True)
         os.makedirs(self._benchmark_dir, exist_ok=True)
@@ -190,6 +200,17 @@ class BenchmarkManager:
                 elif self._benchmark_queue:
                     benchmark = self._benchmark_queue.popleft()
             if benchmark:
+                # Lifecycle gate: a benchmark referencing a custom Dataset
+                # can be created before the dataset finishes downloading. Hold it in
+                # the queue until READY; fail it if the dataset errors.
+                gate = await self._check_dataset_ready(benchmark)
+                if gate == "wait":
+                    async with self._queue_lock:
+                        self._benchmark_queue.append(benchmark)
+                    await asyncio.sleep(3)
+                    continue
+                if gate == "error":
+                    continue
                 try:
                     await self._start_benchmark(benchmark)
                 except Exception as e:
@@ -198,6 +219,47 @@ class BenchmarkManager:
                     )
             else:
                 await asyncio.sleep(1)
+
+    async def _check_dataset_ready(self, benchmark: Benchmark) -> str:
+        """Return 'ready' / 'wait' / 'error' for the benchmark's custom dataset.
+
+        Non-custom benchmarks are always 'ready'. On 'error' the benchmark has
+        already been moved to ERROR.
+        """
+        if benchmark.dataset_name != DATASET_CUSTOM or benchmark.dataset_id is None:
+            return "ready"
+        try:
+            dataset = await asyncio.to_thread(
+                self._clientset.datasets.get, id=benchmark.dataset_id
+            )
+        except Exception as e:
+            await self._update_benchmark_state(
+                benchmark.id,
+                state=BenchmarkStateEnum.ERROR,
+                state_message=f"Dataset {benchmark.dataset_id} not found: {e}",
+            )
+            return "error"
+
+        if dataset is None:
+            await self._update_benchmark_state(
+                benchmark.id,
+                state=BenchmarkStateEnum.ERROR,
+                state_message=f"Dataset {benchmark.dataset_id} not found",
+            )
+            return "error"
+        if dataset.state == DatasetStateEnum.READY:
+            return "ready"
+        if dataset.state == DatasetStateEnum.ERROR:
+            await self._update_benchmark_state(
+                benchmark.id,
+                state=BenchmarkStateEnum.ERROR,
+                state_message=(
+                    f"Dataset '{dataset.readable_source}' download failed: "
+                    f"{dataset.state_message}"
+                ),
+            )
+            return "error"
+        return "wait"
 
     async def _start_benchmark(self, benchmark: Benchmark):
         """
@@ -335,6 +397,8 @@ class BenchmarkManager:
         # Cleanup internal states.
         self._provisioning_processes.pop(benchmark.id, None)
         self._benchmark_by_id.pop(benchmark.id, None)
+        self._container_log_offset.pop(benchmark.id, None)
+        self._last_log_snapshot_at.pop(benchmark.id, None)
         self._clear_active_benchmark(benchmark.id)
 
         logger.info(f"Stopped benchmark {benchmark.name}(id={benchmark.id})")
@@ -385,6 +449,11 @@ class BenchmarkManager:
 
         # Get workload and handle based on state
         workload = get_workload(benchmark.name)
+
+        # Snapshot container logs while running, so we still have them if the
+        # container is garbage-collected before we observe a terminal state.
+        if workload and workload.state == WorkloadStatusStateEnum.RUNNING:
+            self._maybe_snapshot_logs(benchmark)
 
         if self._should_skip_workload(benchmark, workload):
             return
@@ -465,15 +534,97 @@ class BenchmarkManager:
         self._dump_benchmark_logs_to_file(benchmark)
         self._stop_benchmark(benchmark)
 
-    def _sync_benchmark_metrics(self, benchmark):
+    def _sync_benchmark_metrics(self, benchmark):  # noqa: C901
         """
         Synchronize benchmarks' metrics.
         """
         metrics = None
+        results = []
+        report = None
         try:
-            metrics_file_path = f"{self._benchmark_dir}/{benchmark.id}.json"
-            report = GenerativeBenchmarksReport.load_file(metrics_file_path)
-            metrics = report.to_metrics()
+            if benchmark.auto_tune:
+                # Adaptive ramp: benchmark-runner writes one file per measured
+                # point ({id}__p{index}.json), the point count decided at runtime.
+                # Aggregate all points; representative = global throughput peak.
+                # Missing/corrupt files are skipped (logged) so a bad point
+                # doesn't drop the whole run.
+                best = None
+                prefix = f"{benchmark.id}__p"
+                try:
+                    names = [
+                        n
+                        for n in os.listdir(self._benchmark_dir)
+                        if n.startswith(prefix)
+                        and n.endswith(".json")
+                        and not n.endswith(".full.json")
+                    ]
+                except Exception:
+                    names = []
+
+                def _point_index(name: str) -> int:
+                    m = re.search(r"__p(\d+)\.json$", name)
+                    return int(m.group(1)) if m else 0
+
+                for name in sorted(names, key=_point_index):
+                    path = f"{self._benchmark_dir}/{name}"
+                    try:
+                        rep = GenerativeBenchmarksReport.load_file(path)
+                    except Exception as e:
+                        logger.warning(
+                            f"Skipping auto-tune point {name} of benchmark "
+                            f"{benchmark.name}(id={benchmark.id}); result file "
+                            f"unavailable: {e}"
+                        )
+                        continue
+                    if report is None:
+                        report = rep  # primary report for error samples
+                    results.extend(
+                        rep.to_results(input_tokens=benchmark.dataset_input_tokens)
+                    )
+                    m = rep.to_metrics()
+                    if m and (
+                        best is None
+                        or (m.tokens_per_second_mean or 0)
+                        > (best.tokens_per_second_mean or 0)
+                    ):
+                        best = m
+                metrics = best
+            elif benchmark.stages:
+                # v2.1 stages: aggregate per-stage result files
+                # ({id}__stage{i}.json), one single-rate run each.
+                # Representative = global throughput peak. A missing/corrupt
+                # stage file is skipped (logged) so the other stages still
+                # report — a failure in one stage shouldn't drop the whole run.
+                best = None
+                for i in range(len(benchmark.stages)):
+                    path = f"{self._benchmark_dir}/{benchmark.id}__stage{i}.json"
+                    try:
+                        rep = GenerativeBenchmarksReport.load_file(path)
+                    except Exception as e:
+                        logger.warning(
+                            f"Skipping stage {i} of benchmark "
+                            f"{benchmark.name}(id={benchmark.id}); result file "
+                            f"unavailable: {e}"
+                        )
+                        continue
+                    if report is None:
+                        report = rep  # primary report for error samples
+                    results.extend(
+                        rep.to_results(input_tokens=benchmark.dataset_input_tokens)
+                    )
+                    m = rep.to_metrics()
+                    if m and (
+                        best is None
+                        or (m.tokens_per_second_mean or 0)
+                        > (best.tokens_per_second_mean or 0)
+                    ):
+                        best = m
+                metrics = best
+            else:
+                metrics_file_path = f"{self._benchmark_dir}/{benchmark.id}.json"
+                report = GenerativeBenchmarksReport.load_file(metrics_file_path)
+                metrics = report.to_metrics()
+                results = report.to_results(input_tokens=benchmark.dataset_input_tokens)
         except Exception as e:
             logger.error(
                 f"Failed to load metrics for benchmark {benchmark.name}(id={benchmark.id}): {e}"
@@ -486,10 +637,20 @@ class BenchmarkManager:
             )
             return
 
-        total = metrics.request_total or 0
-        successful = metrics.request_successful or 0
-        errored = metrics.request_errored or 0
-        incomplete = metrics.request_incomplete or 0
+        # Failure counts aggregate across ALL stages/points — a failure in any
+        # stage should surface, not only the representative peak point. (For a
+        # single-run benchmark `results` has one point, so this matches the old
+        # behavior.)
+        if results:
+            total = sum(r.get("request_total") or 0 for r in results)
+            successful = sum(r.get("request_successful") or 0 for r in results)
+            errored = sum(r.get("request_errored") or 0 for r in results)
+            incomplete = sum(r.get("request_incomplete") or 0 for r in results)
+        else:
+            total = metrics.request_total or 0
+            successful = metrics.request_successful or 0
+            errored = metrics.request_errored or 0
+            incomplete = metrics.request_incomplete or 0
 
         try:
             errored_samples, incomplete_samples = self._load_request_samples(
@@ -524,11 +685,218 @@ class BenchmarkManager:
         )
         raise_if_response_error(resp)
 
+        # Upload per-point results (one row per (input_tokens, rate) grid cell).
+        # The parent metrics above hold the representative (throughput-peak) point.
+        try:
+            resp = self._clientset.http_client.get_httpx_client().post(
+                f"/benchmarks/{benchmark.id}/results", json=results
+            )
+            raise_if_response_error(resp)
+        except Exception as e:
+            logger.error(
+                "Failed to upload benchmark results for "
+                f"{benchmark.name}(id={benchmark.id}): {e}"
+            )
+
+        # v2.1 best operating points: peak throughput / latency-throughput knee /
+        # max rate meeting the SLA. Computed from the per-point grid and persisted
+        # on the parent row for the detail page's "Best Operating Points" cards.
+        best_points = self._compute_best_points(benchmark, results)
+        # v2.1 test-coverage validity: whether the sweep explored enough to trust
+        # the result (single source of truth on the parent; the UI just renders
+        # the warning codes). See _compute_validity.
+        validity = self._compute_validity(benchmark, results, best_points)
+        patch = {**best_points, "validity": validity}
+        try:
+            self._update_benchmark_state_sync(benchmark.id, **patch)
+        except Exception as e:
+            logger.error(
+                "Failed to update best operating points / validity for "
+                f"{benchmark.name}(id={benchmark.id}): {e}"
+            )
+
+        # Surface partial failures (errored / incomplete requests) on the
+        # benchmark's state_message so the UI shows why a run partly failed.
         if partial_failure_message:
             self._update_benchmark_state_sync(
                 benchmark.id,
                 state_message=partial_failure_message,
             )
+
+    # SLA thresholds ("<=" ms). Each: (benchmark attr, point metric key, scale) —
+    # a point's (metric * scale) must be <= the threshold. request_latency is
+    # stored in seconds, so it scales to ms (x1000); TTFT/TPOT are already ms.
+    # A point meets the SLA when EVERY set threshold holds (AND) + success ok.
+    _SLA_CHECKS = [
+        ("sla_avg_ttft_ms", "time_to_first_token_mean", 1.0),
+        ("sla_p99_ttft_ms", "time_to_first_token_p99", 1.0),
+        ("sla_avg_tpot_ms", "time_per_output_token_mean", 1.0),
+        ("sla_p99_tpot_ms", "time_per_output_token_p99", 1.0),
+        ("sla_avg_latency_ms", "request_latency_mean", 1000.0),
+        ("sla_p99_latency_ms", "request_latency_p99", 1000.0),
+    ]
+
+    @staticmethod
+    def _has_sla(benchmark) -> bool:
+        return any(
+            getattr(benchmark, attr, None)
+            for attr, _, _ in BenchmarkManager._SLA_CHECKS
+        )
+
+    @staticmethod
+    def _meets_sla(benchmark, r: dict) -> bool:
+        """True iff every SET SLA threshold holds for this point (AND)."""
+        for attr, key, scale in BenchmarkManager._SLA_CHECKS:
+            thr = getattr(benchmark, attr, None)
+            if thr is None:
+                continue
+            val = r.get(key)
+            if val is None or val * scale > thr:
+                return False
+        return True
+
+    @staticmethod
+    def _success_ok(r: dict) -> bool:
+        total = r.get("request_total") or 0
+        if total <= 0:
+            return False
+        return (
+            r.get("request_successful") or 0
+        ) / total >= BenchmarkManager._MIN_SUCCESS_RATE
+
+    @staticmethod
+    def _compute_best_points(benchmark, results: list) -> dict:
+        """Derive best operating points from the per-rate result grid.
+
+        - peak_rate: rate at the global throughput peak.
+        - knee_rate: rate at the latency-throughput knee (best balance).
+        - sla_met_rate / recommended_rate: when SLA targets are set, the max rate
+          whose TTFT/TPOT both stay within the SLA thresholds (ms).
+        """
+        points = [
+            r
+            for r in results
+            if r.get("rate") is not None and r.get("tokens_per_second_mean") is not None
+        ]
+        if not points:
+            return {}
+        points = sorted(points, key=lambda r: r["rate"])
+        out: dict = {}
+
+        peak = max(points, key=lambda r: r.get("tokens_per_second_mean") or 0)
+        out["peak_rate"] = float(peak["rate"])
+
+        knee = BenchmarkManager._find_knee(points)
+        if knee is not None:
+            out["knee_rate"] = float(knee["rate"])
+
+        if BenchmarkManager._has_sla(benchmark):
+            met = [
+                r
+                for r in points
+                if BenchmarkManager._meets_sla(benchmark, r)
+                and BenchmarkManager._success_ok(r)
+            ]
+            if met:
+                sla_rate = float(max(met, key=lambda r: r["rate"])["rate"])
+                out["sla_met_rate"] = sla_rate
+                out["recommended_rate"] = sla_rate
+        else:
+            # No SLA => the user asked for maximum throughput and stated no latency
+            # budget, so recommend the throughput peak (matches the Max Throughput
+            # profile and the runner's argmax search). knee_rate is still computed
+            # above and surfaced as an informational "balanced" point on the chart;
+            # it is deliberately NOT the recommendation. Points past the peak are
+            # already excluded by the overload / throughput-drop guards, so no extra
+            # latency guard is needed here.
+            out["recommended_rate"] = out.get("peak_rate")
+
+        return out
+
+    # A sampled point's success rate below this = overloaded / not trustworthy.
+    _MIN_SUCCESS_RATE = 0.95
+
+    @staticmethod
+    def _compute_validity(benchmark, results: list, best_points: dict) -> dict:
+        """Judge whether the adaptive ramp explored enough to trust the result.
+
+        Returns ``{"sufficient": bool, "warnings": [{"code", "params"}]}``. Codes
+        (rendered/localized by the UI), inferred from the measured point grid:
+        - ``sla_never_met``: SLA targets set but no measured point meets them ->
+          the server is too slow for this SLA; no usable capacity.
+        - ``not_saturated``: recommended == the highest measured knob and no point
+          overloaded -> the true optimum may be higher; extend bounds / budget.
+        - ``point_high_error``: some point's success rate < 95% -> overloaded /
+          unreliable at that load (already flagged red in the table).
+        - ``few_points``: too few measured points (< 3, no SLA) to trust the curve.
+        """
+        warnings: list = []
+
+        rate_points = [r for r in results if r.get("rate") is not None]
+        has_sla = BenchmarkManager._has_sla(benchmark)
+
+        # Any measured point that overloaded (low success rate).
+        overloaded_any = False
+        worst_ok = None
+        for r in rate_points:
+            total = r.get("request_total") or 0
+            if total <= 0:
+                continue
+            ok = (r.get("request_successful") or 0) / total
+            worst_ok = ok if worst_ok is None else min(worst_ok, ok)
+            if ok < BenchmarkManager._MIN_SUCCESS_RATE:
+                overloaded_any = True
+        if overloaded_any and worst_ok is not None:
+            warnings.append(
+                {"code": "point_high_error", "params": {"rate": round(worst_ok * 100)}}
+            )
+
+        if has_sla and best_points.get("sla_met_rate") is None:
+            # SLA set but nothing met it — even the lowest load is too slow.
+            warnings.append({"code": "sla_never_met", "params": {}})
+
+        rec = best_points.get("recommended_rate")
+        # "Could go higher" only makes sense when nothing overloaded — if a point
+        # already overloaded we hit the ceiling, so don't also say "test higher".
+        if not overloaded_any and rec is not None and rate_points:
+            max_rate = max(r["rate"] for r in rate_points)
+            if rec == max_rate:
+                warnings.append({"code": "not_saturated", "params": {}})
+
+        if not has_sla and 0 < len(rate_points) < 3:
+            warnings.append({"code": "few_points", "params": {}})
+
+        return {"sufficient": len(warnings) == 0, "warnings": warnings}
+
+    @staticmethod
+    def _find_knee(points: list) -> Optional[dict]:
+        """Latency-throughput knee: the last point before latency starts rising
+        sharply relative to throughput gains. Walks rate ascending and returns
+        the point right before Δlatency/Δthroughput first exceeds 2× the mean.
+
+        Latency here is TPOT (time per output token), matching the "Throughput vs
+        Latency" decision chart's x-axis: for a max-throughput sweep the decode
+        speed (TPOT) is the throughput-relevant latency, whereas TTFT mostly
+        reflects prefill queueing."""
+        if len(points) < 3:
+            return None
+        ratios = []
+        for a, b in zip(points, points[1:]):
+            dl = (b.get("time_per_output_token_mean") or 0) - (
+                a.get("time_per_output_token_mean") or 0
+            )
+            dt = (b.get("tokens_per_second_mean") or 0) - (
+                a.get("tokens_per_second_mean") or 0
+            )
+            ratios.append(dl / dt if dt > 0 else float("inf"))
+        finite = [r for r in ratios if r != float("inf")]
+        if not finite:
+            return None
+        threshold = (sum(finite) / len(finite)) * 2.0
+        for idx, r in enumerate(ratios):
+            if r > threshold:
+                return points[idx]  # point before the sharp rise
+        return None
 
     def _log_request_failures_if_any(
         self,
@@ -743,26 +1111,65 @@ class BenchmarkManager:
             return False
         return (time.time() - self._active_benchmark_started_at) > limit
 
+    def _maybe_snapshot_logs(self, benchmark: Benchmark):
+        """Throttled log snapshot for a running benchmark (see
+        BENCHMARK_LOG_SNAPSHOT_INTERVAL_SECONDS)."""
+        last = self._last_log_snapshot_at.get(benchmark.id, 0.0)
+        now = time.time()
+        if now - last < BENCHMARK_LOG_SNAPSHOT_INTERVAL_SECONDS:
+            return
+        self._last_log_snapshot_at[benchmark.id] = now
+        self._dump_benchmark_logs_to_file(benchmark)
+
     def _dump_benchmark_logs_to_file(
         self,
         benchmark: Benchmark,
     ):
+        """Write the container's (full) logs to the benchmark log file.
+
+        The provisioning subprocess already wrote its own logs to the same file;
+        the container logs are (re)written after that boundary. `logs_workload`
+        returns the full log each call, so we truncate back to the recorded
+        boundary and rewrite — making repeated snapshots idempotent while
+        preserving the provisioning logs.
+        """
         try:
-            logs = logs_workload(
-                name=benchmark.name,
-            )
+            logs = logs_workload(name=benchmark.name)
         except Exception as e:
             logger.error(
                 f"Failed to fetch workload logs for benchmark {benchmark.name}(id={benchmark.id}): {e}"
             )
             return
+        if logs is None:
+            return
+
+        log_str = logs
+        if isinstance(log_str, (bytes, bytearray)):
+            log_str = log_str.decode("utf-8", errors="replace")
+        log_str = str(log_str)
 
         log_file_path = f"{self._benchmark_log_dir}/{benchmark.id}.log"
-        with open(log_file_path, "a", encoding="utf-8") as f:
-            log_str = logs
-            if isinstance(log_str, bytes):
-                log_str = log_str.decode("utf-8", errors="replace")
-            log_str = str(log_str)
-            f.write(log_str)
-            if not log_str.endswith("\n"):
-                f.write("\n")
+        try:
+            size = (
+                os.path.getsize(log_file_path) if os.path.exists(log_file_path) else 0
+            )
+            # Boundary = end of the provisioning logs, captured on first snapshot.
+            offset = self._container_log_offset.get(benchmark.id)
+            if offset is None:
+                offset = size
+                self._container_log_offset[benchmark.id] = offset
+            offset = min(offset, size)  # guard against a shrunk/recreated file
+
+            mode = "r+" if os.path.exists(log_file_path) else "w"
+            with open(log_file_path, mode, encoding="utf-8") as f:
+                f.seek(offset)
+                f.truncate()
+                if offset > 0:
+                    f.write("\n---- Benchmark container logs ----\n")
+                f.write(log_str)
+                if not log_str.endswith("\n"):
+                    f.write("\n")
+        except Exception as e:
+            logger.error(
+                f"Failed to write workload logs for benchmark {benchmark.name}(id={benchmark.id}): {e}"
+            )

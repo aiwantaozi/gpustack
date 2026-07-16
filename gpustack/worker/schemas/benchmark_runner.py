@@ -5,7 +5,7 @@
 import json
 import uuid
 from pathlib import Path
-from typing import Generic, Literal, Optional, Self, TypeVar
+from typing import Any, Dict, Generic, Literal, Optional, Self, TypeVar
 from pydantic import BaseModel, Field
 
 from gpustack.schemas.benchmark import BenchmarkMetrics
@@ -371,9 +371,13 @@ class GenerativeRequestStats(BaseModel):
     """
 
     type_: Literal["generative_request_stats"] = "generative_request_stats"
-    request_id: str = Field(description="Unique identifier for the request")
-    request_type: GenerativeRequestType | str = Field(
-        description="Type of generative request (text_completion or chat_completion)"
+    request_id: Optional[str] = Field(
+        default=None, description="Unique identifier for the request"
+    )
+    # Optional: truncated/errored request samples may omit this field.
+    request_type: Optional[GenerativeRequestType | str] = Field(
+        default=None,
+        description="Type of generative request (text_completion or chat_completion)",
     )
     response_id: str | None = Field(
         default=None, description="Unique identifier matching vLLM Response ID"
@@ -393,6 +397,22 @@ class GenerativeRequestStats(BaseModel):
     )
 
 
+class BenchmarkStrategy(BaseModel):
+    """Scheduling strategy of a single benchmark run (guidellm config.strategy)."""
+
+    type_: Optional[str] = None  # concurrent / constant / poisson / ...
+    streams: Optional[int] = None  # concurrent: the concurrency level
+    rate: Optional[float] = None  # constant / poisson: requests per second
+    max_concurrency: Optional[int] = None
+
+
+class BenchmarkRunConfig(BaseModel):
+    """Per-run config of a benchmark in the report (guidellm benchmark.config)."""
+
+    run_index: int = 0
+    strategy: Optional[BenchmarkStrategy] = None
+
+
 class GenerativeBenchmark(BaseModel):
     """
     Complete generative AI benchmark results with specialized metrics.
@@ -403,6 +423,10 @@ class GenerativeBenchmark(BaseModel):
     analysis and status-grouped request details for detailed post-execution reporting.
     """
 
+    config: Optional[BenchmarkRunConfig] = Field(
+        default=None,
+        description="Per-run config including scheduling strategy and run index",
+    )
     scheduler_metrics: SchedulerMetrics = Field(
         description="Scheduler timing and performance statistics",
     )
@@ -434,6 +458,15 @@ class GenerativeBenchmark(BaseModel):
             "Request details grouped by status: successful, incomplete, errored"
         ),
     )
+    scheduler_state: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Scheduler end-state. end_processing_constraints names the constraint "
+            "that actually stopped this point (max_requests = normal; "
+            "requests_exhausted = dataset ran out; max_seconds/max_errors = early "
+            "stop). Kept only to derive the termination reason, then dropped."
+        ),
+    )
 
 
 class GenerativeBenchmarksReport(BaseModel):
@@ -452,34 +485,145 @@ class GenerativeBenchmarksReport(BaseModel):
         default_factory=list,
     )
 
+    @staticmethod
+    def _termination_reason(bm: "GenerativeBenchmark") -> Optional[dict]:
+        """Which constraint stopped this point, for the UI to flag early stops.
+
+        guidellm records the satisfied end constraints in
+        ``scheduler_state.end_processing_constraints`` (keyed by constraint name).
+        We pick the one that actually halted processing (request_processing in
+        stop/stop_local), falling back to the first. ``max_requests`` means the
+        point hit its target normally; anything else (``requests_exhausted`` =
+        dataset too small, ``max_seconds`` = timed out, ``max_errors*`` = too many
+        errors) is an early stop worth surfacing.
+        """
+        ss = bm.scheduler_state
+        if not isinstance(ss, dict):
+            return None
+        end = ss.get("end_processing_constraints") or ss.get("end_queuing_constraints")
+        if not isinstance(end, dict) or not end:
+            return None
+        name, item = None, None
+        for k, v in end.items():
+            rp = v.get("request_processing") if isinstance(v, dict) else None
+            if rp in ("stop", "stop_local"):
+                name, item = k, v
+                break
+        if name is None:
+            name, item = next(iter(end.items()))
+        meta = (item.get("metadata") if isinstance(item, dict) else {}) or {}
+        # Target = the max_requests constraint's configured value (this point's
+        # goal, e.g. 960), NOT the triggering constraint's own count (which for
+        # requests_exhausted is just the dataset size = processed).
+        target = None
+        sc = ss.get("scheduler_constraints")
+        if isinstance(sc, dict) and isinstance(sc.get("max_requests"), dict):
+            target = (sc["max_requests"].get("metadata") or {}).get("max_requests")
+        if target is None:
+            target = meta.get("max_requests") or meta.get("num_requests")
+        return {
+            "reason": name,
+            "requested": target,
+            "processed": meta.get("processed_requests"),
+        }
+
+    @staticmethod
+    def _point_metrics_kwargs(bm: "GenerativeBenchmark") -> dict:
+        """Flat BenchmarkMetricsLite kwargs for one benchmark point."""
+        m = bm.metrics
+        return dict(
+            requests_per_second_mean=m.requests_per_second.successful.mean,
+            request_latency_mean=m.request_latency.successful.mean,
+            time_per_output_token_mean=m.time_per_output_token_ms.successful.mean,
+            inter_token_latency_mean=m.inter_token_latency_ms.successful.mean,
+            time_to_first_token_mean=m.time_to_first_token_ms.successful.mean,
+            # p99 percentiles for the SLA-relevant latency metrics.
+            time_to_first_token_p99=(
+                m.time_to_first_token_ms.successful.percentiles.p99
+            ),
+            time_per_output_token_p99=(
+                m.time_per_output_token_ms.successful.percentiles.p99
+            ),
+            request_latency_p99=m.request_latency.successful.percentiles.p99,
+            tokens_per_second_mean=m.tokens_per_second.successful.mean,
+            output_tokens_per_second_mean=m.output_tokens_per_second.successful.mean,
+            input_tokens_per_second_mean=m.prompt_tokens_per_second.successful.mean,
+            request_concurrency_max=m.request_concurrency.successful.max,
+            request_concurrency_mean=m.request_concurrency.successful.mean,
+            request_total=m.request_totals.total,
+            request_successful=m.request_totals.successful,
+            request_errored=m.request_totals.errored,
+            request_incomplete=m.request_totals.incomplete,
+        )
+
+    def _peak_benchmark(self) -> Optional["GenerativeBenchmark"]:
+        """Global throughput-peak point (representative of the whole task)."""
+        best = None
+        for bm in self.benchmarks:
+            if bm.metrics is None:
+                continue
+            tps = bm.metrics.tokens_per_second.successful.mean or 0
+            if best is None or tps > best[0]:
+                best = (tps, bm)
+        return best[1] if best else None
+
     def to_metrics(self) -> Optional[BenchmarkMetrics]:
         """
-        Convert the report to a gpustack benchmark metrics object.
+        Representative metrics for the parent benchmark row = the global
+        throughput-peak point across all (input_tokens, rate) cells. For a
+        single-rate run this is just the only point, preserving legacy behavior.
         """
-        if not self.benchmarks:
+        bm = self._peak_benchmark()
+        if bm is None:
             return None
-
-        if self.benchmarks[0].metrics is None:
-            return None
-
-        fbm = self.benchmarks[0].metrics
+        # scheduler_state is bulky and only needed to derive per-point termination
+        # (done in to_results); strip it from the full report dump kept here.
+        raw = self.model_dump()
+        for b in raw.get("benchmarks", []):
+            if isinstance(b, dict):
+                b.pop("scheduler_state", None)
         return BenchmarkMetrics(
-            raw_metrics=self.model_dump(),
-            requests_per_second_mean=fbm.requests_per_second.successful.mean,
-            request_latency_mean=fbm.request_latency.successful.mean,
-            time_per_output_token_mean=fbm.time_per_output_token_ms.successful.mean,
-            inter_token_latency_mean=fbm.inter_token_latency_ms.successful.mean,
-            time_to_first_token_mean=fbm.time_to_first_token_ms.successful.mean,
-            tokens_per_second_mean=fbm.tokens_per_second.successful.mean,
-            output_tokens_per_second_mean=fbm.output_tokens_per_second.successful.mean,
-            input_tokens_per_second_mean=fbm.prompt_tokens_per_second.successful.mean,
-            request_concurrency_max=fbm.request_concurrency.successful.max,
-            request_concurrency_mean=fbm.request_concurrency.successful.mean,
-            request_total=fbm.request_totals.total,
-            request_successful=fbm.request_totals.successful,
-            request_errored=fbm.request_totals.errored,
-            request_incomplete=fbm.request_totals.incomplete,
+            raw_metrics=raw,
+            **self._point_metrics_kwargs(bm),
         )
+
+    def to_results(self, input_tokens: Optional[int] = None) -> list[dict]:
+        """
+        One dict per measured (input_tokens, rate) grid point, for upload into the
+        benchmark_results sub-table. `benchmark_id` is filled in by the server from
+        the request path; `raw_metrics` carries this point's benchmarks[i] dump.
+        """
+        results: list[dict] = []
+        for bm in self.benchmarks:
+            if bm.metrics is None:
+                continue
+            strat = bm.config.strategy if bm.config else None
+            strategy_type = strat.type_ if strat else None
+            if strat is not None and strat.type_ == "concurrent":
+                rate = strat.streams
+            elif strat is not None:
+                rate = strat.rate
+            else:
+                rate = None
+            sequence = bm.config.run_index if bm.config else len(results)
+            # Keep a compact termination reason in raw_metrics; drop the bulky
+            # scheduler_state that produced it.
+            raw = bm.model_dump()
+            raw.pop("scheduler_state", None)
+            termination = self._termination_reason(bm)
+            if termination:
+                raw["termination"] = termination
+            results.append(
+                dict(
+                    sequence=sequence,
+                    strategy_type=strategy_type,
+                    rate=float(rate) if rate is not None else None,
+                    input_tokens=input_tokens,
+                    raw_metrics=raw,
+                    **self._point_metrics_kwargs(bm),
+                )
+            )
+        return results
 
     @classmethod
     def load_file(cls, path: str) -> Self:

@@ -1,6 +1,6 @@
 from sqlmodel import col
 import yaml
-from typing import Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 import aiohttp
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -32,14 +32,19 @@ from gpustack.schemas.models import (
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
+from gpustack.schemas.datasets import Dataset
 from gpustack.schemas.benchmark import (
+    DATASET_CUSTOM,
     DATASET_RANDOM,
     DATASET_SHAREGPT,
     Benchmark,
+    DatasetSnapshot,
     BenchmarkCreate,
     BenchmarkFullPublic,
     BenchmarkListParams,
     BenchmarkMetrics,
+    BenchmarkResult,
+    BenchmarkResultPublic,
     BenchmarkSnapshot,
     BenchmarkStateEnum,
     BenchmarkStateUpdate,
@@ -103,6 +108,9 @@ async def get_benchmarks(
     gpu_summary: Optional[str] = Query(None, description="Filter by GPU summary."),
     dataset_name: Optional[str] = Query(None, description="Filter by dataset name."),
     profile: Optional[str] = Query(None, description="Filter by profile."),
+    load_type: Optional[str] = Query(
+        None, description="Filter by load type (fixed_rate / concurrency)."
+    ),
 ):
     return await _get_benchmarks(
         ctx=ctx,
@@ -113,6 +121,7 @@ async def get_benchmarks(
         gpu_summary=gpu_summary,
         dataset_name=dataset_name,
         profile=profile,
+        load_type=load_type,
     )
 
 
@@ -158,6 +167,7 @@ async def _get_benchmarks(
     gpu_summary: Optional[str] = None,
     dataset_name: Optional[str] = None,
     profile: Optional[str] = None,
+    load_type: Optional[str] = None,
 ):
     fuzzy_fields = {}
     if search:
@@ -169,6 +179,11 @@ async def _get_benchmarks(
 
     if dataset_name:
         fields["dataset_name"] = dataset_name
+
+    # `load_type` (fixed_rate / concurrency) filter (exact match; every row
+    # carries a load_type).
+    def _load_type_match(data) -> bool:
+        return not load_type or data.load_type == load_type
 
     extra_conditions = list(cluster_resource_visibility_conditions(ctx, Benchmark))
     if gpu_summary:
@@ -183,6 +198,8 @@ async def _get_benchmarks(
         extra_conditions.append(
             func.lower(Benchmark.model_name).like(f"%{model_name.lower()}%")
         )
+    if load_type:
+        extra_conditions.append(Benchmark.load_type == load_type)
 
     _benchmark_visible = _make_benchmark_visibility_filter(ctx)
 
@@ -194,7 +211,8 @@ async def _get_benchmarks(
                 filter_func=lambda data: _benchmark_visible(data)
                 and gpu_summary_filter(data, gpu_summary)
                 and _fuzzy_contains(profile, data.profile)
-                and _fuzzy_contains(model_name, data.model_name),
+                and _fuzzy_contains(model_name, data.model_name)
+                and _load_type_match(data),
             ),
             media_type="text/event-stream",
         )
@@ -241,7 +259,7 @@ async def get_benchmark(
     return benchmark
 
 
-async def validate_and_mutate_benchmark_in(
+async def validate_and_mutate_benchmark_in(  # noqa: C901
     session: SessionDep, benchmark_in: BenchmarkCreate
 ) -> Benchmark:
 
@@ -269,9 +287,13 @@ async def validate_and_mutate_benchmark_in(
     if benchmark_in.dataset_name is None:
         raise BadRequestException(message="Field dataset_name must be specified")
 
-    if benchmark_in.dataset_name not in [DATASET_RANDOM, DATASET_SHAREGPT]:
+    if benchmark_in.dataset_name not in [
+        DATASET_RANDOM,
+        DATASET_SHAREGPT,
+        DATASET_CUSTOM,
+    ]:
         raise BadRequestException(
-            message=f"Dataset '{benchmark_in.dataset_name}' is not supported. Supported datasets are '{DATASET_RANDOM}' and '{DATASET_SHAREGPT}'."
+            message=f"Dataset '{benchmark_in.dataset_name}' is not supported. Supported datasets are '{DATASET_RANDOM}', '{DATASET_SHAREGPT}' and '{DATASET_CUSTOM}'."
         )
 
     if benchmark_in.dataset_name == DATASET_RANDOM and (
@@ -280,6 +302,43 @@ async def validate_and_mutate_benchmark_in(
     ):
         raise BadRequestException(
             message="Fields dataset_input_tokens and dataset_output_tokens must be specified for 'Random' dataset"
+        )
+
+    dataset_snapshot: Optional[DatasetSnapshot] = None
+    if benchmark_in.dataset_name == DATASET_CUSTOM:
+        if benchmark_in.dataset_id is None:
+            raise BadRequestException(
+                message="Field dataset_id must be specified for a custom 'Dataset'"
+            )
+        dataset = await Dataset.one_by_id(session, benchmark_in.dataset_id)
+        if not dataset:
+            raise BadRequestException(
+                message=f"Dataset {benchmark_in.dataset_id} not found"
+            )
+        # Co-location: the dataset must live on the same worker as the target
+        # instance so it can be mounted into the benchmark container.
+        if dataset.worker_id is not None and dataset.worker_id != instance.worker_id:
+            raise BadRequestException(
+                message=(
+                    f"Dataset '{dataset.readable_source}' is on worker {dataset.worker_id} but "
+                    f"the instance runs on worker {instance.worker_id}. Pick a dataset "
+                    "on the instance's worker or create one there."
+                )
+            )
+        # `dataset_name` stays the TYPE ("Dataset") — it is the form's dataset-type
+        # selector value and must round-trip through clone/edit. The actual dataset
+        # is referenced by `dataset_id` (run-time mount) and snapshotted below for
+        # display (self-contained, survives resource deletion).
+        dataset_snapshot = DatasetSnapshot(
+            dataset_id=dataset.id,
+            source=dataset.source.value,
+            readable_source=dataset.readable_source,
+            huggingface_repo_id=dataset.huggingface_repo_id,
+            huggingface_filename=dataset.huggingface_filename,
+            model_scope_model_id=dataset.model_scope_model_id,
+            model_scope_file_path=dataset.model_scope_file_path,
+            local_path=dataset.local_path,
+            column_mapping=dataset.column_mapping,
         )
 
     model = await Model.one_by_id(session, mutated.model_id)
@@ -304,6 +363,8 @@ async def validate_and_mutate_benchmark_in(
         )  # treat non-positive request_rate as unlimited
 
     snapshot = await get_benchmark_snapshot(session, instance, model)
+    if dataset_snapshot is not None:
+        snapshot.dataset = dataset_snapshot
     mutated.snapshot = snapshot
     mutated.gpu_summary, mutated.gpu_vendor_summary = summary_gpu_snapshots(
         snapshot.gpus
@@ -390,6 +451,23 @@ async def update_benchmark_state(
             message="Only benchmarks in QUEUED, PENDING, or RUNNING state can be stopped."
         )
 
+    # Progress is monotonic within a run: a multi-stage run reports each stage's
+    # slice of the overall bar, so the server must never let it move backward.
+    # Reset to 0 only when (re)entering RUNNING (a fresh / re-run).
+    entering_running = (
+        state_update.state == BenchmarkStateEnum.RUNNING
+        and benchmark.state != BenchmarkStateEnum.RUNNING
+    )
+    if entering_running:
+        state_update.progress = 0.0
+        state_update.__pydantic_fields_set__.add("progress")
+    elif (
+        state_update.progress is not None
+        and benchmark.progress is not None
+        and state_update.progress < benchmark.progress
+    ):
+        state_update.progress = benchmark.progress
+
     try:
         await benchmark.update(session, state_update)
     except Exception as e:
@@ -455,6 +533,56 @@ async def update_benchmark_metrics(
         )
 
     return benchmark
+
+
+@router.post(
+    "/{id}/results",
+    response_model=BenchmarkPublic,
+)
+async def update_benchmark_results(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    results: List[Dict[str, Any]],
+):
+    """
+    Replace the benchmark's per-point results (one row per (input_tokens, rate)
+    grid cell). Idempotent: existing rows for this benchmark are removed first so
+    a re-run overwrites cleanly.
+    """
+    benchmark = await Benchmark.one_by_id(session, id)
+    assert_cluster_resource_visible(
+        ctx, benchmark, not_found_message="Benchmark not found"
+    )
+    try:
+        existing = await BenchmarkResult.all_by_field(session, "benchmark_id", id)
+        for row in existing:
+            await row.delete(session, auto_commit=False)
+        for data in results:
+            await BenchmarkResult.create(
+                session, source={**data, "benchmark_id": id}, auto_commit=False
+            )
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        raise InternalServerErrorException(
+            message=f"Failed to update benchmark results: {e}"
+        )
+
+    return benchmark
+
+
+@router.get(
+    "/{id}/results",
+    response_model=List[BenchmarkResultPublic],
+)
+async def get_benchmark_results(session: SessionDep, ctx: TenantContextDep, id: int):
+    benchmark = await Benchmark.one_by_id(session, id)
+    assert_cluster_resource_visible(
+        ctx, benchmark, not_found_message="Benchmark not found"
+    )
+    results = await BenchmarkResult.all_by_field(session, "benchmark_id", id)
+    return sorted(results, key=lambda r: (r.input_tokens or 0, r.sequence))
 
 
 @router.delete(

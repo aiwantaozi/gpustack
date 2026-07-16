@@ -38,6 +38,7 @@ from gpustack.routes import (
     token,
     benchmarks,
     benchmark_profiles,
+    datasets,
     model_provider,
     rerank,
     model_routes,
@@ -190,6 +191,12 @@ model_routers = [
         "router": benchmark_profiles.router,
         "prefix": "/benchmark-profiles",
         "tags": ["Benchmark Profiles"],
+        "dependencies": _org_owner_only,
+    },
+    {
+        "router": datasets.router,
+        "prefix": "/datasets",
+        "tags": ["Datasets"],
         "dependencies": _org_owner_only,
     },
     {

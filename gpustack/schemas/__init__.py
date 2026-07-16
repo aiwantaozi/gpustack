@@ -82,6 +82,13 @@ from gpustack.schemas.resource_events import (  # noqa: F401  table registration
     ResourceEvent,
     ResourceEventArchive,
 )
+from gpustack.schemas.datasets import (
+    Dataset,
+    DatasetCreate,
+    DatasetUpdate,
+    DatasetPublic,
+    DatasetsPublic,
+)
 from gpustack.schemas.common import PaginatedList
 from gpustack.schemas.benchmark import (
     ModelInstanceRuntimeInfo,
@@ -244,6 +251,11 @@ __all__ = [
     "ModelFileUpdate",
     "ModelFilePublic",
     "ModelFilesPublic",
+    "Dataset",
+    "DatasetCreate",
+    "DatasetUpdate",
+    "DatasetPublic",
+    "DatasetsPublic",
     "CloudCredential",
     "CloudCredentialCreate",
     "CloudCredentialUpdate",

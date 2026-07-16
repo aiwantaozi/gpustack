@@ -44,6 +44,7 @@ from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.benchmark_manager import BenchmarkManager
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 from gpustack.worker.model_file_manager import ModelFileManager
+from gpustack.worker.dataset_manager import DatasetManager
 from gpustack.worker.runtime_metrics_aggregator import RuntimeMetricsAggregator
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.exporter import MetricExporter
@@ -307,6 +308,11 @@ class Worker:
             worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
         )
         self._create_async_task(model_file_manager.watch_model_files())
+
+        dataset_manager = DatasetManager(
+            worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
+        )
+        self._create_async_task(dataset_manager.watch_datasets())
 
         if self._config.proxy_mode == ModelInstanceProxyModeEnum.TUNNEL:
             docker_sock = Path("/var/run/docker.sock")

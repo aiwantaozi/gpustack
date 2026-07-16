@@ -10,6 +10,7 @@ from .generated_model_file_client import ModelFileClient
 from .generated_user_client import UserClient
 from .generated_inference_backend_client import InferenceBackendClient
 from .generated_benchmark_client import BenchmarkClient
+from .generated_dataset_client import DatasetClient
 from .generated_model_route_target_client import ModelRouteTargetClient
 
 from gpustack.ssl_context import make_ssl_context
@@ -85,6 +86,10 @@ class ClientSet:
             enable_cache=enable_cache,
         )
         self.benchmarks = BenchmarkClient(
+            http_client,
+            enable_cache=enable_cache,
+        )
+        self.datasets = DatasetClient(
             http_client,
             enable_cache=enable_cache,
         )

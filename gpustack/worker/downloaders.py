@@ -3,10 +3,11 @@ import os
 from typing import List, Optional, Union
 from tqdm.contrib.concurrent import thread_map
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from modelscope.hub.api import HubApi
 from modelscope.hub.snapshot_download import (
     snapshot_download as modelscope_snapshot_download,
+    dataset_snapshot_download,
 )
 from modelscope.hub.utils.utils import model_id_to_group_owner_name
 
@@ -73,6 +74,56 @@ def get_model_file_info(
         return file_list
 
     raise ValueError(f"Unsupported model source: {model.source}")
+
+
+def download_dataset(
+    dataset,
+    local_dir: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    huggingface_token: Optional[str] = None,
+) -> str:
+    """Download a benchmark dataset and return the path handed to ``--data``.
+
+    Whole-dataset mode returns a local directory; single-file mode
+    (``huggingface_filename`` / ``model_scope_file_path``) returns the single
+    downloaded file path. The origin (HF / ModelScope / local) is transparent to
+    the caller — the benchmark runner only ever sees a local path.
+    """
+    if dataset.source == SourceEnum.HUGGING_FACE:
+        ds_cache = os.path.join(cache_dir, "datasets", "huggingface")
+        if dataset.huggingface_filename:
+            return hf_hub_download(
+                repo_id=dataset.huggingface_repo_id,
+                filename=dataset.huggingface_filename,
+                repo_type="dataset",
+                token=huggingface_token,
+                local_dir=local_dir,
+                cache_dir=None if local_dir else ds_cache,
+            )
+        return snapshot_download(
+            repo_id=dataset.huggingface_repo_id,
+            repo_type="dataset",
+            token=huggingface_token,
+            local_dir=local_dir,
+            cache_dir=None if local_dir else ds_cache,
+        )
+    elif dataset.source == SourceEnum.MODEL_SCOPE:
+        ds_cache = os.path.join(cache_dir, "datasets", "model_scope")
+        if dataset.model_scope_file_path:
+            snapshot_dir = dataset_snapshot_download(
+                dataset.model_scope_model_id,
+                allow_patterns=[dataset.model_scope_file_path],
+                cache_dir=ds_cache,
+            )
+            return os.path.join(snapshot_dir, dataset.model_scope_file_path)
+        return dataset_snapshot_download(
+            dataset.model_scope_model_id,
+            cache_dir=ds_cache,
+        )
+    elif dataset.source == SourceEnum.LOCAL_PATH:
+        return dataset.local_path
+
+    raise ValueError(f"Unsupported dataset source: {dataset.source}")
 
 
 class HfDownloader:

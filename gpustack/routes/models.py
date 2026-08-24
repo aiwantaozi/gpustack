@@ -2,6 +2,7 @@ import logging
 import math
 from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
 from fastapi.responses import RedirectResponse, StreamingResponse
 from urllib.parse import urlencode
 from gpustack_runtime.detector import ManufacturerEnum
@@ -11,6 +12,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
+    ConflictException,
     InternalServerErrorException,
     BadRequestException,
     ForbiddenException,
@@ -48,6 +50,7 @@ from gpustack.server.deps import (
 from gpustack.schemas.models import (
     PD_MODE_BACKENDS,
     LoraListEntry,
+    RoleSpec,
     Model,
     ModelCreate,
     ModelSpecBase,
@@ -65,10 +68,12 @@ from gpustack.schemas.model_routes import (
 from gpustack.schemas.links import ModelRoutePrincipalLink
 from gpustack.schemas.principals import platform_principal_id
 from gpustack.server.services import (
+    ModelInstanceService,
     ModelService,
     WorkerService,
     revoke_model_access_cache,
 )
+from gpustack.server.controllers import model_spec_digest
 from gpustack.server.scaling_scheduler import compute_desired_replicas
 from gpustack.server.cache_provider_catalog import get_cache_provider
 from gpustack.server.lora_adapters_discovery import list_adapters_for_base
@@ -77,7 +82,7 @@ from gpustack.server.lora_model_routes import (
     create_lora_model_routes,
     is_lora_list_stale,
 )
-from gpustack.utils.command import find_parameter
+from gpustack.utils.command import find_int_parameter, find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
 from gpustack.routes.model_common import (
@@ -512,6 +517,130 @@ def validate_roles(  # noqa: C901
                 )
 
 
+# Engine parameters that must agree between prefill and decode, with the
+# spellings each engine uses for them. The split below is not stylistic: the
+# first entry is the one the engines do NOT check, and the rest are ones they
+# do — checked here anyway so the report names the role rather than surfacing
+# as a geometry assertion inside a container.
+_PAIRING_MAX_LEN = ["max-model-len", "max_model_len", "context-length"]
+_PAIRING_TP = ["tensor-parallel-size", "tp", "tp-size"]
+_PAIRING_MUST_MATCH = {
+    "dtype": ["dtype"],
+    "KV cache dtype": ["kv-cache-dtype"],
+    "block size": ["block-size", "page-size"],
+    "KV cache layout": ["kv-cache-layout"],
+}
+
+
+def _role_parameters(role: RoleSpec, model_parameters) -> List[str]:
+    """A role's effective engine parameters.
+
+    `None` inherits, an empty list does not — a role that deliberately clears
+    the model's parameters must not silently get them back.
+    """
+    if role.backend_parameters is None:
+        return list(model_parameters or [])
+    return list(role.backend_parameters)
+
+
+def validate_role_pairing(  # noqa: C901
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    stored: Optional[Model] = None,
+) -> None:
+    """Reject prefill/decode pairs the engines will accept and serve wrongly.
+
+    The division of labour with the engine is deliberate and documented in X1
+    3.1: most handshake factors are hashed by the connector and rejected on
+    contact, so re-checking them here buys attribution, not safety. Two are
+    different.
+
+    `max_model_len` is checked by nothing at all. Measured with prefill at 8192
+    and decode at 4096: the handshake passes, KV transfers, short prompts
+    answer normally, and only a prompt above decode's window fails — with a 400
+    from decode, after prefill has already computed it. The user is left
+    believing the deployment serves 8192.
+
+    Tensor parallelism is asserted by the engine at run time, but a decode
+    narrower than its prefill surfaces as an `IndexError` inside decode rather
+    than as a configuration error, so the hard block is worth more than the
+    assertion.
+
+    This is a pre-check, not a mirror of the engine's factor set — vLLM's own
+    source says that set is "likely to evolve significantly over time", so the
+    engine stays the final judge.
+    """
+
+    def field(name: str):
+        submitted = getattr(model_in, name, None)
+        if submitted is not None:
+            return submitted
+        if stored is not None and name not in getattr(
+            model_in, "model_fields_set", set()
+        ):
+            return getattr(stored, name, None)
+        return submitted
+
+    roles = field("roles")
+    if not roles or not field("disaggregation"):
+        return
+
+    model_parameters = field("backend_parameters")
+    prefill = next((r for r in roles if r.name == RoleNameEnum.PREFILL.value), None)
+    decode = next((r for r in roles if r.name == RoleNameEnum.DECODE.value), None)
+    if prefill is None or decode is None:
+        return
+
+    prefill_params = _role_parameters(prefill, model_parameters)
+    decode_params = _role_parameters(decode, model_parameters)
+
+    prefill_len = find_int_parameter(prefill_params, _PAIRING_MAX_LEN)
+    decode_len = find_int_parameter(decode_params, _PAIRING_MAX_LEN)
+    if prefill_len is not None and decode_len is not None:
+        if prefill_len != decode_len:
+            raise BadRequestException(
+                message=(
+                    f"prefill and decode declare different context lengths "
+                    f"({prefill_len} vs {decode_len}). No engine checks this: "
+                    f"the pair handshakes, transfers KV and answers short "
+                    f"prompts, and a prompt above "
+                    f"{min(prefill_len, decode_len)} tokens fails at decode "
+                    f"after prefill has already computed it. Give both roles "
+                    f"the same context length."
+                )
+            )
+
+    prefill_tp = find_int_parameter(prefill_params, _PAIRING_TP)
+    decode_tp = find_int_parameter(decode_params, _PAIRING_TP)
+    if prefill_tp is not None and decode_tp is not None and decode_tp < prefill_tp:
+        raise BadRequestException(
+            message=(
+                f"decode runs tensor parallelism {decode_tp}, below prefill's "
+                f"{prefill_tp}. A decode narrower than its prefill cannot "
+                f"receive that prefill's KV layout, and the engine reports it "
+                f"as an IndexError inside decode rather than as a "
+                f"configuration error. decode's tensor parallelism must be at "
+                f"least prefill's."
+            )
+        )
+
+    for label, names in _PAIRING_MUST_MATCH.items():
+        prefill_value = find_parameter(prefill_params, names)
+        decode_value = find_parameter(decode_params, names)
+        if (
+            prefill_value is not None
+            and decode_value is not None
+            and prefill_value != decode_value
+        ):
+            raise BadRequestException(
+                message=(
+                    f"prefill and decode declare different {label} "
+                    f"('{prefill_value}' vs '{decode_value}'). The connector "
+                    f"rejects the pair on contact, so the group would never "
+                    f"serve; the roles must agree."
+                )
+            )
+
+
 async def validate_model_in(
     session: SessionDep,
     model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
@@ -523,6 +652,7 @@ async def validate_model_in(
     # merged state rather than against the handful of fields it happened to
     # send. Absent on create, where there is nothing to merge.
     validate_roles(model_in, stored=stored)
+    validate_role_pairing(model_in, stored=stored)
 
     if getattr(model_in, "gpu_type_selector", None) is not None:
         await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
@@ -1257,6 +1387,89 @@ async def update_model(
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 
     return updated
+
+
+class ModelRestartResult(BaseModel):
+    """What a restart request did, so the caller can tell "converged" from
+    "nothing to do" without a second read."""
+
+    spec_digest: str
+    """The generation the group is being brought onto."""
+    restarted: bool
+    deleted_instances: List[str] = []
+    message: Optional[str] = None
+
+
+@router.post("/{id}/restart", response_model=ModelRestartResult)
+async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
+    """Retire the running generation so the current spec takes effect.
+
+    Atomic by construction, and that is the point rather than an optimisation.
+    "Restart" has until now meant deleting an instance and letting replica
+    convergence rebuild it, which for a group produces a window holding a
+    new-generation prefill beside an old-generation decode — and the engines do
+    not reject that pairing. A `max_model_len` mismatch handshakes, transfers,
+    and only fails on a long prompt, after prefill has already been paid for.
+    So the whole generation stops before any of it starts again.
+
+    There is deliberately no role parameter. "Restart only the decodes" is the
+    request that produces exactly the cross-generation window above, and the
+    strongest way to reject it is to have no way to express it.
+
+    Idempotent on the target digest: a group already wholly on the current spec
+    reports `restarted: false` rather than bouncing containers, because the
+    operation this endpoint names is "converge to the current spec", not
+    "cycle the processes". A restart still in flight is a 409 — the members are
+    mid-replacement and a second teardown would delete the replacements.
+    """
+    model = await Model.one_by_id(session, id)
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+
+    target = await model_spec_digest(session, model)
+    instances = await ModelInstance.all_by_fields(
+        session, fields={"model_id": model.id, "deleted_at": None}
+    )
+
+    if not instances:
+        return ModelRestartResult(
+            spec_digest=target,
+            restarted=False,
+            message="No instances to restart; the model has none running.",
+        )
+
+    digests = {instance.spec_digest for instance in instances}
+    if len(digests) > 1:
+        # Mixed digests mean a previous restart is still rebuilding. Tearing
+        # down again here would delete the replacements it just created.
+        raise ConflictException(
+            message="A restart is already in progress for this model: its "
+            "instances span more than one generation. Retry once they have "
+            "converged."
+        )
+
+    if digests == {target}:
+        return ModelRestartResult(
+            spec_digest=target,
+            restarted=False,
+            message="Instances already run the current configuration.",
+        )
+
+    try:
+        deleted = await ModelInstanceService(session).batch_delete(list(instances))
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to restart model: {e}")
+
+    # Rebuilding is left to replica convergence rather than done here: it is
+    # the one place that knows a group forms its GPU roles atomically and holds
+    # the router back until they run, and duplicating that here would be a
+    # second implementation of the rule that matters most.
+    return ModelRestartResult(
+        spec_digest=target,
+        restarted=True,
+        deleted_instances=deleted,
+        message="Instances retired; the group will re-form on the current "
+        "configuration.",
+    )
 
 
 @router.delete(

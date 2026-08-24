@@ -104,6 +104,14 @@ class WorkerConfig(PredefinedConfig):
     server_url: Optional[str] = None
     worker_ip: Optional[str] = None
     worker_name: Optional[str] = None
+    # Escape hatch for the KV transfer plane of disaggregated serving. Only the
+    # management-plane NIC is auto-detected (``worker_ifname``); nothing today
+    # enumerates the NICs a KV connector could ride, so on a multi-NIC host, or
+    # when KV traffic belongs on a dedicated fabric, this is the only way to say
+    # so. Left unset, the derivation falls back to the management NIC and then
+    # to nothing at all -- never to a guess, since UCX guessing wrong yields an
+    # unroutable address in the NIXL metadata rather than a clean failure.
+    kv_ifname: Optional[str] = None
 
 
 class Config(WorkerConfig, BaseSettings):
@@ -140,6 +148,7 @@ class Config(WorkerConfig, BaseSettings):
         worker_ip: IP address of the worker node. Auto-detected by default.
         worker_ifname: Network interface name of the worker node. Auto-detected by default.
         worker_name: Name of the worker node. Use the hostname by default.
+        kv_ifname: Network interface name carrying the KV transfer plane of disaggregated serving. Falls back to worker_ifname when unset.
         disable_worker_metrics: Disable worker metrics.
         worker_metrics_port: Port to expose metrics on.
         worker_port: Port to bind the worker to.

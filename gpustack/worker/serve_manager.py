@@ -52,6 +52,7 @@ from gpustack.routes.worker.logs import (
 )
 from gpustack.worker.model_meta import get_meta_from_running_instance
 from gpustack.client import ClientSet
+from gpustack.worker.pd_router import apply_managed_router
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
@@ -63,9 +64,13 @@ from gpustack.schemas.models import (
     DistributedServerCoordinateModeEnum,
     ModelInstanceSubordinateWorker,
     CategoryEnum,
+    PortBand,
+    RoleNameEnum,
     role_effective_model,
 )
+from gpustack.schemas.pd_modes import PDPortSpec
 from gpustack.server.bus import Event, EventType
+from gpustack.server.pd_mode_catalog import get_pd_mode
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 
 logger = logging.getLogger(__name__)
@@ -1596,6 +1601,10 @@ class ServeManager:
                     "state": ModelInstanceStateEnum.INITIALIZING,
                     "port": mi.port,
                     "ports": mi.ports,
+                    # The bands are allocated on the worker but read on the
+                    # server (the router's peer config), so they persist the
+                    # same way `port`/`ports` do.
+                    "named_ports": mi.named_ports,
                     "pid": process.pid,
                 }
             # Get patch dict for subordinate worker.
@@ -1654,19 +1663,24 @@ class ServeManager:
         - Main serving port
         - RPC port for vLLM DP communication (if applicable)
         - Connecting port for subordinate workers (if applicable)
+        - Named connector bands declared by the instance's PD role
 
         Args:
             mi: The model instance to assign ports to.
             model: The model associated with the instance.
             backend: The backend type (e.g., vLLM, SGLang).
         """
-        if mi.port:
-            # Port already assigned, skip.
-            return
-
         with _port_lock:
             if mi.port:
-                # Port already assigned, skip.
+                # Ports already assigned (a restart reusing what was
+                # persisted), so nothing to allocate — but they still have to
+                # be re-registered. This process's view of what is taken lives
+                # only in `_assigned_ports`, so returning without refilling it
+                # leaves the whole band looking free to the next instance
+                # started here. Harmless while an instance held one port;
+                # with a band of `1 + Σcount` it hands the same ports out
+                # twice after a worker restart.
+                self._register_assigned_ports(mi)
                 return
 
             if self._assigned_ports:
@@ -1690,6 +1704,7 @@ class ServeManager:
             #   ports[3]: env VLLM_PORT (dp_only only; reserved but unused otherwise)
             #   ports[-1]: connecting port (= VLLM_DP_MASTER_PORT for dp_only/nested)
             # Ray path: only ports[1] (DP RPC), when user dp > 1.
+            connecting_port: Optional[int] = None
             if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
                 # Allocate first so we can fence off the 10-port band vLLM reserves
                 # around VLLM_DP_MASTER_PORT (= connecting port), keeping the cross
@@ -1735,9 +1750,154 @@ class ServeManager:
                         unavailable_ports.add(cross_port)
 
                 mi.ports.extend(cross_ports)
+
+            # Named connector bands, appended to `mi.ports` as well as written
+            # to `mi.named_ports`. `named_ports` is a *new* index, not a
+            # migration: the positional convention above stays exactly as it
+            # is. The append matters on its own — under hostNetwork the
+            # runtime declares every entry of `mi.ports` as a hostPort
+            # (`_get_configured_ports()` never looks at `named_ports`), and
+            # that declaration is the only thing that turns a same-host port
+            # collision into a schedulable-Pending with an event instead of a
+            # container crash-looping forever in `starting`.
+            named_band_ports = self._assign_named_ports(mi, model, unavailable_ports)
+            mi.ports.extend(named_band_ports)
+
+            if connecting_port is not None:
+                # Last, because the distributed backends read the connecting
+                # port as `ports[-1]` (VLLM_DP_MASTER_PORT / VLLM_PORT). The
+                # named bands go *before* it so that "append at the tail"
+                # doesn't quietly redefine which port that is.
                 mi.ports.append(connecting_port)
 
             self._assigned_ports[mi.id] = set(mi.ports)
+
+    def _register_assigned_ports(self, mi: ModelInstance) -> None:
+        """Re-register an instance's already-persisted ports as taken.
+
+        Covers both indexes: the named bands are whole runs, and only their
+        base is stored, so the fence has to be re-expanded from `count`.
+        Callers must hold `_port_lock`.
+        """
+        taken: Set[int] = set(mi.ports or [])
+        if mi.port:
+            taken.add(mi.port)
+        for band in (mi.named_ports or {}).values():
+            taken |= set(range(band.base, band.base + max(band.count, 1)))
+        if taken:
+            self._assigned_ports[mi.id] = taken
+
+    def _assign_named_ports(
+        self,
+        mi: ModelInstance,
+        model: Model,
+        unavailable_ports: Set[int],
+    ) -> List[int]:
+        """Allocate the port bands this instance's PD role declares.
+
+        The widths come from `pd-modes.yaml` and nothing else: measured, one
+        connector wants one port per data-parallel replica and another wants
+        one per tensor-parallel rank, so there is no platform-side formula to
+        compute them from. Writes `mi.named_ports` and returns every port of
+        every band, in order, for the caller to append to `mi.ports`.
+
+        Mutates `unavailable_ports` with the *whole* band, not just its base:
+        the ports a connector derives from the base are bound just as surely
+        as the base is, and the existing vLLM mp path fencing off ten ports
+        around the connecting port is the same idea with the width hardcoded.
+
+        Every band is allocated per instance, which is what
+        `PDPortScopeEnum.INSTANCE` means and what every band shipped today
+        declares. A `role`-scoped band would need a registry shared across the
+        instances of one role, which does not exist yet; nothing declares one,
+        so allocating it per instance is strictly safer than pretending.
+
+        Callers must hold `_port_lock`.
+        """
+        disaggregation = getattr(model, "disaggregation", None)
+        mode_name = getattr(disaggregation, "mode", None)
+        if not mode_name or not mi.role:
+            # Not a PD instance. Take today's path byte for byte.
+            return []
+
+        try:
+            mode = get_pd_mode(str(mode_name))
+        except Exception as e:
+            # A broken catalog fails the server at start-up; on a worker it
+            # must not take down an otherwise startable instance, and an
+            # instance missing its connector ports fails loudly downstream.
+            logger.warning(
+                f"Failed to load the PD mode catalog while assigning ports for "
+                f"{mi.name}: {e}"
+            )
+            return []
+        if mode is None:
+            logger.warning(
+                f"Model instance {mi.name} declares PD mode '{mode_name}', which "
+                "is not in the catalog. No named ports assigned."
+            )
+            return []
+
+        # A router's declaration lives on `mode.router`, not in `mode.roles` —
+        # it is a command line, not an engine.
+        if mi.role == RoleNameEnum.ROUTER.value:
+            holder = mode.router
+        else:
+            holder = mode.role(mi.role)
+        if holder is None or not holder.ports:
+            return []
+
+        named_ports: Dict[str, PortBand] = dict(mi.named_ports or {})
+        band_ports: List[int] = []
+        for spec in holder.ports:
+            count = self._resolve_band_count(mi, spec)
+            try:
+                base = network.get_free_band(
+                    port_range=self._config.service_port_range,
+                    count=count,
+                    unavailable_ports=unavailable_ports,
+                    host=mi.worker_ip,
+                )
+            except network.PortRangeExhaustedError as e:
+                # Re-raise with the role and band named. The allocator knows
+                # the arithmetic but not who was asking, and "which role of
+                # which deployment" is the first thing an operator needs.
+                raise network.PortRangeExhaustedError(
+                    f"Model instance {mi.name} (role '{mi.role}', PD mode "
+                    f"'{mode_name}') needs a {count}-port band for "
+                    f"'{spec.name}': {e}"
+                ) from e
+            band = list(range(base, base + count))
+            unavailable_ports |= set(band)
+            named_ports[spec.name] = PortBand(base=base, count=count)
+            band_ports.extend(band)
+
+        mi.named_ports = named_ports
+        return band_ports
+
+    @staticmethod
+    def _resolve_band_count(mi: ModelInstance, spec: PDPortSpec) -> int:
+        """The width of one declared band.
+
+        A `count` may be a placeholder (`{{tensor_parallel_size}}`) resolved
+        from the deployment context. Phase one has no such resolver, so a
+        templated width is narrowed to a single port — and said so out loud:
+        silently reserving one port where the connector will bind eight is
+        precisely the collision this whole mechanism exists to prevent, and
+        it would surface as an instance wedged in `starting` with nothing in
+        the allocator's log to explain it.
+        """
+        count = spec.count
+        if isinstance(count, int):
+            return max(count, 1)
+        logger.warning(
+            f"Model instance {mi.name} declares port band '{spec.name}' with a "
+            f"templated count '{count}', which phase one cannot resolve. "
+            "Reserving 1 port. If the connector derives more from this base "
+            "they are not fenced, and a second instance on this host may "
+            "collide with them."
+        )
+        return 1
 
     def _restart_model_instance(self, mi: ModelInstance):
         """
@@ -1905,6 +2065,12 @@ class ServeManager:
         # The cache is already keyed per instance, so projecting inside it is
         # exactly per-role.
         model = role_effective_model(self._clientset.models.get(mi.model_id), mi.role)
+        # A managed router is a custom-backend image plus a command, and this
+        # manager has to know that before the child process exists: the backend
+        # is what picks the port band and the fallback registry. No peers are
+        # passed — the command they render into is the child's business, and
+        # rendering it here would only be rendering it twice.
+        model = apply_managed_router(model, mi.role)
         self._model_cache_by_instance[mi.id] = model
         return model
 

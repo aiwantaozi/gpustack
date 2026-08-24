@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import random
 import string
@@ -52,12 +54,16 @@ from gpustack.schemas.models import (
     ModelInstanceCreate,
     ModelInstanceStateEnum,
     ModelInstanceSubordinateWorker,
+    ModelSpecBase,
     ModelStateEnum,
     RoleNameEnum,
+    RoleSpec,
     RoleStatus,
     SourceEnum,
     get_backend,
+    role_effective_model,
 )
+from gpustack.schemas.gpu_instance_types import GPUInstanceType
 from gpustack.schemas.links import (
     ModelInstanceModelFileLink,
     ModelInstanceDraftModelFileLink,
@@ -176,6 +182,30 @@ from gpustack.schemas.model_provider import (
 logger = logging.getLogger(__name__)
 
 
+def _gateway_registrable_instances(
+    model: Model, instances: List[ModelInstance]
+) -> List[ModelInstance]:
+    """The members whose addresses may become gateway upstreams.
+
+    For a role-bearing group that is the router alone. Every member of a PD
+    group serves an OpenAI-shaped API on its own port, so registering them all
+    is not a duplicate registration — it is a set of upstreams that answer the
+    same requests *wrongly*: a request balanced onto a prefill returns after
+    one token, and one onto a decode runs without the prefix its KV was
+    supposed to carry. Both return 200 with plausible text, which is the
+    failure mode PD is least able to absorb.
+
+    A group with no router role registers nothing here rather than falling
+    back to its GPU members, for the same reason: there is no member that can
+    correctly answer a whole request on its own.
+    """
+    if not model.roles:
+        return instances
+    return [
+        instance for instance in instances if instance.role == RoleNameEnum.ROUTER.value
+    ]
+
+
 class ModelController:
     def __init__(self, cfg: Config):
         self._config = cfg
@@ -207,6 +237,7 @@ class ModelController:
             session,
             fields={"model_id": model.id, "deleted_at": None},
         )
+        model_instances = _gateway_registrable_instances(model, model_instances)
         worker_by_id = None
         worker_ids = {
             instance.worker_id for instance in model_instances if instance.worker_id
@@ -893,6 +924,18 @@ class CacheServiceController:
 async def sync_replicas(session: AsyncSession, model: Model):
     """
     Synchronize the replicas.
+
+    Two convergence rules live behind this one name, and the switch between
+    them is `model.roles`:
+
+    - No roles: the pre-PD rule, `model.replicas` interchangeable instances.
+      `_sync_replicas_legacy` below is that code unchanged.
+    - Roles: convergence is per role, because `Model.replicas` stops being a
+      count and becomes a 0/1 deployment switch (the counts move to
+      `roles[].replicas`). Running the legacy rule on a role-bearing model is
+      an *active* bug, not merely a gap: a 3P1D+router deployment is five
+      instance rows against `replicas == 1`, so `5 > 1` deletes four of them
+      and the victims are whichever the scale-down scorer ranks lowest.
     """
 
     # Re-fetch model from database to ensure we have latest state
@@ -901,6 +944,14 @@ async def sync_replicas(session: AsyncSession, model: Model):
     if not fresh_model or fresh_model.deleted_at is not None:
         return
     model = fresh_model
+
+    if model.roles:
+        return await _sync_replicas_per_role(session, model)
+    return await _sync_replicas_legacy(session, model)
+
+
+async def _sync_replicas_legacy(session: AsyncSession, model: Model):
+    """The role-less rule, byte-for-byte what it has always been."""
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
     if len(instances) < model.replicas:
@@ -950,6 +1001,348 @@ async def sync_replicas(session: AsyncSession, model: Model):
             ).batch_delete(scale_down_instances)
             if scale_down_instance_names:
                 logger.debug(f"Deleted model instances: {scale_down_instance_names}")
+
+
+# Spec fields that must NOT enter a generation's digest. Everything else on
+# `ModelSpecBase` does, and that direction is deliberate: a field added later
+# joins the digest by default, which errs toward restarting a group that did
+# not need it rather than toward pairing two generations that must not meet.
+# A wrong restart is visible and costs a reload; a cross-generation pair is
+# silent and returns wrong answers (F7 3.3 — `max_model_len` mismatched across
+# P and D handshakes fine, transfers fine, and only a long prompt reveals it,
+# after prefill has already been paid for).
+_DIGEST_EXCLUDED_SPEC_FIELDS = frozenset(
+    {
+        # Descriptive. Renaming the description must not restart a group.
+        "description",
+        "meta",
+        "categories",
+        # Counts, not shape. Convergence below handles them per role, and
+        # folding them in would make scaling 1P1D to 2P1D a full-group
+        # restart — exactly what per-role convergence exists to avoid.
+        "replicas",
+        "ready_replicas",
+        "scaling_schedule",
+        # Supervisor behaviour and routing, not container shape.
+        "restart_on_error",
+        "generic_proxy",
+        # Mounted at run time against a running engine.
+        "lora_list",
+    }
+)
+
+
+def _role_digest_payload(role: RoleSpec) -> Dict[str, Any]:
+    """A role's contribution to the digest, minus its replica count.
+
+    Same reason `replicas` is excluded at the model level: a role's count is
+    what per-role convergence adjusts, so folding it in would turn every
+    scale into a generation change.
+    """
+    payload = role.model_dump(mode="json", exclude_none=True)
+    payload.pop("replicas", None)
+    return payload
+
+
+async def _instance_type_snapshots(
+    session: AsyncSession, model: Model
+) -> Dict[str, Optional[str]]:
+    """The InstanceType identity snapshot behind every type name the model
+    selects, keyed by name.
+
+    Required by D13. A `gpu_type_selector` records only the type's *name*,
+    while the catalog behind that name is versioned by retire-and-insert — so
+    two members admitted at different moments can resolve one name to
+    different card specs. Without this in the digest that drift is invisible:
+    the group looks like one generation and is two.
+
+    An unresolvable name maps to None rather than being dropped, so "the type
+    is gone" is itself a digest input.
+    """
+    names = set()
+    for role in model.roles or []:
+        selector = role.gpu_type_selector or model.gpu_type_selector
+        if selector is not None and selector.type:
+            names.add(selector.type)
+    if not names and model.gpu_type_selector and model.gpu_type_selector.type:
+        names.add(model.gpu_type_selector.type)
+
+    snapshots: Dict[str, Optional[str]] = {}
+    for name in sorted(names):
+        matched = await GPUInstanceType.all_by_fields(
+            session,
+            fields={
+                "cluster_id": model.cluster_id,
+                "deleted_at": None,
+                "name": name,
+            },
+        )
+        snapshots[name] = matched[0].snapshot if matched else None
+    return snapshots
+
+
+async def model_spec_digest(session: AsyncSession, model: Model) -> str:
+    """The generation identity of `model`'s deployment shape.
+
+    Shaped after `GPUInstanceType.compute_snapshot` (F7 3.3, D13): a content
+    hash over the definitional spec with the mutable description fields
+    excluded, so an unchanged spec keeps its digest across restarts and a
+    changed one produces a new generation.
+    """
+    payload: Dict[str, Any] = {}
+    for field in ModelSpecBase.model_fields:
+        if field in _DIGEST_EXCLUDED_SPEC_FIELDS:
+            continue
+        value = getattr(model, field, None)
+        if field == "roles":
+            value = [_role_digest_payload(role) for role in (value or [])] or None
+        elif isinstance(value, BaseModel):
+            value = value.model_dump(mode="json", exclude_none=True)
+        elif isinstance(value, list):
+            value = [
+                (
+                    item.model_dump(mode="json", exclude_none=True)
+                    if isinstance(item, BaseModel)
+                    else item
+                )
+                for item in value
+            ]
+        payload[field] = value
+
+    payload["_instance_types"] = await _instance_type_snapshots(session, model)
+
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return f"sha1:{hashlib.sha1(blob.encode('utf-8')).hexdigest()}"
+
+
+def _generation_group_id(model: Model, digest: str) -> str:
+    """One `group_id` is one generation, and a generation is one digest.
+
+    Scoped by model id so the value is unique fleet-wide: `group_id` is what
+    the router matches its peers on, and two models that happen to share a
+    spec must not be able to resolve each other's members.
+    """
+    return f"{model.id}-{digest.split(':')[-1][:16]}"
+
+
+def _gpu_roles(model: Model) -> List[RoleSpec]:
+    """Every role that occupies accelerators — that is, everything but the
+    router.
+
+    This is the set that forms atomically and the set Kueue's
+    `pod-group-total-count` counts (D11): a 4P4D is 8, not 9.
+    """
+    return [
+        role for role in (model.roles or []) if role.name != RoleNameEnum.ROUTER.value
+    ]
+
+
+def _role_dependencies(model: Model, role: RoleSpec) -> List[str]:
+    """Roles that must have a ready member before `role` may be created.
+
+    An explicit `dependencies` wins. Absent one, the router depends on every
+    GPU role — and that default is load-bearing rather than a convenience:
+    the router's command line is rendered from its peers' `ip:port`, ports are
+    assigned worker-side at start, so a router created alongside its peers has
+    nothing to render (F4 3.6, F3 3.4 ④). Creating it early does not merely
+    produce a slower start, it produces a router pointed at nothing.
+    """
+    if role.dependencies is not None:
+        return list(role.dependencies)
+    if role.name == RoleNameEnum.ROUTER.value:
+        return [gpu_role.name for gpu_role in _gpu_roles(model)]
+    return []
+
+
+def _dependencies_ready(
+    model: Model, role: RoleSpec, members: List[ModelInstance]
+) -> bool:
+    """Whether every role `role` depends on has at least one RUNNING member.
+
+    RUNNING rather than merely created, because what the dependent needs is
+    the *address*, and an instance only has one once its worker has assigned
+    ports and started it.
+    """
+    required = _role_dependencies(model, role)
+    if not required:
+        return True
+    running = {
+        member.role
+        for member in members
+        if member.state == ModelInstanceStateEnum.RUNNING and member.role
+    }
+    return all(name in running for name in required)
+
+
+async def _build_instance_create(
+    session: AsyncSession,
+    model: Model,
+    role: RoleSpec,
+    group_id: str,
+    digest: str,
+) -> ModelInstanceCreate:
+    """One member row of `role` in the generation `group_id`.
+
+    Everything outside the four PD columns is what `_sync_replicas_legacy`
+    builds, deliberately: a role's overrides are applied by the read-path
+    projection (`role_effective_model`), never written here, so that one
+    intent keeps one source of truth.
+    """
+    name_prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+    return ModelInstanceCreate(
+        name=f"{model.name}-{role.name}-{name_prefix}",
+        model_id=model.id,
+        model_name=model.name,
+        source=model.source,
+        huggingface_repo_id=model.huggingface_repo_id,
+        huggingface_filename=model.huggingface_filename,
+        model_scope_model_id=model.model_scope_model_id,
+        model_scope_file_path=model.model_scope_file_path,
+        local_path=model.local_path,
+        state=ModelInstanceStateEnum.PENDING,
+        cluster_id=model.cluster_id,
+        owner_principal_id=model.owner_principal_id,
+        draft_model_source=await get_draft_model_source(session, model),
+        # The backend is a per-role override, so it is resolved against the
+        # role-effective model rather than the Model — a `custom` group may
+        # legitimately mix engines.
+        backend=get_backend(role_effective_model(model, role.name)),
+        backend_version=role.backend_version or model.backend_version,
+        role=role.name,
+        group_id=group_id,
+        spec_digest=digest,
+    )
+
+
+async def _release_and_delete(
+    session: AsyncSession, instances: List[ModelInstance]
+) -> List[str]:
+    """The single exit for every member deletion — scale-down, generation
+    teardown and full teardown all pass through here.
+
+    ⚠️ D19's Kueue finalizer is NOT yet applied here. Deleting a member of an
+    admitted pod-group without marking `kueue.x-k8s.io/retriable-in-group:
+    "false"` leaves the Pod in Terminating and the Workload holding its quota.
+    That marking belongs to the k8s deployment path, which has no PD wiring
+    yet; collecting the deletions behind one function now is what makes adding
+    it a one-place change rather than three.
+    """
+    if not instances:
+        return []
+    names = await ModelInstanceService(session).batch_delete(instances)
+    if names:
+        logger.debug(f"Deleted model instances: {names}")
+    return names
+
+
+async def _sync_replicas_per_role(session: AsyncSession, model: Model):
+    """Converge a role-bearing model, one role at a time.
+
+    Per role rather than per group because the group is not the unit of
+    change: turning a 1P1D into a 2P1D under group semantics would mean
+    deleting the group and recreating it — a full outage to add one prefill.
+    """
+    instances = await ModelInstance.all_by_field(session, "model_id", model.id)
+
+    if model.replicas == 0:
+        # `Model.replicas` is a deployment switch for a role-bearing model,
+        # so zero means the whole group is parked, not "zero of each role".
+        await _release_and_delete(session, instances)
+        return
+
+    digest = await model_spec_digest(session, model)
+
+    # The live members define the current generation, not the model's present
+    # digest. A spec edit makes the running members stale; it does not by
+    # itself retire them — F7 3.3 requires the switch to be an explicit
+    # all-stop-then-all-start, because restarting members one at a time is
+    # precisely how a cross-generation pair is produced. So new members join
+    # the generation their peers are already in.
+    members = [i for i in instances if i.group_id]
+    if members:
+        group_id = max(
+            {i.group_id for i in members},
+            key=lambda gid: (
+                len([i for i in members if i.group_id == gid]),
+                max(i.created_at for i in members if i.group_id == gid),
+            ),
+        )
+        generation = [i for i in members if i.group_id == group_id]
+        generation_digest = next(
+            (i.spec_digest for i in generation if i.spec_digest), digest
+        )
+    else:
+        group_id = _generation_group_id(model, digest)
+        generation = []
+        generation_digest = digest
+
+    if not generation:
+        # First formation is atomic and contains ONLY the GPU roles. Two
+        # reasons, and they point the same way: Kueue's pod-group admission
+        # counts members against a declared total, so a group whose rows
+        # appear in batches is repeatedly judged incomplete (D11); and the
+        # router cannot be in this transaction at all, since it has no peers
+        # to render yet (see `_role_dependencies`).
+        pending = []
+        for role in _gpu_roles(model):
+            for _ in range(role.replicas):
+                pending.append(
+                    await _build_instance_create(
+                        session, model, role, group_id, generation_digest
+                    )
+                )
+        if pending:
+            await ModelInstanceService(session).batch_create(pending)
+            logger.debug(
+                f"Formed group {group_id} for model {model.name} "
+                f"with {len(pending)} members"
+            )
+            generation = await ModelInstance.all_by_field(session, "model_id", model.id)
+            generation = [i for i in generation if i.group_id == group_id]
+        # Deliberately no early return: the router still has to be considered
+        # below, and it becomes creatable the moment its dependencies report
+        # ready — which may already be true on a later pass.
+
+    for role in model.roles:
+        have = [i for i in generation if i.role == role.name]
+        if len(have) < role.replicas:
+            if not _dependencies_ready(model, role, generation):
+                continue
+            pending = [
+                await _build_instance_create(
+                    session, model, role, group_id, generation_digest
+                )
+                for _ in range(role.replicas - len(have))
+            ]
+            await ModelInstanceService(session).batch_create(pending)
+            logger.debug(
+                f"Created {len(pending)} {role.name} instance(s) for "
+                f"model {model.name} in group {group_id}"
+            )
+        elif len(have) > role.replicas:
+            await _scale_down_role(session, model, role, have)
+
+
+async def _scale_down_role(
+    session: AsyncSession, model: Model, role: RoleSpec, have: List[ModelInstance]
+):
+    """Remove this role's surplus members.
+
+    The excess is measured against the ROLE's count, not the model's. The
+    pre-PD line was `len(candidates) - model.replicas`, which assumed
+    `candidates` held every instance of the model; scoped to one role of a
+    4P4D that arithmetic deletes eight instances in one pass.
+    """
+    excess = len(have) - role.replicas
+    if excess <= 0:
+        return
+    candidates = await find_scale_down_candidates(have, model)
+    if not candidates:
+        # `find_scale_down_candidates` returns [] on its internal exception,
+        # so an empty result is indistinguishable from a scoring failure.
+        # Not deleting is the fail-safe reading of that ambiguity.
+        return
+    await _release_and_delete(session, [c.model_instance for c in candidates[:excess]])
 
 
 async def distribute_models_to_user(
@@ -1369,6 +1762,19 @@ async def find_scale_down_candidates(
     placement_max_score: Optional[float] = None,
     total_max_score: Optional[float] = None,
 ) -> List[ModelInstanceScore]:
+    roles = {instance.role for instance in instances}
+    if len(roles) > 1:
+        # This is a selector WITHIN a comparable set, not across one. Its
+        # `PlacementScorer` reads `_get_worker_model_instance_count()`, which
+        # aggregates per worker by `model_id` — so a prefill holding eight
+        # cards and a `cpu_only` router land in one distribution and their
+        # scores are not comparable. Ranking them together does not fail, it
+        # picks a plausible-looking wrong victim, which is the failure mode
+        # PD is least able to absorb (D10: a PD failure must be a hard one).
+        raise ValueError(
+            "find_scale_down_candidates requires instances of a single role, "
+            f"got {sorted(str(r) for r in roles)}"
+        )
     try:
         if status_max_score is None:
             status_max_score = envs.SCHEDULER_SCALE_DOWN_STATUS_MAX_SCORE
@@ -1587,9 +1993,6 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     them, one change gate writes them and one transaction commits them.
     Nothing else writes them.
 
-    `stale` is the one status field this does not compute — see the note
-    below.
-
     Returns True if the model row was updated (and the session was committed).
     """
 
@@ -1670,29 +2073,35 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
 
     degradations = reasons or None
 
-    # `stale` is deliberately left untouched. It compares a member's
-    # `spec_digest` against the model's current digest, and nothing computes
-    # either yet: D13 fixes the digest's shape (copy
-    # `GPUInstanceType.compute_snapshot` — a content hash over the
-    # definitional spec with the mutable description fields excluded, and
-    # retire-and-insert semantics for a generation) and requires folding the
-    # InstanceType snapshot in, so that a `gpu_type_selector` naming a type
-    # whose catalog row was replaced counts as a new generation. Deriving
-    # `stale` from an unwritten column would mark every model stale, and
-    # guessing at a digest scheme would be worse than having none: it is what
-    # decides whether a whole group gets restarted.
+    # `stale`: the running members predate the config they are shown with.
+    # Orthogonal to `state` — a stale group is usually still serving, which is
+    # exactly what makes it worth surfacing: without it, a user who edits a
+    # config and sees the model still RUNNING has no way to learn the edit has
+    # not taken effect (M0: changing `Model.env` returns the new value from the
+    # API while `StartedAt` never moves).
+    #
+    # Only members that carry a digest count. A row created before this column
+    # existed has None, and reading that as "differs" would mark every
+    # pre-upgrade model stale on the first pass after an upgrade.
+    stale: Optional[bool] = None
+    digested = [i.spec_digest for i in instances if i.spec_digest]
+    if digested:
+        current_digest = await model_spec_digest(session, model)
+        stale = any(digest != current_digest for digest in digested)
 
     if (
         model.ready_replicas != ready_replicas
         or model.state != state
         or model.state_message != state_message
         or model.role_status != role_status
+        or model.stale != stale
         or model.degradations != degradations
     ):
         model.ready_replicas = ready_replicas
         model.state = state
         model.state_message = state_message
         model.role_status = role_status
+        model.stale = stale
         model.degradations = degradations
         await ModelService(session).update(model)
         return True

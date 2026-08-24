@@ -62,6 +62,7 @@ from gpustack.utils.profiling import time_decorator
 from gpustack.utils import platform
 from gpustack.utils.version import pick_runtime_version
 from gpustack.utils.runtime import transform_workload_plan
+from gpustack.worker.pd_injection import PDInjection, render_pd_injection
 
 logger = logging.getLogger(__name__)
 lock = threading.Lock()
@@ -179,6 +180,12 @@ class InferenceServer(ABC):
     reads; this is only for the one path that writes the model back, which must
     not push a role's values up to the Model-level spec."""
 
+    _pd_injection_cache: Optional[PDInjection] = None
+    _pd_injection_resolved: bool = False
+    """Rendered once per deploy: three seams read it (env, files, arguments)
+    and rendering logs every unresolved placeholder, so doing it three times
+    would triple the warnings for one fact."""
+
     @time_decorator
     def __init__(
         self,
@@ -276,6 +283,12 @@ class InferenceServer(ABC):
         # `{data_dir}` substitution, which they would miss the other way
         # round.
         model = role_effective_model(model, self._model_instance.role)
+        # A managed router's image and command come from the catalog and its
+        # peers' live addresses, so they are materialised here rather than
+        # stored: the addresses change on every scale, and a persisted command
+        # would be wrong as soon as anything moved. Everything below this line
+        # then reads an ordinary custom-backend deployment.
+        model = self._apply_managed_router(model)
         data_dir = self._config.data_dir
         for i, param in enumerate(model.backend_parameters or []):
             model.backend_parameters[i] = param.replace("{data_dir}", data_dir)
@@ -501,6 +514,125 @@ class InferenceServer(ABC):
         variables.update(overrides)
         return variables
 
+    def _pd_injection(self) -> Optional[PDInjection]:
+        """What this instance's PD role adds to its launch, or None when the
+        deployment is not disaggregated — in which case every seam below falls
+        through to the path it takes today, byte for byte.
+
+        The *unprojected* model is what goes in. A projection has already
+        pushed this role's overrides up to the Model level, so a cross-role
+        reference read off one — `{{roles.decode.tensor_parallel_size}}` while
+        prefill is starting — would resolve decode's inherited parameters
+        against prefill's values and produce a wrong number instead of a
+        failure. The injector re-derives the running role's own effective
+        values itself.
+        """
+        if self._pd_injection_resolved:
+            return self._pd_injection_cache
+
+        model = self._model_spec or getattr(self, "_model", None)
+        # Cheap pre-check on the same conditions the injector returns None
+        # for, so a non-PD deploy does not pay for the PD context (an image
+        # resolution among other things).
+        instance = getattr(self, "_model_instance", None)
+        if getattr(model, "disaggregation", None) is None or not getattr(
+            instance, "role", None
+        ):
+            self._pd_injection_resolved = True
+            return None
+
+        variables = self._template_variables(**self._pd_template_variables())
+        # Marked resolved only once it is: a refused injection raises, and
+        # caching "nothing to inject" for the seams that come after would turn
+        # that hard failure into the silent aggregated start it exists to stop.
+        injection = render_pd_injection(model, instance, variables)
+        self._pd_injection_cache = injection
+        self._pd_injection_resolved = True
+        return injection
+
+    def _apply_managed_router(self, model):
+        """Materialise this instance's role if it is a router the catalog
+        assembles. A no-op for every other role and every non-PD deployment.
+
+        Peers are read from the instance's own generation, which is what makes
+        a cross-generation router impossible rather than unlikely: the
+        `group_id` filter cannot resolve a member of another generation even
+        if one is running beside it.
+        """
+        from gpustack.worker.pd_router import (
+            apply_managed_router,
+            group_peer_addresses,
+            is_managed_router,
+        )
+
+        instance = self._model_instance
+        if not is_managed_router(model, instance.role):
+            return model
+
+        siblings = self._clientset.model_instances.list(
+            params={"model_id": instance.model_id}
+        )
+        members = getattr(siblings, "items", siblings) or []
+        worker_ips = {}
+        for member in members:
+            if member.worker_id and member.worker_id not in worker_ips:
+                try:
+                    worker = self._clientset.workers.get(id=member.worker_id)
+                    if worker and worker.ip:
+                        worker_ips[member.worker_id] = worker.ip
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to resolve worker {member.worker_id} "
+                        f"while rendering the router: {e}"
+                    )
+
+        peers = group_peer_addresses(members, instance.group_id, worker_ips)
+        variables = self._template_variables(**self._pd_template_variables())
+        return apply_managed_router(
+            model, instance.role, peers=peers, variables=variables
+        )
+
+    def _pd_template_variables(self) -> Dict[str, object]:
+        """The two placeholders only this layer can resolve: the KV-plane NIC
+        and the runner image.
+
+        Both are read tolerantly. An unresolvable one is left out of the
+        context so its placeholder survives into the launch with a warning,
+        which is diagnosable; inventing a value is not. `UCX_NET_DEVICES=all`
+        in particular makes UCX advertise docker0 addresses the peer cannot
+        route, and the failure surfaces as `NIXL_ERR_BACKEND` on the far side.
+        """
+        variables: Dict[str, object] = {}
+
+        net_device = None
+        try:
+            # Imported where it is used: only a PD member ever needs a KV-plane
+            # NIC, and every other backend start on this worker should be
+            # unaffected by whether this module resolves.
+            from gpustack.worker.net_device import derive_net_device
+
+            net_device = derive_net_device(self._worker, self._config)
+        except Exception as e:
+            logger.warning(f"Failed to derive the KV-plane network device: {e}")
+        if net_device:
+            variables["net_device"] = net_device
+
+        try:
+            # The raw image: no registry override and no version write-back,
+            # since this is a template value, not the image being deployed.
+            runner_image, _ = self._resolve_image()
+            if runner_image:
+                variables["runner_image"] = runner_image
+        except Exception as e:
+            logger.debug(f"Failed to resolve the runner image for templating: {e}")
+
+        return variables
+
+    def _pd_arguments(self) -> List[str]:
+        """The PD role's engine arguments, or an empty list."""
+        injection = self._pd_injection()
+        return list(injection.args) if injection else []
+
     def _get_configured_env(self, **kwargs) -> Dict[str, str]:
         """
         Get the environment variables for the model instance.
@@ -514,6 +646,21 @@ class InferenceServer(ABC):
         env = {}
         if not runtime_envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT:
             env = filter_env_vars(os.environ)
+
+        pd_injection = self._pd_injection()
+        if pd_injection and pd_injection.env:
+            # Before the model's own env, so a deliberate per-model or
+            # per-role override still wins — but never silently: a shadowed
+            # side-channel host is a wrong address the group hands its peers,
+            # not a setting that fails to apply.
+            shadowed = sorted(set(pd_injection.env) & set(self._model.env or {}))
+            if shadowed:
+                logger.warning(
+                    "The model's env overrides PD connection variables: "
+                    f"{', '.join(shadowed)}. The overriding values are what the "
+                    "engine advertises to its peers."
+                )
+            env.update(pd_injection.env)
 
         if self._model.env:
             # Render the *values*. This is the point of gpustack.utils.template
@@ -864,14 +1011,31 @@ class InferenceServer(ABC):
         )
 
     def _cache_injection_files(self) -> dict[str, str]:
-        """Connector config files (container path -> contents) the shared
-        cache service's injection declares; the serving script writes them
-        before the engine starts (e.g. Mooncake's MOONCAKE_CONFIG_PATH
-        JSON)."""
+        """Connector config files (container path -> contents) the serving
+        script writes before the engine starts (e.g. Mooncake's
+        MOONCAKE_CONFIG_PATH JSON).
+
+        Two declarations land here — the shared cache service's injection and
+        the PD role's — because a connector that reads its transport config
+        only from a file leaves no other way in. A path both declare is a
+        genuine collision rather than a merge: the second write would silently
+        replace the first, so it is logged as it happens.
+        """
+        files: dict[str, str] = {}
         cache_config = getattr(self._model_instance, "cache_config", None)
         if cache_config and cache_config.injected:
-            return cache_config.files or {}
-        return {}
+            files.update(cache_config.files or {})
+
+        pd_injection = self._pd_injection()
+        if pd_injection and pd_injection.files:
+            collisions = sorted(set(files) & set(pd_injection.files))
+            if collisions:
+                logger.warning(
+                    "The PD role and the shared cache service both declare "
+                    f"{', '.join(collisions)}; the PD contents win."
+                )
+            files.update(pd_injection.files)
+        return files
 
     def _get_serving_command_script(self, env: dict[str, str]) -> Optional[str]:
         """
@@ -911,7 +1075,7 @@ class InferenceServer(ABC):
             # A quoted heredoc keeps the rendered content verbatim (no
             # shell expansion of $ or backticks inside e.g. JSON).
             cache_files_step += (
-                f'echo "Writing shared cache connector config {path}"\n'
+                f'echo "Writing connector config {path}"\n'
                 f"mkdir -p \"$(dirname '{path}')\"\n"
                 f"cat > '{path}' <<'GPUSTACK_CACHE_FILE_EOF'\n"
                 f"{content}\n"
@@ -1105,6 +1269,18 @@ exec "$@"
         """
         start_index = self._get_backend_parameter_start_index(arguments, entrypoint)
         candidates = arguments[start_index:]
+
+        # `_flatten_backend_param` prepends the PD role's arguments to what the
+        # caller then hands back as "the user's parameters". Strip that prefix
+        # off first, or connector state GPUStack injected is reported as the
+        # user's own — and the deployment view is where a user goes to find out
+        # what GPUStack added.
+        pd_arguments = self._pd_arguments()
+        if (
+            pd_arguments
+            and user_backend_parameters[: len(pd_arguments)] == pd_arguments
+        ):
+            user_backend_parameters = user_backend_parameters[len(pd_arguments) :]
 
         if not user_backend_parameters:
             return candidates
@@ -1372,6 +1548,20 @@ exec "$@"
         space form — equal form can't safely express them).
         """
         tokens = flatten_to_argv(self._model.backend_parameters or [])
+
+        # The PD role's connector arguments ride in front of the user's. This
+        # is the one seam in this file that every backend's command builder
+        # goes through — each of them extends its argument list with this
+        # result — so it is where a declaration in `pd-modes.yaml` reaches an
+        # actual command line. In front, because argparse lets the later of
+        # two spellings win and a user's parameter is the one that should:
+        # the parameters PD cannot share at all (`--kv-transfer-config`) are
+        # refused outright when they are rendered, not resolved by position.
+        # They are appended already tokenized: `flatten_to_argv` would re-split
+        # a rendered JSON document on its spaces.
+        pd_arguments = self._pd_arguments()
+        if pd_arguments:
+            tokens = pd_arguments + tokens
 
         parameter_format = (
             getattr(self.inference_backend, "parameter_format", None)

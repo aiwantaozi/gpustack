@@ -1,9 +1,19 @@
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 import hashlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 from croniter import croniter
 from pydantic import (
     BaseModel,
@@ -12,7 +22,14 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import JSON, Column, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Column,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy import false as sa_false
 from sqlalchemy.orm import selectinload
 from sqlmodel import Field, Relationship, SQLModel, Text, select
@@ -436,6 +453,190 @@ class SpeculativeConfig(BaseModel):
     """Maximum length of the n-gram to match."""
 
 
+# Prefill/decode disaggregation. A Model with `roles` set is a *group*: one
+# pool, one router, one generation at a time.
+
+
+class RoleNameEnum(str, Enum):
+    """Role names accepted in phase one.
+
+    The data model allows any name — the API validation layer is what limits
+    it to these three. Phase two opens up encoder / draft.
+    """
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+    ROUTER = "router"
+
+    def __str__(self):
+        return self.value
+
+
+class PortBand(BaseModel):
+    """A contiguous run of ports, not a single point.
+
+    Some KV connectors derive several ports from one base — NIXL's side
+    channel takes one per tensor-parallel rank — so a port declaration has to
+    carry its width as well as its base.
+    """
+
+    base: int
+    count: int = 1
+
+
+class RoleSpec(BaseModel):
+    """One role of a multi-role deployment.
+
+    Every deployment field left as ``None`` inherits the ``Model``-level field
+    of the same name; giving it a value overrides it. The override surface is
+    deliberately the *whole* of ``backend_parameters`` and ``env`` rather than
+    a PD-specific subset: measured on Ascend 910B2, prefill and decode differ
+    in nearly every performance-related parameter, down to
+    ``HCCL_CONNECT_TIMEOUT`` (120 vs 1200) and ``HCCL_BUFFSIZE`` (2560 vs
+    1024). Any narrower surface runs out immediately.
+
+    Note that the inherit-when-None rule is not applied here: the projection
+    onto an effective per-role Model happens on the read path, and its result
+    is deliberately never persisted so that one intent has one source of
+    truth.
+    """
+
+    name: str
+    replicas: int = Field(default=1, ge=1)
+    """The x and y of xPyD, and the only scaling truth for a group.
+
+    Not wanting a role means removing it, not setting this to zero — a zero
+    would leave `dependencies` pointing at a role that never appears.
+    """
+
+    backend: Optional[str] = None
+    backend_version: Optional[str] = None
+    image_name: Optional[str] = None
+    run_command: Optional[str] = None
+    backend_parameters: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
+    gpu_selector: Optional[GPUSelector] = None
+    worker_selector: Optional[Dict[str, str]] = None
+    gpu_type_selector: Optional[GPUTypeSelector] = None
+    """The only entry point for a heterogeneous group, and the precondition
+    for gang admission."""
+    extended_kv_cache: Optional[ExtendedKVCacheConfig] = None
+
+    dependencies: Optional[List[str]] = None
+    """Roles that must be ready before this one starts. Must not cycle."""
+    cpu_only: bool = False
+    """A router takes no GPU."""
+
+
+class PDModeEnum(str, Enum):
+    """A disaggregation recipe: engine plus KV connector.
+
+    These values must match the entry names in ``pd-modes.yaml`` verbatim —
+    the catalog is looked up by them, so a mismatch is a silent miss. The
+    loader asserts the two sets are equal at start-up.
+    """
+
+    VLLM_NIXL = "vllm-nixl"
+    SGLANG_MOONCAKE = "sglang-mooncake"
+    SGLANG_NIXL = "sglang-nixl"
+    VLLM_ASCEND_MOONCAKE = "vllm-ascend-mooncake"
+    CUSTOM = "custom"
+    """The user supplies every connection-state parameter themselves. Also the
+    only way to mix engines across roles, since a recipe injects one engine's
+    connector config into every role."""
+
+    def __str__(self):
+        return self.value
+
+
+# Which engines a recipe can be injected into. A recipe expands into one
+# engine's connector config and env, so a role running a different engine
+# would be handed configuration it cannot read — e.g. `vllm-nixl` would inject
+# `NixlConnector` and `VLLM_NIXL_*` into a TileRT decode and fail silently.
+# Mixing engines across roles therefore has to go through `custom`.
+#
+# `pd-modes.yaml` is the authoritative source for this; the catalog loader
+# asserts the two agree at start-up, the same way it asserts the mode names
+# match. This table exists so that request validation doesn't have to wait on
+# a catalog read.
+PD_MODE_BACKENDS: Dict[str, List[str]] = {
+    PDModeEnum.VLLM_NIXL.value: [BackendEnum.VLLM.value],
+    PDModeEnum.VLLM_ASCEND_MOONCAKE.value: [BackendEnum.VLLM.value],
+    PDModeEnum.SGLANG_MOONCAKE.value: [BackendEnum.SGLANG.value],
+    PDModeEnum.SGLANG_NIXL.value: [BackendEnum.SGLANG.value],
+    # `custom` means the user writes the connection state themselves, so any
+    # engine mix is theirs to get right.
+    PDModeEnum.CUSTOM.value: [],
+}
+
+
+class DisaggregationSpec(BaseModel):
+    mode: PDModeEnum
+    readiness: Literal["any_per_role", "all"] = "any_per_role"
+    kv_load_failure_policy: Literal["fail", "recompute"] = "fail"
+    router_kind: Optional[str] = None
+    """None derives it from `mode`."""
+
+
+class ModelStateEnum(str, Enum):
+    """Model-level lifecycle. Deliberately *not* a copy of
+    ``ModelInstanceStateEnum`` — this is an aggregate, not a per-process
+    lifecycle, so it has no download/start phases.
+
+    Degradation is not a value here. Cache not attached, bandwidth below the
+    measured baseline, ratio unmet — all of those coexist with a servable
+    group, so they live in the orthogonal ``degradations`` marker instead.
+    """
+
+    PENDING = "pending"
+    """Nothing ready yet."""
+    PARTIAL = "partial"
+    """Members are up and the deployment still cannot serve — for a group, a
+    role with zero ready members, or an upstream registration that has not
+    succeeded.
+
+    **Unreachable for a role-less model**: one ready replica serves, so there
+    is no such condition. Being short of the requested count is
+    `degradations: [ratio_unmet]` beside a RUNNING state, not this."""
+    RUNNING = "running"
+    """Servable: every role has at least one ready member *and* the upstream
+    registration succeeded."""
+    ERROR = "error"
+    """A member has failed in a way it can't recover from."""
+
+    def __str__(self):
+        return self.value
+
+
+class RoleStatus(BaseModel):
+    """Per-role readiness detail.
+
+    Carried on the Model row rather than computed per request because the
+    list endpoint returns `ModelPublic` without instances, and the UI needs
+    per-role detail on a row it hasn't expanded.
+    """
+
+    desired: int = 0
+    ready: int = 0
+
+
+class DegradationReasonEnum(str, Enum):
+    """Reasons a group is servable but worse than asked for.
+
+    Orthogonal to `state`, following the precedent set by `stale`: "config
+    changed *and* still serving" has to be expressible as one fact, and so
+    does "running but the cache never attached".
+    """
+
+    CACHE_NOT_INJECTED = "cache_not_injected"
+    BANDWIDTH_DEGRADED = "bandwidth_degraded"
+    RATIO_UNMET = "ratio_unmet"
+    NO_ATOMIC_ADMISSION = "no_atomic_admission"
+
+    def __str__(self):
+        return self.value
+
+
 class ModelSpecBase(SQLModel, ModelSource):
     name: str = Field(index=True)
     description: Optional[str] = Field(
@@ -515,6 +716,17 @@ class ModelSpecBase(SQLModel, ModelSource):
         sa_column=Column(pydantic_column_type(List[LoraListEntry]), nullable=True),
     )
 
+    # Empty `roles` is the backward-compatibility baseline: behaviour is
+    # byte-for-byte unchanged. `roles` without `disaggregation` is plain
+    # multi-role orchestration; both together is PD.
+    roles: Optional[List[RoleSpec]] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(List[RoleSpec]), nullable=True),
+    )
+    disaggregation: Optional[DisaggregationSpec] = Field(
+        sa_type=pydantic_column_type(DisaggregationSpec), default=None
+    )
+
     @model_validator(mode="after")
     def set_defaults(self):
         backend = get_backend(self)
@@ -552,6 +764,40 @@ class Model(ModelBase, BaseModelMixin, table=True):
         ),
     )
     id: Optional[int] = Field(default=None, primary_key=True)
+
+    # Server-owned status. Declared here and on `ModelPublic`, deliberately
+    # *not* on `ModelBase`: `ModelUpdate` inherits `ModelBase`, and the UI
+    # issues whole-object PUTs (start/stop, inline replica edits), so
+    # anything reachable from `ModelBase` gets written back by the client.
+    # `ready_replicas` sits on `ModelSpecBase` for historical reasons and the
+    # frontend has to strip it by hand — don't grow that list.
+    #
+    # One writer only: `sync_model_status` computes all five from a single
+    # scan of the model's instances, in one transaction behind one change
+    # gate. There is no second owner.
+    # String, not sa.Enum — following CacheService.state. A bare
+    # `Optional[ModelStateEnum]` maps to `sa.Enum(name="modelstateenum")`, and
+    # that breaks twice over: asyncpg then renders `$1::modelstateenum` on
+    # every read and write, against a column the migration created as VARCHAR;
+    # and sa.Enum persists member *names*, so the row would hold "RUNNING"
+    # while the API, the enum's own value and the `?state=` filter all say
+    # "running".
+    state: Optional[ModelStateEnum] = Field(
+        default=None, sa_column=Column(String(length=64), nullable=True)
+    )
+    state_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    role_status: Optional[Dict[str, RoleStatus]] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(Dict[str, RoleStatus]), nullable=True),
+    )
+    stale: Optional[bool] = Field(default=None)
+    """A member's `spec_digest` differs from the model's current one, so the
+    running group predates the config it's shown with. Orthogonal to `state`:
+    a stale group is usually still serving."""
+    degradations: Optional[List[str]] = Field(sa_type=JSON, default=None)
+    """`DegradationReasonEnum` values. A list, because they coexist."""
 
     instances: list["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
@@ -608,6 +854,13 @@ class ModelPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    # Read-only status, mirrored from `Model`. Absent from `ModelBase` so
+    # `ModelUpdate` can't accept it — see the note on `Model`.
+    state: Optional[ModelStateEnum] = None
+    state_message: Optional[str] = None
+    role_status: Optional[Dict[str, RoleStatus]] = None
+    stale: Optional[bool] = None
+    degradations: Optional[List[str]] = None
     # Populated only by the detail endpoint; None on list responses.
     has_stale_lora_instances: Optional[bool] = None
 
@@ -628,6 +881,101 @@ class ModelPublic(
 
 
 ModelsPublic = PaginatedList[ModelPublic]
+
+
+class RoleEffectiveModel(ModelBase):
+    """A `Model` as one role sees it — see `role_effective_model`.
+
+    Non-table on purpose, and both reasons are load-bearing:
+
+    * **A projection must never reach the database.** `Model.model_copy()`
+      looks like the obvious way to build one, but the copy *shares the
+      original's* `_sa_instance_state` — it is the same ORM identity, so the
+      projection would sit one session flush away from writing a role's
+      overrides onto the Model row. A non-table class cannot be added to a
+      session at all, so the rule holds by construction rather than by
+      everyone remembering it.
+    * It records the direction of the data: nothing reads a projection back.
+
+    It carries the spec, not the aggregate status: `state` / `role_status` /
+    `degradations` live on `Model` and `ModelPublic` only. A worker or a
+    scheduling pass acting on a model-wide aggregate would be reading the
+    wrong thing anyway.
+    """
+
+    id: Optional[int] = None
+
+    # Deliberately left unhashable, which is what `Model` is too — SQLModel
+    # sets `__hash__ = None` on a table class the same way pydantic does for
+    # any mutable model, and `ModelInstance` has to override it explicitly to
+    # go into a queue. So a projection behaves like the thing it stands in
+    # for, and a reader that starts hashing models fails for both rather than
+    # only for role-bearing deployments.
+
+
+# The RoleSpec fields that describe the role itself rather than override a
+# Model field. Everything else is an override, derived rather than listed so
+# that adding one to RoleSpec cannot silently fail to be projected.
+_ROLE_OWN_FIELDS = frozenset({"name", "dependencies", "cpu_only"})
+
+_ROLE_OVERRIDE_FIELDS = frozenset(RoleSpec.model_fields) - _ROLE_OWN_FIELDS
+
+
+def find_role(model, role_name: Optional[str]) -> Optional[RoleSpec]:
+    """The named role of `model`, or None if it has no roles or no match."""
+    if not role_name:
+        return None
+    for role in model.roles or []:
+        if role.name == role_name:
+            return role
+    return None
+
+
+def role_effective_model(model, role_name: Optional[str]):
+    """Return `model` with the named role's overrides applied.
+
+    A `RoleSpec` field left as None means "inherit the Model field of the same
+    name". Nothing downstream performs that merge: the worker's start path
+    reads `self._model.<field>` in dozens of places and the scheduler's
+    filters, selectors and scorers read a Model in dozens more, all of them
+    expecting a single set of values. So the merge happens once, here, at the
+    two points where a Model is handed to those readers — `get_model()` on the
+    worker and `find_candidate()` on the server.
+
+    `replicas` is projected too, and unconditionally: it is never None, and
+    for a role-bearing model `Model.replicas` is a 0/1 deployment switch while
+    `roles[].replicas` is the count. Inside these two read paths the role's
+    count is the right answer — it is what decides how many GPUs one replica
+    gets and whether the multi-replica overcommit rule applies. Outside them
+    `Model.replicas` keeps its switch meaning, which is why this projection
+    deliberately does not reach the evaluator's `set_model_gpus_per_replica`:
+    that one writes back.
+
+    Returns `model` itself when there is nothing to project, so a role-less
+    deployment takes byte-for-byte the path it takes today.
+
+    One known edge: `distributed_inference_across_workers` is defaulted from
+    the *Model's* backend by `ModelSpecBase.set_defaults`, which runs before a
+    role's `backend` override is applied. A role that switches engines
+    therefore inherits the Model's value rather than one derived from its own
+    backend. That only arises under `pd_mode=custom`, the one mode that
+    permits a mixed-engine group, and there the user is already supplying the
+    connection state by hand — so set it explicitly on the Model in that case.
+    """
+    role = find_role(model, role_name)
+    if role is None:
+        return model
+
+    projected = RoleEffectiveModel.model_validate(model)
+    for field in _ROLE_OVERRIDE_FIELDS:
+        value = getattr(role, field, None)
+        if value is None:
+            continue
+        # Copy, so that mutating a projected list in place — the worker
+        # substitutes `{data_dir}` into `backend_parameters` that way — cannot
+        # reach back into the role held by `model.roles`.
+        setattr(projected, field, copy.deepcopy(value))
+    return projected
 
 
 # Model Instances
@@ -830,6 +1178,24 @@ class ModelInstanceBase(SQLModel, ModelSource):
         distributed_inference_across_workers permission flag."""
         dservers = self.distributed_servers
         return bool(dservers and dservers.subordinate_workers)
+    role: Optional[str] = None
+    """Which role of the parent Model this instance serves. None for a plain
+    single-role deployment."""
+    group_id: Optional[str] = Field(default=None, index=True)
+    """Shared by every member of one group. A group is a *generation*, not a
+    replica: one group_id is one `spec_digest`.
+
+    Pairing binds to this rather than to peer addresses because serving ports
+    were measured to change on every rebuild; addresses get resolved when the
+    router config is rendered."""
+    spec_digest: Optional[str] = None
+    """The generation this instance was created from. Differing from the
+    model's current digest is what makes the model `stale`."""
+    named_ports: Optional[Dict[str, PortBand]] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(Dict[str, PortBand]), nullable=True),
+    )
+    """Connector ports by declared name. Values are bands, not points."""
 
     def get_deployment_metadata(
         self,

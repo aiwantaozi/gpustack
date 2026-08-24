@@ -26,6 +26,7 @@ from gpustack.routes import (
     organization_members,
     organizations,
     ota_sources,
+    pd_modes,
     probes,
     proxy,
     source_probe,
@@ -326,6 +327,11 @@ tenant_routers = model_routers + [
         "router": cache_providers.router,
         "prefix": "/cache-providers",
         "tags": ["Cache Providers"],
+    },
+    {
+        "router": pd_modes.router,
+        "prefix": "/pd-modes",
+        "tags": ["PD Modes"],
     },
     # Inference backends are platform-wide (admin curates) but every Org
     # owner/manager needs to read them to pick a backend at deploy time.

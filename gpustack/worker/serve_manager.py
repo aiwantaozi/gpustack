@@ -63,6 +63,7 @@ from gpustack.schemas.models import (
     DistributedServerCoordinateModeEnum,
     ModelInstanceSubordinateWorker,
     CategoryEnum,
+    role_effective_model,
 )
 from gpustack.server.bus import Event, EventType
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
@@ -1894,7 +1895,16 @@ class ServeManager:
         if model := self._model_cache_by_instance.get(mi.id):
             return model
 
-        model = self._clientset.models.get(mi.model_id)
+        # Project the role's overrides here too. This is a third cluster of
+        # worker-side readers, and every one of them wants the role's value:
+        # the vGPU type and backend version at sync, `env` for the health-check
+        # config, and the backend that decides the port band and the fallback
+        # registry at start. Without the projection this manager would size and
+        # probe an instance from the Model-level spec while the child process
+        # runs from the role's — the two would disagree on the same instance.
+        # The cache is already keyed per instance, so projecting inside it is
+        # exactly per-role.
+        model = role_effective_model(self._clientset.models.get(mi.model_id), mi.role)
         self._model_cache_by_instance[mi.id] = model
         return model
 

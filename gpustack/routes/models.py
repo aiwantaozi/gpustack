@@ -6,7 +6,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from urllib.parse import urlencode
 from gpustack_runtime.detector import ManufacturerEnum
 from sqlalchemy.orm import selectinload
-from sqlmodel import and_, or_
+from sqlmodel import or_
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
@@ -46,6 +46,7 @@ from gpustack.server.deps import (
     TenantContextDep,
 )
 from gpustack.schemas.models import (
+    PD_MODE_BACKENDS,
     LoraListEntry,
     Model,
     ModelCreate,
@@ -53,6 +54,7 @@ from gpustack.schemas.models import (
     ModelUpdate,
     ModelPublic,
     ModelsPublic,
+    RoleNameEnum,
 )
 from gpustack.schemas.model_routes import (
     AccessPolicyEnum,
@@ -82,7 +84,8 @@ from gpustack.routes.model_common import (
     ModelStateFilterEnum,
     build_category_conditions,
     categories_filter,
-    state_stream_filter,
+    model_state_condition,
+    model_state_stream_filter,
 )
 from gpustack.config.config import get_global_config
 from gpustack.utils.grafana import resolve_grafana_base_url
@@ -102,9 +105,7 @@ def _make_model_watch_filter(ctx, categories, state=None):
     if cluster_scoped_system(ctx):
         predicates.append(lambda data: scoped_cluster_row_visible(ctx, data))
     if state is not None:
-        predicates.append(
-            lambda data: state_stream_filter(data, state, "ready_replicas", "replicas")
-        )
+        predicates.append(lambda data: model_state_stream_filter(data, state))
     if categories:
         predicates.append(lambda data: categories_filter(data, categories))
 
@@ -166,14 +167,9 @@ async def get_models(
             conditions = build_category_conditions(session, Model, categories)
             extra_conditions.append(or_(*conditions))
 
-        if state is None:
-            pass
-        elif state == ModelStateFilterEnum.READY:
-            extra_conditions.append(Model.ready_replicas > 0)
-        elif state == ModelStateFilterEnum.NOT_READY:
-            extra_conditions.append(and_(Model.ready_replicas == 0, Model.replicas > 0))
-        elif state == ModelStateFilterEnum.STOPPED:
-            extra_conditions.append(Model.replicas == 0)
+        state_condition = model_state_condition(state)
+        if state_condition is not None:
+            extra_conditions.append(state_condition)
 
         order_by = params.order_by
         if order_by:
@@ -364,12 +360,170 @@ def _max_intended_replicas(
     )
 
 
+def validate_roles(  # noqa: C901
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    stored: Optional[Model] = None,
+) -> None:
+    """Structural checks on a multi-role deployment.
+
+    Phase one deliberately rejects rather than reinterprets. Every rule here
+    exists because the alternative — silently folding the request into
+    something adjacent — is the failure mode that makes a deployment behave
+    unlike what the user typed.
+
+    `stored` is the row being updated, and every rule below is judged against
+    the *merged* state. A sparse PUT carries only the fields it changes, so
+    without this a request that adds a schedule without resending `roles` would
+    be judged as a role-less model and the schedule would be accepted onto a
+    group — exactly the combination the rule forbids, reached by not mentioning
+    the thing that makes it illegal. Same shape for `replicas`. Read-only, so
+    nothing here can widen what the request persists.
+    """
+
+    def field(name: str):
+        submitted = getattr(model_in, name, None)
+        if submitted is not None:
+            return submitted
+        if stored is not None and name not in getattr(
+            model_in, "model_fields_set", set()
+        ):
+            return getattr(stored, name, None)
+        return submitted
+
+    roles = field("roles")
+    disaggregation = field("disaggregation")
+
+    if not roles:
+        if disaggregation is not None:
+            raise BadRequestException(
+                message="disaggregation requires roles: declare a prefill and a decode role."
+            )
+        return
+
+    names = [role.name for role in roles]
+    duplicates = {name for name in names if names.count(name) > 1}
+    if duplicates:
+        raise BadRequestException(
+            message=f"Duplicate role name(s): {', '.join(sorted(duplicates))}."
+        )
+
+    allowed = {item.value for item in RoleNameEnum}
+    unknown = [name for name in names if name not in allowed]
+    if unknown:
+        raise BadRequestException(
+            message=(
+                f"Unsupported role name(s): {', '.join(unknown)}. "
+                f"Supported roles are {', '.join(sorted(allowed))}."
+            )
+        )
+
+    for role in roles:
+        if role.name == RoleNameEnum.ROUTER.value and role.replicas != 1:
+            raise BadRequestException(
+                message="The router role runs exactly one replica."
+            )
+
+    # `dependencies` is a start order, so a cycle is a deployment that never
+    # starts. Reject it here rather than letting the controller spin.
+    known = set(names)
+    graph = {role.name: list(role.dependencies or []) for role in roles}
+    for name, deps in graph.items():
+        for dep in deps:
+            if dep not in known:
+                raise BadRequestException(
+                    message=f"Role '{name}' depends on '{dep}', which is not declared."
+                )
+            if dep == name:
+                raise BadRequestException(
+                    message=f"Role '{name}' cannot depend on itself."
+                )
+    visiting: set = set()
+    done: set = set()
+
+    def _walk(name: str) -> None:
+        if name in done:
+            return
+        if name in visiting:
+            raise BadRequestException(
+                message=f"Role dependencies form a cycle through '{name}'."
+            )
+        visiting.add(name)
+        for dep in graph.get(name, []):
+            _walk(dep)
+        visiting.discard(name)
+        done.add(name)
+
+    for name in graph:
+        _walk(name)
+
+    # `roles[].replicas` is the only scaling truth, so a model-level count
+    # above one would be a second one. Refuse instead of quietly reading it as
+    # a multiplier — an implicit mode switch is exactly what makes a
+    # deployment stop matching its own spec.
+    if field("replicas") not in (0, 1):
+        raise BadRequestException(
+            message=(
+                "A model with roles uses replicas as an on/off switch (0 or 1). "
+                "Scale a disaggregated deployment through roles[].replicas."
+            )
+        )
+
+    # The scaling scheduler writes `model.replicas` directly, without passing
+    # through this validation, so a window rule holding 3 would break the
+    # deployment at its next tick rather than at submit time.
+    schedule = field("scaling_schedule")
+    if schedule and schedule.enabled:
+        raise BadRequestException(
+            message="Scheduled scaling is not supported for a model with roles."
+        )
+
+    if disaggregation is None:
+        return
+
+    counts = {name: names.count(name) for name in allowed}
+    if counts[RoleNameEnum.PREFILL.value] != 1:
+        raise BadRequestException(
+            message="A disaggregated model needs exactly one prefill role."
+        )
+    if counts[RoleNameEnum.DECODE.value] != 1:
+        raise BadRequestException(
+            message="A disaggregated model needs exactly one decode role."
+        )
+    if counts[RoleNameEnum.ROUTER.value] > 1:
+        raise BadRequestException(
+            message="A disaggregated model has at most one router."
+        )
+
+    # A recipe injects one engine's connector configuration into every role,
+    # so a role on a different engine would receive settings it cannot read.
+    permitted = PD_MODE_BACKENDS.get(disaggregation.mode.value, [])
+    if permitted:
+        for role in roles:
+            role_backend = role.backend or field("backend")
+            if role_backend and role_backend not in permitted:
+                raise BadRequestException(
+                    message=(
+                        f"Role '{role.name}' runs backend '{role_backend}', which "
+                        f"pd mode '{disaggregation.mode.value}' cannot configure "
+                        f"(it targets {', '.join(permitted)}). Mixing engines "
+                        f"across roles requires pd mode 'custom', where the "
+                        f"connection parameters are yours to supply."
+                    )
+                )
+
+
 async def validate_model_in(
     session: SessionDep,
     model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
     *,
     cluster_id: Optional[int] = None,
+    stored: Optional[Model] = None,
 ):
+    # `stored` is the row being updated, so a sparse PUT is judged against the
+    # merged state rather than against the handful of fields it happened to
+    # send. Absent on create, where there is nothing to merge.
+    validate_roles(model_in, stored=stored)
+
     if getattr(model_in, "gpu_type_selector", None) is not None:
         await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
 
@@ -624,12 +778,15 @@ async def validate_gpu_ids(  # noqa: C901
         cluster_id if cluster_id is not None else getattr(model_in, "cluster_id", None)
     )
 
-    if (
-        model_in.gpu_selector
-        and model_in.gpu_selector.gpu_ids
-        and model_in.gpu_selector.gpus_per_replica
-    ):
-        if len(model_in.gpu_selector.gpu_ids) < model_in.gpu_selector.gpus_per_replica:
+    # A selector can legitimately carry `gpus_per_replica` and no `gpu_ids`:
+    # that's what it looks like when the card is picked by the operator's
+    # device plugin rather than by index, which is also the shape of a
+    # per-role selector. Everything below reads `gpu_ids` as a sequence, so
+    # normalise it once here instead of guarding at each use.
+    gpu_ids = model_in.gpu_selector.gpu_ids or []
+
+    if gpu_ids and model_in.gpu_selector.gpus_per_replica:
+        if len(gpu_ids) < model_in.gpu_selector.gpus_per_replica:
             raise BadRequestException(
                 message="The number of selected GPUs must be greater than or equal to gpus_per_replica."
             )
@@ -637,7 +794,7 @@ async def validate_gpu_ids(  # noqa: C901
     model_backend = model_in.backend
 
     if model_backend == BackendEnum.VOX_BOX and (
-        len(model_in.gpu_selector.gpu_ids) > 1
+        len(gpu_ids) > 1
         or (
             model_in.gpu_selector.gpus_per_replica is not None
             and model_in.gpu_selector.gpus_per_replica > 1
@@ -648,7 +805,7 @@ async def validate_gpu_ids(  # noqa: C901
         )
 
     worker_name_set = set()
-    for gpu_id in model_in.gpu_selector.gpu_ids:
+    for gpu_id in gpu_ids:
         is_valid, matched = parse_gpu_id(gpu_id)
         if not is_valid:
             raise BadRequestException(message=f"Invalid GPU ID: {gpu_id}")
@@ -1057,7 +1214,7 @@ async def update_model(
         if field not in model_in.model_fields_set:
             object.__setattr__(model_in, field, getattr(model, field))
 
-    await validate_model_in(session, model_in)
+    await validate_model_in(session, model_in, stored=model)
     # Server-side assignment, after validation: validation must see the replica
     # count the caller submitted, not the schedule-driven one.
     apply_scaling_schedule_baseline(model_in)

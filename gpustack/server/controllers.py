@@ -44,6 +44,7 @@ from gpustack.schemas.principals import (
 from gpustack.schemas.models import (
     BackendEnum,
     BackendSourceEnum,
+    DegradationReasonEnum,
     LoraListEntry,
     ModelSource,
     Model,
@@ -51,6 +52,9 @@ from gpustack.schemas.models import (
     ModelInstanceCreate,
     ModelInstanceStateEnum,
     ModelInstanceSubordinateWorker,
+    ModelStateEnum,
+    RoleNameEnum,
+    RoleStatus,
     SourceEnum,
     get_backend,
 )
@@ -248,6 +252,25 @@ class ModelController:
         try:
             async with async_session() as session:
                 await sync_replicas(session, model)
+                # The status owner has to run on the spec side too, not only on
+                # instance events. `role_status.desired` is read straight off
+                # `roles[].replicas`, so a spec edit changes it with no instance
+                # changing — and a model with no instances at all (a group
+                # parked at `replicas: 0`) would otherwise never have its status
+                # computed even once, leaving the UI with no declared shape to
+                # show. Safe to call from both sides: the change gate inside
+                # means a pass that finds nothing new writes nothing, so the
+                # update this may publish converges after one round.
+                #
+                # Load a session-attached row rather than writing through
+                # `event.data`: what arrives on the bus is a detached copy whose
+                # identity may already have been collected, and assigning to it
+                # raises "parent object of type <Model> has been garbage
+                # collected". `notify_model_route_target` below re-fetches for
+                # the same reason.
+                attached = await Model.one_by_id(session, model.id)
+                if attached is not None:
+                    await sync_model_status(session, attached)
                 await notify_model_route_target(
                     session=session, model=model, event=event
                 )
@@ -353,7 +376,7 @@ class ModelInstanceController:
                     )
 
                 await model.refresh(session)
-                replicas_updated = await sync_ready_replicas(session, model)
+                replicas_updated = await sync_model_status(session, model)
                 if any_lora_route_deleted and not replicas_updated:
                     await session.commit()
                 if any_lora_route_deleted:
@@ -1380,9 +1403,192 @@ async def find_scale_down_candidates(
         return []
 
 
-async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
+def upstream_registration_ready(model: Model) -> bool:
+    """The second half of the RUNNING predicate: whether the group's router
+    upstream is registered.
+
+    The predicate has exactly one definition (F7 3.1)::
+
+        Model.state == RUNNING  <=>  every role has >=1 ready
+                                     AND the upstream registration succeeded
+
+    Registration is a *precondition* of RUNNING rather than a consequence of
+    it — the original "group ready, therefore register" order was a
+    self-cycle, so it was turned around: every role gets a ready member, the
+    server then tries to register the router upstream, and only a successful
+    registration flips the group to RUNNING.
+
+    A model with no router role has no upstream to register, so the predicate
+    is vacuously true: a plain deployment and a role-less model behave exactly
+    as they did before this field existed. This seam is the one place the
+    other half is decided — when the router registration step lands it
+    reports its recorded outcome here, and a group whose registration failed
+    stays PARTIAL with a message instead of silently claiming to serve.
     """
-    Synchronize the ready replicas.
+    has_router = any(
+        role.name == RoleNameEnum.ROUTER.value for role in (model.roles or [])
+    )
+    if not has_router:
+        return True
+    # TODO(track D, router upstream registration): return the recorded
+    # outcome of the registration attempt for this group. Until that step
+    # exists there is nothing to observe, so a group whose roles are all
+    # covered is reported servable rather than parked forever in PARTIAL.
+    return True
+
+
+def is_model_servable(model: Model) -> bool:
+    """Whether requests may be routed to this model.
+
+    This is the boolean servability gate, and `Model.state` is what it reads,
+    replacing the pre-PD `ready_replicas > 0`: under PD a count no longer
+    implies servability (3P1D with the router still down is four RUNNING
+    instances and zero service). `ModelRouteTarget.state` is the only place
+    in this repo that evaluates it; `ModelRoute.ready_targets`, `/v1/models`
+    and `resolve_route_targets` all derive from that target state, so they
+    follow from this one predicate.
+
+    One predicate, no per-shape special case: RUNNING means servable and
+    nothing else does. That holds because `state` was defined to answer
+    exactly this question and running-but-worse-than-asked-for is expressed
+    beside it, in `degradations`, rather than inside it — a role-less model
+    with 2 of 3 replicas up is RUNNING with `ratio_unmet`, not PARTIAL. So
+    PARTIAL keeps a single meaning everywhere: members are up and the
+    deployment still cannot serve, which for a group is a role at zero and
+    for a role-less model cannot happen at all.
+
+    Byte-for-byte the old `ready_replicas > 0` for a role-less model, which
+    `derive_model_state` is what makes true.
+    """
+    if model.state is None:
+        # A row carries NULL between its creation and the first
+        # `sync_model_status` pass over it. The migration backfills existing
+        # rows, so this is not about the upgrade — it is about newly created
+        # models, and about any row a reconcile has not reached yet. Reading
+        # the old counter for those is the same answer the gate would have
+        # given before this field existed.
+        return model.ready_replicas > 0
+    return model.state == ModelStateEnum.RUNNING
+
+
+def _ratio_unmet(
+    model: Model,
+    *,
+    ready_replicas: int,
+    role_status: Optional[Dict[str, RoleStatus]],
+) -> bool:
+    """Whether the deployment is short of the shape it was asked for.
+
+    Reported as a degradation rather than a state, because a deployment short
+    of its count is still serving — which is also why it is only meaningful
+    once something is ready. Nothing is ready yet is PENDING, and calling that
+    "degraded" as well would put the marker on every model during its first
+    start.
+
+    For a group the question is per role, since the declared ratio is what
+    makes a group a 3P1D rather than a 4P4D, and one role at half staff is
+    exactly the case the marker exists to surface.
+    """
+    if ready_replicas == 0:
+        return False
+    if role_status is not None:
+        return any(status.ready < status.desired for status in role_status.values())
+    return ready_replicas < model.replicas
+
+
+def derive_model_state(
+    model: Model,
+    *,
+    ready_replicas: int,
+    instance_count: int,
+    role_status: Optional[Dict[str, RoleStatus]],
+    error_count: int,
+) -> Tuple[ModelStateEnum, Optional[str]]:
+    """Fold one instance scan into the model-level lifecycle value and its
+    message (F7 3.1 / 3.2).
+
+    This is an aggregate, not a copy of `ModelInstanceStateEnum`: there are no
+    download or start phases here.
+
+    `state` answers one question — can this serve — and nothing else. Being
+    up but worse than asked for lives beside it in `degradations`, never
+    inside it: a group serving without its shared cache is RUNNING with
+    `cache_not_injected`, and a deployment short of its declared replica count
+    or role ratio is RUNNING with `ratio_unmet`. That is what lets PARTIAL
+    keep one meaning everywhere — members are up and it still cannot serve —
+    and lets the servability gate be a plain `state == RUNNING` with no
+    per-shape special case.
+
+    Readiness is decided before failure: a deployment with members up is
+    serving whatever else has failed, so ERROR is reserved for "nothing is
+    ready and something failed". That ordering is what keeps
+    `state == RUNNING` equivalent to `ready_replicas > 0` for a role-less
+    model, which the servability gate and the `GET /v2/models?state=` filter
+    both depend on.
+    """
+    if role_status is not None:
+        # A group is servable when every role has at least one ready member,
+        # not when every role is fully staffed: requiring the latter would
+        # make a 2P3D deployment unservable for the whole duration of a
+        # scale-up (F7 3.1). Falling short of the declared ratio while every
+        # role is covered is a degradation, not a lifecycle value.
+        roles_missing = sorted(
+            name for name, status in role_status.items() if status.ready == 0
+        )
+        if not roles_missing and upstream_registration_ready(model):
+            return ModelStateEnum.RUNNING, None
+        if ready_replicas > 0:
+            # Members up, still not servable — the one meaning PARTIAL has.
+            if roles_missing:
+                return (
+                    ModelStateEnum.PARTIAL,
+                    f"roles not ready: {', '.join(roles_missing)}",
+                )
+            return ModelStateEnum.PARTIAL, "waiting for upstream registration"
+        if error_count:
+            return (
+                ModelStateEnum.ERROR,
+                f"{error_count}/{instance_count} members failed",
+            )
+        return ModelStateEnum.PENDING, None
+
+    # No roles: the backward-compatibility baseline. The model is its own
+    # single implicit role, so "every role has a ready member" degenerates to
+    # `ready_replicas > 0` — which is therefore exactly when it is RUNNING.
+    # PARTIAL is unreachable here on purpose: one ready replica serves, so
+    # there is no state in which a role-less model has members up and cannot
+    # serve. Short of the requested count is `ratio_unmet`, carried by
+    # `sync_model_status`, with the count itself in the message.
+    if ready_replicas == 0:
+        if error_count:
+            # Only ERROR is counted as a failure. UNREACHABLE is a worker
+            # comms fault that clears when the worker comes back, so it reads
+            # as not-ready-yet, the same way it does per instance today.
+            return (
+                ModelStateEnum.ERROR,
+                f"{error_count}/{instance_count} instances failed",
+            )
+        return ModelStateEnum.PENDING, None
+    if ready_replicas < model.replicas:
+        return (
+            ModelStateEnum.RUNNING,
+            f"{ready_replicas}/{model.replicas} replicas ready",
+        )
+    return ModelStateEnum.RUNNING, None
+
+
+async def sync_model_status(session: AsyncSession, model: Model) -> bool:
+    """
+    Synchronize the model's server-owned status from its instances.
+
+    The single owner of every status field on the Model row (D26): the
+    counter, the lifecycle, the per-role detail and the degradation markers
+    are four different questions about the same scan, so one scan answers
+    them, one change gate writes them and one transaction commits them.
+    Nothing else writes them.
+
+    `stale` is the one status field this does not compute — see the note
+    below.
 
     Returns True if the model row was updated (and the session was committed).
     """
@@ -1392,13 +1598,102 @@ async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
 
+    # `ready_replicas` keeps its exact pre-PD meaning: a plain count of
+    # RUNNING instances, router included. `exporter.py` publishes it as
+    # `model_running_instances`, so it is a counter and nothing else —
+    # servability is `state`, per-role detail is `role_status`.
     ready_replicas: int = 0
-    for _, instance in enumerate(instances):
+    ready_by_role: Dict[str, int] = {}
+    error_count: int = 0
+    cache_not_injected: bool = False
+    cache_reason: Optional[str] = None
+    for instance in instances:
         if instance.state == ModelInstanceStateEnum.RUNNING:
             ready_replicas += 1
+            if instance.role:
+                ready_by_role[instance.role] = ready_by_role.get(instance.role, 0) + 1
+        elif instance.state == ModelInstanceStateEnum.ERROR:
+            error_count += 1
+        # A resolved cache the instance could not attach to is a degradation,
+        # not a failure: the instance starts anyway, just without the shared
+        # cache (D10). `cache_config` is None when no cache service was
+        # selected at all, which is not a degradation.
+        if instance.cache_config is not None and not instance.cache_config.injected:
+            cache_not_injected = True
+            if cache_reason is None:
+                cache_reason = instance.cache_config.reason
 
-    if model.ready_replicas != ready_replicas:
+    role_status: Optional[Dict[str, RoleStatus]] = None
+    if model.roles:
+        # `desired` can only come from `roles[].replicas`: an instance that was
+        # never created has no state, so the ratio is not derivable from the
+        # scan alone (F7 3.2). `ready` is counted per role out of the same
+        # scan.
+        #
+        # A group is one generation at a time (D21/D25: no blue-green), so
+        # counting a role across the model's instances is counting it within
+        # the live `group_id`. If that ever stops being true, scoping the
+        # count to a generation belongs right here.
+        role_status = {
+            role.name: RoleStatus(
+                desired=role.replicas, ready=ready_by_role.get(role.name, 0)
+            )
+            for role in model.roles
+        }
+
+    state, state_message = derive_model_state(
+        model,
+        ready_replicas=ready_replicas,
+        instance_count=len(instances),
+        role_status=role_status,
+        error_count=error_count,
+    )
+
+    # Degradations are what "up but worse than asked for" is expressed with,
+    # so they coexist with RUNNING by construction — `derive_model_state`
+    # looks at neither the cache nor the ratio. Two of the four reasons come
+    # out of this scan; `bandwidth_degraded` and `no_atomic_admission` are not
+    # derivable from it and belong to the observability work.
+    reasons: List[str] = []
+
+    if _ratio_unmet(model, ready_replicas=ready_replicas, role_status=role_status):
+        reasons.append(DegradationReasonEnum.RATIO_UNMET.value)
+
+    if cache_not_injected:
+        # A resolved cache the instance could not attach to only makes it
+        # slower (D10), so it is a marker and never a lifecycle value.
+        reasons.append(DegradationReasonEnum.CACHE_NOT_INJECTED.value)
+        detail = "shared cache not injected"
+        if cache_reason:
+            detail = f"{detail}: {cache_reason}"
+        state_message = "; ".join(m for m in (state_message, detail) if m) or None
+
+    degradations = reasons or None
+
+    # `stale` is deliberately left untouched. It compares a member's
+    # `spec_digest` against the model's current digest, and nothing computes
+    # either yet: D13 fixes the digest's shape (copy
+    # `GPUInstanceType.compute_snapshot` — a content hash over the
+    # definitional spec with the mutable description fields excluded, and
+    # retire-and-insert semantics for a generation) and requires folding the
+    # InstanceType snapshot in, so that a `gpu_type_selector` naming a type
+    # whose catalog row was replaced counts as a new generation. Deriving
+    # `stale` from an unwritten column would mark every model stale, and
+    # guessing at a digest scheme would be worse than having none: it is what
+    # decides whether a whole group gets restarted.
+
+    if (
+        model.ready_replicas != ready_replicas
+        or model.state != state
+        or model.state_message != state_message
+        or model.role_status != role_status
+        or model.degradations != degradations
+    ):
         model.ready_replicas = ready_replicas
+        model.state = state
+        model.state_message = state_message
+        model.role_status = role_status
+        model.degradations = degradations
         await ModelService(session).update(model)
         return True
     return False
@@ -3422,7 +3717,16 @@ async def notify_model_route_target(session: AsyncSession, model: Model, event: 
         # entry is built, and that only runs off a route event -- so without it
         # here, flipping the selector would change nothing until the deployment
         # happened to scale.
-        related_fields = ["ready_replicas", "replicas", "native_anthropic_api"]
+        #
+        # `state` is what the target's ACTIVE gate reads, so a state change
+        # has to reach the target even when the RUNNING count did not move
+        # (a group whose upstream registration flips, for instance).
+        related_fields = [
+            "state",
+            "ready_replicas",
+            "replicas",
+            "native_anthropic_api",
+        ]
         for field in related_fields:
             if field in event.changed_fields:
                 should_notify = True
@@ -3451,6 +3755,7 @@ async def notify_model_route_target(session: AsyncSession, model: Model, event: 
                             {
                                 "id": model.id,
                                 "name": model.name,
+                                "state": model.state,
                                 "ready_replicas": model.ready_replicas,
                                 "replicas": model.replicas,
                             },
@@ -3732,9 +4037,14 @@ class ModelRouteTargetController:
             model = await Model.one_by_id(session, target.model_id)
             if not model:
                 return
+            # The servability gate: `Model.state`, not the RUNNING count.
+            # `ModelRoute.ready_targets`, `/v1/models` and
+            # `resolve_route_targets` are all defined off this target state,
+            # so they follow from here. The route's weight / fallback / alias
+            # mechanics are untouched.
             target_state = (
                 TargetStateEnum.ACTIVE
-                if model.ready_replicas > 0
+                if is_model_servable(model)
                 else TargetStateEnum.UNAVAILABLE
             )
         if target.state != target_state:

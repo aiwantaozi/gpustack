@@ -48,12 +48,14 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
     ModelUpdate,
     ModelInstanceDeploymentMetadata,
+    role_effective_model,
 )
 from gpustack.schemas.workers import GPUDevicesStatus
 from gpustack.server.bus import Event
 from gpustack.utils.command import flatten_to_argv, is_parameter_key
 from gpustack.utils.config import apply_registry_override_to_image
 from gpustack.utils.envs import filter_env_vars
+from gpustack.utils.template import deployment_variables, render_values
 from gpustack.utils.hub import get_hf_text_config, get_max_model_len
 from gpustack.utils.hub import get_pretrained_config, safe_pretrained_config_from_dict
 from gpustack.utils.profiling import time_decorator
@@ -171,6 +173,12 @@ class InferenceServer(ABC):
     _runner_overrides: Optional[List[RunnerOverrideEntryPublic]] = None
     """The runner overrides this deploy resolved images against, fetched once."""
 
+    _model_spec = None
+    """The model as the server holds it, before the role's overrides are
+    projected onto it. `self._model` is the projection and is what everything
+    reads; this is only for the one path that writes the model back, which must
+    not push a role's values up to the Model-level spec."""
+
     @time_decorator
     def __init__(
         self,
@@ -257,6 +265,17 @@ class InferenceServer(ABC):
 
     def get_model(self):
         model = self._clientset.models.get(id=self._model_instance.model_id)
+        # Keep the model as the server holds it, for the one path that writes
+        # back: a projection must never be persisted, and a PUT built from one
+        # would push a role's overrides up to the Model-level spec.
+        self._model_spec = model
+        # Apply the role's overrides before anything reads the model. This is
+        # the only place the worker does it: everything below reads
+        # `self._model.<field>` and knows nothing about roles. Projecting
+        # first also means a role's own `backend_parameters` get the
+        # `{data_dir}` substitution, which they would miss the other way
+        # round.
+        model = role_effective_model(model, self._model_instance.role)
         data_dir = self._config.data_dir
         for i, param in enumerate(model.backend_parameters or []):
             model.backend_parameters[i] = param.replace("{data_dir}", data_dir)
@@ -448,6 +467,40 @@ class InferenceServer(ABC):
 
         return []
 
+    def _template_variables(self, **overrides) -> Dict[str, object]:
+        """The `{{name}}` values this instance can resolve.
+
+        One builder for both rendering paths — the run command and the env
+        values — so the two cannot drift into resolving different things.
+
+        Every source is read tolerantly, on purpose. Rendering enriches an env
+        value; it must not gain the power to end a start. A source that isn't
+        resolvable yet — the device list before scheduling, the instance on a
+        caller that only set the model — should leave its placeholder
+        unresolved and logged, which is a diagnosable outcome, rather than
+        raise from underneath `_get_configured_env`.
+        """
+        try:
+            gpu_indexes = sorted(d.index for d in self._get_selected_gpu_devices())
+        except Exception:
+            gpu_indexes = None
+
+        instance = getattr(self, "_model_instance", None)
+        worker = getattr(self, "_worker", None)
+
+        variables = deployment_variables(
+            model_path=self._model_path,
+            port=getattr(instance, "port", None),
+            worker_ip=getattr(worker, "ip", None),
+            model_name=getattr(instance, "model_name", None),
+            gpu_count=len(gpu_indexes) if gpu_indexes is not None else None,
+            gpu_ids=gpu_indexes,
+            role=getattr(instance, "role", None),
+            group_id=getattr(instance, "group_id", None),
+        )
+        variables.update(overrides)
+        return variables
+
     def _get_configured_env(self, **kwargs) -> Dict[str, str]:
         """
         Get the environment variables for the model instance.
@@ -463,7 +516,14 @@ class InferenceServer(ABC):
             env = filter_env_vars(os.environ)
 
         if self._model.env:
-            env.update(self._model.env)
+            # Render the *values*. This is the point of gpustack.utils.template
+            # existing at all: substitution used to happen only inside
+            # `replace_command_param`, which is gated on a version config that
+            # has a run_command and no built_in_frameworks — so no built-in
+            # backend ever reached it, and a connector variable reached the
+            # engine verbatim (`ZMQError: No such device
+            # (addr='tcp://{{worker_ip}}:5600')`).
+            env.update(render_values(self._model.env, self._template_variables()))
 
         # Skip the container toolkit's NVIDIA_REQUIRE_CUDA check so a newer-minor
         # image starts on an older host driver. setdefault keeps user overrides.
@@ -1276,10 +1336,18 @@ exec "$@"
             return
         try:
             if not self._model.backend_version:
+                # Write the *unprojected* model back. `self._model` carries the
+                # role's overrides merged in, so sending it as a ModelUpdate
+                # would persist one role's engine parameters, env and image as
+                # the Model-level spec — silently, and for every other role to
+                # then inherit. The non-table projection class cannot prevent
+                # this one: the write goes out over HTTP, not through a
+                # session. A role that overrides `backend_version` never
+                # reaches here anyway, since the value is then already set.
+                spec = self._model_spec or self._model
+                spec.backend_version = service_version
                 self._model.backend_version = service_version
-                self._clientset.models.update(
-                    self._model.id, ModelUpdate(**self._model.model_dump())
-                )
+                self._clientset.models.update(spec.id, ModelUpdate(**spec.model_dump()))
             if not self._model_instance.backend_version:
                 self._update_model_instance(
                     self._model_instance.id, backend_version=service_version

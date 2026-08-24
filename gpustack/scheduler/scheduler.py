@@ -57,6 +57,7 @@ from gpustack.schemas.models import (
     DistributedServerCoordinateModeEnum,
     SourceEnum,
     is_omni_model,
+    role_effective_model,
 )
 from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.server.bus import EventType
@@ -348,7 +349,12 @@ class Scheduler:
             if workers and model:
                 try:
                     candidate, messages = await find_candidate(
-                        session, self._config, model, workers, model_instances
+                        session,
+                        self._config,
+                        model,
+                        workers,
+                        model_instances,
+                        role=model_instance.role,
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
@@ -427,16 +433,24 @@ async def find_candidate(
     model: Model,
     workers: List[Worker],
     model_instances: List[ModelInstance],
+    role: Optional[str] = None,
 ) -> Tuple[Optional[ModelInstanceScheduleCandidate], List[str]]:
     """
     Find a schedule candidate for the model instance.
     :param config: GPUStack configuration.
     :param model: Model to schedule.
     :param workers: List of workers to consider.
+    :param role: Which role of a multi-role model is being placed. None for a
+                 single-role deployment.
     :return: A tuple containing:
                 - The schedule candidate.
                 - A list of messages for the scheduling process.
     """
+
+    # Apply the role's overrides once, here. Every filter, selector and scorer
+    # below is constructed from `model` and reads Model-level fields directly;
+    # none of them knows about roles. A role-less model comes back unchanged.
+    model = role_effective_model(model, role)
 
     # Filter workers.
     filters = [

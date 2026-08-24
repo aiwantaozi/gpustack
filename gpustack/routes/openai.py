@@ -214,8 +214,9 @@ async def proxy_request_by_model(
         if not route_targets:
             # resolve_route_targets filters on TargetStateEnum.ACTIVE, so an
             # empty result means either no such route or every target sitting
-            # UNAVAILABLE while ready_replicas is 0 (any worker that misses
-            # /healthz does that to every model on it). 404 would tell the
+            # UNAVAILABLE because its model is not servable (any worker that
+            # misses /healthz does that to every model on it; a group with a
+            # role at zero ready members does it too). 404 would tell the
             # caller a deployed model is gone and not to retry, so split them.
             if await model_route_service.get_by_name(model_name) is None:
                 raise NotFoundException(

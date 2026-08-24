@@ -19,15 +19,23 @@ from gpustack.schemas.models import (
     ModelInstanceSubordinateWorker,
     PDModeEnum,
     PortBand,
+    RoleSpec,
+    role_effective_model,
 )
 from gpustack.schemas.pd_modes import (
     PDInjectTargetEnum,
     PDMode,
     PDModeRole,
+    PDPortScopeEnum,
     PDPortSpec,
 )
+from gpustack.server.pd_mode_catalog import get_pd_modes
 from gpustack.utils import network
-from gpustack.worker.serve_manager import ServeManager
+from gpustack.worker.serve_manager import (
+    _VLLM_MP_CONNECTING_BAND,
+    PDPortScopeUnsupportedError,
+    ServeManager,
+)
 from tests.utils.model import new_model, new_model_instance
 
 PORT_RANGE = "40000-40063"
@@ -46,12 +54,13 @@ def _manager(port_range: str = PORT_RANGE, worker_id: int = 1) -> ServeManager:
     return manager
 
 
-def _pd_model(mode: PDModeEnum = PDModeEnum.VLLM_NIXL):
+def _pd_model(mode: PDModeEnum = PDModeEnum.VLLM_NIXL, **kwargs):
     return new_model(
         1,
         "pd-model",
         huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
         disaggregation=DisaggregationSpec(mode=mode),
+        **kwargs,
     )
 
 
@@ -241,10 +250,107 @@ def test_refilled_ports_are_honoured_by_the_next_allocation():
     assert not set(fresh.ports) & {40000, 40001, 40002, 40003, 40004}
 
 
-def test_templated_count_is_narrowed_to_one_and_says_so(caplog):
-    """Phase one has no resolver for `{{tensor_parallel_size}}`. Reserving one
-    port where the connector will bind eight is exactly the collision this
-    mechanism exists to prevent, so it is never silent."""
+def test_templated_count_resolves_from_the_roles_parallelism():
+    """Mooncake's `kv_port` is a base and the connector binds one port per
+    tensor-parallel rank: TP8 was measured holding 41100-41107. The width has
+    to come from the parallelism the role actually starts with."""
+    manager = _manager(port_range="40000-40063")
+    mi = _instance(role="prefill")
+    model = _pd_model(
+        PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        backend_parameters=["--tensor-parallel-size", "8"],
+    )
+
+    manager._assign_ports(mi, model, BackendEnum.VLLM)
+
+    band = mi.named_ports["kv_port"]
+    assert band.count == 8
+    expected = set(range(band.base, band.base + 8))
+    # The whole run is fenced, not just the base — that is the point.
+    assert expected <= set(mi.ports)
+    assert expected <= manager._assigned_ports[mi.id]
+
+
+@pytest.mark.parametrize(
+    "parameters, expected",
+    [
+        (["--tensor-parallel-size", "4"], 4),
+        (["-tp", "2"], 2),
+        (["--tp-size=8"], 8),
+    ],
+)
+def test_templated_count_accepts_every_spelling_of_tp(parameters, expected):
+    """The engines accept three spellings and users write all three."""
+    manager = _manager()
+    mi = _instance(role="prefill")
+    model = _pd_model(PDModeEnum.VLLM_ASCEND_MOONCAKE, backend_parameters=parameters)
+
+    manager._assign_ports(mi, model, BackendEnum.VLLM)
+
+    assert mi.named_ports["kv_port"].count == expected
+
+
+@pytest.mark.parametrize(
+    "placeholder, parameters",
+    [
+        ("{{data_parallel_size}}", ["--data-parallel-size", "3"]),
+        ("{{pipeline_parallel_size}}", ["-pp", "3"]),
+    ],
+)
+def test_the_other_parallelism_placeholders_resolve_too(placeholder, parameters):
+    """A connector that sizes its band by DP or PP is a YAML change, not a
+    code change."""
+    manager = _manager()
+    mi = _instance(role="prefill")
+    mode = PDMode(
+        name="test-wide-band",
+        roles={
+            "prefill": PDModeRole(
+                ports=[
+                    PDPortSpec(
+                        name="kv_port",
+                        count=placeholder,
+                        inject_to=PDInjectTargetEnum.ARGS,
+                    )
+                ],
+                connector={"kv_port": "{{ports.kv_port}}"},
+            )
+        },
+    )
+    model = _pd_model(backend_parameters=parameters)
+
+    with patch("gpustack.worker.serve_manager.get_pd_mode", return_value=mode):
+        manager._assign_ports(mi, model, BackendEnum.VLLM)
+
+    assert mi.named_ports["kv_port"].count == 3
+
+
+def test_templated_count_reads_the_roles_own_override():
+    """`_get_model` hands this allocator the role's projection, so a role that
+    overrides `backend_parameters` sizes its band from its own value and not
+    from the Model's."""
+    manager = _manager()
+    mi = _instance(role="decode")
+    model = _pd_model(
+        PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        backend_parameters=["--tensor-parallel-size", "8"],
+        roles=[
+            RoleSpec(name="prefill"),
+            RoleSpec(name="decode", backend_parameters=["--tensor-parallel-size", "2"]),
+        ],
+    )
+
+    manager._assign_ports(mi, role_effective_model(model, "decode"), BackendEnum.VLLM)
+
+    assert mi.named_ports["kv_port"].count == 2
+
+
+def test_unresolvable_templated_count_allocates_nothing_and_says_why(caplog):
+    """vLLM's default TP is 1, but GPUStack injects a tensor-parallel size of
+    its own further down, so "no -tp written" does not mean "one rank".
+    Guessing 1 would fence one port where the connector binds eight, and that
+    surfaces as an instance wedged in `starting`; not allocating the band
+    leaves the placeholder in the launch, which names itself."""
     manager = _manager()
     mi = _instance(role="prefill")
 
@@ -253,9 +359,60 @@ def test_templated_count_is_narrowed_to_one_and_says_so(caplog):
             mi, _pd_model(PDModeEnum.VLLM_ASCEND_MOONCAKE), BackendEnum.VLLM
         )
 
-    assert mi.named_ports["kv_port"].count == 1
-    assert "templated count" in caplog.text
+    assert not mi.named_ports
+    assert mi.ports == [mi.port]
+    assert "kv_port" in caplog.text
     assert "tensor_parallel_size" in caplog.text
+    assert "No ports are reserved" in caplog.text
+
+
+def test_a_role_scoped_band_is_refused_not_downgraded():
+    """Role scope means "every member of this role shares one band". Handing
+    each member its own band is not a partial implementation of that, it is a
+    band the connector cannot meet on — and it only fails at handshake."""
+    manager = _manager()
+    mi = _instance(role="prefill")
+    mode = PDMode(
+        name="test-wide-band",
+        roles={
+            "prefill": PDModeRole(
+                ports=[
+                    PDPortSpec(
+                        name="kv_port",
+                        count=2,
+                        inject_to=PDInjectTargetEnum.ARGS,
+                        scope=PDPortScopeEnum.ROLE,
+                    )
+                ],
+                connector={"kv_port": "{{ports.kv_port}}"},
+            )
+        },
+    )
+
+    with pytest.raises(PDPortScopeUnsupportedError) as excinfo:
+        with patch("gpustack.worker.serve_manager.get_pd_mode", return_value=mode):
+            manager._assign_ports(mi, _pd_model(), BackendEnum.VLLM)
+
+    message = str(excinfo.value)
+    assert "kv_port" in message
+    assert "registry" in message
+    assert not mi.named_ports
+
+
+def test_no_shipped_band_declares_role_scope():
+    """The guard above is only tolerable while nothing needs role scope. This
+    is the tripwire: adding `scope: role` to the catalog fails here, where the
+    fix is "implement the registry", rather than on a worker at handshake."""
+    for mode in get_pd_modes():
+        holders = list(mode.roles.values())
+        if mode.router is not None:
+            holders.append(mode.router)
+        for holder in holders:
+            for spec in holder.ports or []:
+                assert spec.scope == PDPortScopeEnum.INSTANCE, (
+                    f"PD mode '{mode.name}' band '{spec.name}' declares "
+                    f"scope '{spec.scope}', which the worker allocator refuses"
+                )
 
 
 def test_unknown_mode_warns_and_assigns_no_bands(caplog):
@@ -286,6 +443,197 @@ def test_exhaustion_names_the_role_and_the_band():
     assert "role 'prefill'" in message
     assert "'kv_port'" in message
     assert "Widen the port range" in message
+
+
+# ---------------------------------------------------------------------------
+# The vLLM mp connecting band. Not a PD path — it predates PD and is shared by
+# every multi-node vLLM deployment — but the same three bugs: the ports vLLM
+# derives from VLLM_DP_MASTER_PORT were never probed, never registered, and
+# silently clamped to fewer than ten near the end of the range.
+# ---------------------------------------------------------------------------
+
+
+def _distributed(mi):
+    mi.distributed_servers = DistributedServers(
+        subordinate_workers=[ModelInstanceSubordinateWorker(worker_id=2)]
+    )
+    return mi
+
+
+def _mp_model(**kwargs):
+    return new_model(
+        1,
+        "mp-model",
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend_parameters=["--distributed-executor-backend", "mp"],
+        **kwargs,
+    )
+
+
+def _plain_instance(instance_id: int = 1):
+    mi = new_model_instance(instance_id, f"mp-{instance_id}", 1, worker_id=1)
+    mi.worker_ip = "127.0.0.1"
+    return _distributed(mi)
+
+
+def test_mp_connecting_band_keeps_the_positional_layout():
+    """`ports[1..3]` and `ports[-1]` are read by name in vllm.py, so nothing
+    may be appended after the connecting port."""
+    manager = _manager()
+    mi = _plain_instance()
+
+    manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+
+    connecting = mi.ports[-1]
+    assert mi.ports[0] == mi.port
+    band = set(range(connecting, connecting + _VLLM_MP_CONNECTING_BAND))
+    # The cross ports (DP RPC, master, VLLM_PORT) stay outside the band.
+    assert not band & set(mi.ports[1:4])
+
+
+def test_the_mp_container_spec_is_unchanged():
+    """The nine derived ports are recorded but NOT put in `mi.ports`.
+
+    `mi.ports` is what the runtime turns into host ports, so adding them there
+    would rewrite the container spec of every existing multi-worker vLLM
+    deployment — a change to non-disaggregated behaviour, made as a side effect
+    of a disaggregation change. HTTP plus three cross ports plus the band's
+    base is what it has always been.
+    """
+    manager = _manager()
+    mi = _plain_instance()
+
+    manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+
+    assert len(mi.ports) == 5
+
+
+def test_mp_connecting_band_is_registered_whole():
+    """The band used to be fenced only inside the one call that allocated it,
+    so the next instance on this worker saw nine of its ten ports as free."""
+    manager = _manager()
+    mi = _plain_instance()
+
+    manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+
+    connecting = mi.ports[-1]
+    band = set(range(connecting, connecting + _VLLM_MP_CONNECTING_BAND))
+    assert band <= manager._assigned_ports[mi.id]
+
+
+def test_the_mp_band_survives_a_worker_restart():
+    """Recorded in `named_ports`, which the early-return refill re-expands from
+    `base`/`count` — the whole reason the band needed a persisted home at all.
+    """
+    manager = _manager()
+    mi = _plain_instance()
+    manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+    connecting = mi.ports[-1]
+
+    fresh = _manager()
+    fresh._register_assigned_ports(mi)
+
+    band = set(range(connecting, connecting + _VLLM_MP_CONNECTING_BAND))
+    assert band <= fresh._assigned_ports[mi.id]
+
+
+def test_a_second_mp_instance_gets_a_disjoint_band():
+    """The defect this fixes: the band was fenced only within the call that
+    allocated it, so the next instance on the worker saw nine of its ten ports
+    as free and vLLM bound them anyway."""
+    manager = _manager()
+    first, second = _plain_instance(1), _plain_instance(2)
+
+    manager._assign_ports(first, _mp_model(), BackendEnum.VLLM)
+    manager._assign_ports(second, _mp_model(), BackendEnum.VLLM)
+
+    assert not set(first.ports) & set(second.ports)
+    # The derived ports are the point: comparing only `mi.ports` would compare
+    # the two bases and miss the nine ports on either side of them.
+    first_band = set(range(first.ports[-1], first.ports[-1] + _VLLM_MP_CONNECTING_BAND))
+    second_band = set(
+        range(second.ports[-1], second.ports[-1] + _VLLM_MP_CONNECTING_BAND)
+    )
+    assert not first_band & second_band
+
+
+def test_mp_connecting_band_is_probed(monkeypatch):
+    """Every port of the band is bound by vLLM, so every port of it has to be
+    probed — the old implementation probed the base alone."""
+    busy = {40003, 40011}
+    monkeypatch.setattr(
+        network, "is_port_available", lambda port, host=None: port not in busy
+    )
+    manager = _manager()
+    mi = _plain_instance()
+
+    manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+
+    connecting = mi.ports[-1]
+    band = set(range(connecting, connecting + _VLLM_MP_CONNECTING_BAND))
+    assert not band & busy
+
+
+def test_mp_band_at_the_range_end_is_refused_not_clamped():
+    """The old implementation clamped the fence to the end of the range and
+    handed out the base anyway, so vLLM bound ports nobody had reserved. A
+    range that cannot hold the band now fails where the message can be read."""
+    # 40000 goes to the HTTP port, leaving nine — one short of the band.
+    manager = _manager(port_range="40000-40009")
+    mi = _plain_instance()
+
+    with pytest.raises(network.PortRangeExhaustedError) as excinfo:
+        manager._assign_ports(mi, _mp_model(), BackendEnum.VLLM)
+
+    message = str(excinfo.value)
+    assert "10 consecutive free port(s)" in message
+    assert "Widen the port range" in message
+
+
+def test_restarted_mp_instance_refills_the_whole_band():
+    """The band is persisted in `mi.ports`, so the refill on a restart covers
+    it without a second index to expand."""
+    manager = _manager()
+    restarted = _plain_instance(1)
+    restarted.port = 40000
+    restarted.ports = [40000, 40020, 40021, 40022] + list(range(40031, 40040)) + [40030]
+
+    manager._assign_ports(restarted, _mp_model(), BackendEnum.VLLM)
+
+    assert manager._assigned_ports[restarted.id] == set(restarted.ports)
+    fresh = _plain_instance(2)
+    manager._assign_ports(fresh, _mp_model(), BackendEnum.VLLM)
+    assert not set(fresh.ports) & set(restarted.ports)
+
+
+def test_the_ray_path_still_takes_a_single_connecting_port():
+    """Only vLLM's mp executor derives ports from the connecting port; fencing
+    ten on the Ray path would burn nine ports per instance."""
+    manager = _manager()
+    mi = _plain_instance()
+    model = new_model(
+        1,
+        "ray-model",
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend_parameters=["--distributed-executor-backend", "ray", "--dp", "2"],
+    )
+
+    manager._assign_ports(mi, model, BackendEnum.VLLM)
+
+    # [http, dp_rpc, connecting] — nothing else.
+    assert len(mi.ports) == 3
+    assert manager._assigned_ports[mi.id] == set(mi.ports)
+
+
+def test_a_non_vllm_distributed_backend_takes_a_single_connecting_port():
+    manager = _manager()
+    mi = _plain_instance()
+    model = new_model(1, "mindie-model", huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+
+    manager._assign_ports(mi, model, BackendEnum.ASCEND_MINDIE)
+
+    assert len(mi.ports) == 2
+    assert mi.ports[0] == mi.port
 
 
 def test_start_model_instance_persists_named_ports(tmp_path):

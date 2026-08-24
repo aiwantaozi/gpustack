@@ -1,3 +1,7 @@
+import logging
+import socket
+from collections import namedtuple
+
 import pytest
 
 from gpustack.config.config import Config
@@ -7,7 +11,8 @@ from gpustack.schemas.workers import (
     Worker,
     WorkerStatus,
 )
-from gpustack.worker.net_device import derive_net_device
+from gpustack.worker import net_device
+from gpustack.worker.net_device import candidate_kv_interfaces, derive_net_device
 
 
 @pytest.fixture
@@ -16,6 +21,25 @@ def config(tmp_path):
         return Config(data_dir=str(tmp_path / "data"), **kwargs)
 
     return _config
+
+
+@pytest.fixture(autouse=True)
+def single_nic_host(monkeypatch):
+    """Pin the host NIC enumeration for every test that does not care about it.
+
+    Without this the results would depend on whatever NICs the machine running
+    the suite happens to have -- a developer box with Docker plus a second
+    uplink would flip the multi-NIC refusal on and fail the fallback tests.
+    """
+    monkeypatch.setattr(net_device, "candidate_kv_interfaces", lambda: ["eth0"])
+
+
+@pytest.fixture
+def nics(monkeypatch):
+    def _set(names):
+        monkeypatch.setattr(net_device, "candidate_kv_interfaces", lambda: list(names))
+
+    return _set
 
 
 def _worker(ifname: str = "eth0", gpu_devices=None) -> Worker:
@@ -41,7 +65,26 @@ def test_kv_ifname_overrides_worker_ifname(config):
     assert derive_net_device(_worker(ifname="eth0"), config(kv_ifname="ib0")) == "ib0"
 
 
-def test_falls_back_to_worker_ifname(config):
+def test_kv_ifname_wins_on_a_multi_nic_host(config, nics):
+    """The refusal below is what kv_ifname is the answer to, so it must not be
+    reachable once the operator has answered."""
+    nics(["eno1", "ib0"])
+    assert derive_net_device(_worker(ifname="eno1"), config(kv_ifname="ib0")) == "ib0"
+
+
+def test_kv_ifname_is_honoured_even_when_it_is_not_a_candidate(config, nics):
+    """The candidate filter gates the automatic path only. An explicit value is
+    an instruction, not a proposal -- an RDMA-only netdev, or one this host's
+    naming does not resemble, must still get through."""
+    nics(["eno1"])
+    assert (
+        derive_net_device(_worker(ifname="eno1"), config(kv_ifname="mlx5_0"))
+        == "mlx5_0"
+    )
+
+
+def test_falls_back_to_worker_ifname(config, nics):
+    nics(["bond0"])
     assert derive_net_device(_worker(ifname="bond0"), config()) == "bond0"
 
 
@@ -57,11 +100,12 @@ def test_placeholder_worker_row_is_not_a_value(config):
     assert derive_net_device(_worker(ifname="   "), config()) is None
 
 
-def test_blank_kv_ifname_defers_instead_of_blanking_the_result(config):
+def test_blank_kv_ifname_defers_instead_of_blanking_the_result(config, nics):
+    nics(["eth1"])
     assert derive_net_device(_worker(ifname="eth1"), config(kv_ifname="  ")) == "eth1"
 
 
-def test_ascend_per_card_iface_is_never_used(config):
+def test_ascend_per_card_iface_is_never_used(config, nics):
     """hccn_tool reports eth0-eth7 for the card-internal ports. Those devices do
     not exist in the host netns, so UCX cannot bind to them -- the host NIC is
     still the only usable answer."""
@@ -81,6 +125,7 @@ def test_ascend_per_card_iface_is_never_used(config):
         for i in range(8)
     ]
     worker = _worker(ifname="enp1s0f0", gpu_devices=ascend_cards)
+    nics(["enp1s0f0"])
 
     assert derive_net_device(worker, config()) == "enp1s0f0"
 
@@ -106,3 +151,232 @@ def test_ascend_per_card_iface_does_not_rescue_a_missing_worker_ifname(config):
 
 def test_kv_ifname_defaults_to_none(config):
     assert config().kv_ifname is None
+
+
+#
+# The multi-NIC refusal.
+#
+
+
+def test_multi_nic_host_refuses_instead_of_using_the_management_nic(
+    config, nics, caplog
+):
+    """The design's requirement: silently resolving to the management plane on a
+    multi-NIC host is how the KV traffic ends up on the wrong fabric."""
+    nics(["eno1", "ib0"])
+    with caplog.at_level(logging.ERROR):
+        assert derive_net_device(_worker(ifname="eno1"), config()) is None
+    assert "Refusing to derive" in caplog.text
+
+
+def test_the_refusal_names_the_candidates_so_the_operator_can_transcribe_one(
+    config, nics, caplog
+):
+    nics(["eno1", "ib0", "ib1"])
+    with caplog.at_level(logging.ERROR):
+        derive_net_device(_worker(ifname="eno1"), config())
+    for name in ("eno1", "ib0", "ib1"):
+        assert name in caplog.text
+    # The remedy has to be in the message, not only in the docs.
+    assert "kv_ifname" in caplog.text
+
+
+def test_the_refusal_reports_the_management_nic_as_the_likely_answer(
+    config, nics, caplog
+):
+    nics(["eno1", "ib0"])
+    with caplog.at_level(logging.ERROR):
+        derive_net_device(_worker(ifname="eno1"), config())
+    assert "management-plane NIC is 'eno1'" in caplog.text
+
+
+def test_multi_nic_refusal_is_logged_at_error_not_warning(config, nics, caplog):
+    """The one caller downgrades exceptions to WARNING, so ERROR is the only way
+    this stays distinguishable from the ordinary "nothing detected yet" case."""
+    nics(["eno1", "ib0"])
+    with caplog.at_level(logging.DEBUG):
+        derive_net_device(_worker(ifname="eno1"), config())
+    levels = {r.levelno for r in caplog.records if "Refusing to derive" in r.message}
+    assert levels == {logging.ERROR}
+
+
+def test_multi_nic_refusal_does_not_raise(config, nics):
+    """Raising would be swallowed into a WARNING by the caller and would lose
+    the log level; returning None keeps the placeholder unresolved instead."""
+    nics(["eno1", "ib0"])
+    assert derive_net_device(_worker(ifname="eno1"), config()) is None
+
+
+def test_zero_candidates_keeps_the_worker_ifname_fallback(config, nics):
+    """An enumeration that finds nothing must not be able to withhold a value:
+    the gate exists to stop a guess, not to invent a new failure."""
+    nics([])
+    assert derive_net_device(_worker(ifname="eth0"), config()) == "eth0"
+
+
+def test_enumeration_failure_falls_back_instead_of_refusing(config, monkeypatch):
+    def _boom():
+        raise OSError("no netlink for you")
+
+    monkeypatch.setattr(net_device, "candidate_kv_interfaces", _boom)
+    assert derive_net_device(_worker(ifname="eth0"), config()) == "eth0"
+
+
+def test_management_nic_outside_the_candidate_set_warns_but_still_resolves(
+    config, nics, caplog
+):
+    """A worker that reaches the server through docker0 reports docker0. That is
+    known-bad, but the judgement rests on a hand-written prefix list, so a false
+    positive there must not break a deployment that works today."""
+    nics(["eno1"])
+    with caplog.at_level(logging.WARNING):
+        assert derive_net_device(_worker(ifname="docker0"), config()) == "docker0"
+    assert "not among the candidate KV interfaces" in caplog.text
+
+
+#
+# Host NIC enumeration.
+#
+
+_Addr = namedtuple("_Addr", ["family", "address"])
+_Stats = namedtuple("_Stats", ["isup", "duplex", "speed", "mtu", "flags"])
+
+
+def _up(flags="up,broadcast,running,multicast"):
+    return _Stats(isup=True, duplex=0, speed=0, mtu=1500, flags=flags)
+
+
+def _down():
+    return _Stats(isup=False, duplex=0, speed=0, mtu=1500, flags="broadcast,multicast")
+
+
+def _v4(address):
+    return _Addr(family=socket.AF_INET, address=address)
+
+
+def _v6(address):
+    return _Addr(family=socket.AF_INET6, address=address)
+
+
+@pytest.fixture
+def host(monkeypatch):
+    """Fake a host's NIC table: {name: (addrs, stats)}."""
+
+    def _set(table):
+        monkeypatch.setattr(
+            net_device.psutil,
+            "net_if_addrs",
+            lambda: {name: addrs for name, (addrs, _) in table.items()},
+        )
+        monkeypatch.setattr(
+            net_device.psutil,
+            "net_if_stats",
+            lambda: {name: stats for name, (_, stats) in table.items() if stats},
+        )
+
+    return _set
+
+
+def test_enumeration_keeps_the_single_physical_nic(host):
+    host(
+        {
+            "lo": ([_v4("127.0.0.1"), _v6("::1")], _up("up,loopback,running")),
+            "eno1": ([_v4("192.168.50.15")], _up()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_excludes_the_container_and_cni_bridges(host):
+    """The exact M0 host: five virtual devices, every one of them with an
+    address UCX would happily advertise and no peer could route."""
+    host(
+        {
+            "lo": ([_v4("127.0.0.1")], _up("up,loopback,running")),
+            "eno1": ([_v4("192.168.50.15")], _up()),
+            "docker0": ([_v4("172.17.0.1")], _up()),
+            "flannel.1": ([_v4("10.42.0.0")], _up()),
+            "cni0": ([_v4("10.42.0.1")], _up()),
+            "br-e9790e8eabab": ([_v4("172.18.0.1")], _up()),
+            "veth472ae2e": ([_v6("fe80::10ec:fcff:fec9:4849%veth472ae2e")], _up()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_excludes_down_and_unaddressed_ports(host):
+    """Onboard ports nobody plugged in are not a reason to refuse."""
+    host(
+        {
+            "eno1": ([_v4("192.168.50.15")], _up()),
+            "eno2": ([], _down()),
+            "wlp0s20f3": ([], _down()),
+            "eno3": ([_v4("10.0.0.7")], _down()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_excludes_link_local_only_interfaces(host):
+    host(
+        {
+            "eno1": ([_v4("192.168.50.15")], _up()),
+            "eno2": ([_v4("169.254.3.4")], _up()),
+            "eno3": ([_v6("fe80::1%eno3")], _up()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_reports_a_real_dual_homed_host(host):
+    """The case the refusal is for: a management port and a fabric port, both
+    real, both up, and nothing here able to tell which carries the KV plane."""
+    host(
+        {
+            "lo": ([_v4("127.0.0.1")], _up("up,loopback,running")),
+            "eno1": ([_v4("192.168.50.15")], _up()),
+            "ib0": ([_v4("10.10.0.1")], _up()),
+            "docker0": ([_v4("172.17.0.1")], _up()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["eno1", "ib0"]
+
+
+def test_enumeration_keeps_an_ipv6_only_fabric(host):
+    """A global IPv6 address is routable, so excluding it would shrink the
+    candidate set and turn a refusal into a confident wrong answer."""
+    host({"eno1": ([_v6("2001:db8::5")], _up())})
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_keeps_a_hand_made_br0_but_not_dockers_br_hex(host):
+    """Docker names its user-defined bridges ``br-<hex>``; a bare ``br0`` is
+    frequently the host's real uplink after the address moves onto the bridge."""
+    host(
+        {
+            "br0": ([_v4("192.168.50.15")], _up()),
+            "br-e9790e8eabab": ([_v4("172.18.0.1")], _up()),
+        }
+    )
+    assert candidate_kv_interfaces() == ["br0"]
+
+
+def test_enumeration_tolerates_a_missing_stats_entry(host):
+    """psutil can report an interface in one table and not the other; dropping
+    the NIC in that case would silently shrink the candidate set."""
+    host({"eno1": ([_v4("192.168.50.15")], None)})
+    assert candidate_kv_interfaces() == ["eno1"]
+
+
+def test_enumeration_ignores_non_ip_address_families(host):
+    """AF_PACKET/AF_LINK entries carry a MAC, which is not something a peer can
+    connect back to."""
+    link = _Addr(family=net_device.psutil.AF_LINK, address="be:fc:e7:53:52:6b")
+    host({"eno1": ([link], _up())})
+    assert candidate_kv_interfaces() == []
+
+
+def test_the_real_host_enumeration_runs_and_excludes_loopback():
+    """One unmocked call, to catch a psutil API drift the fakes would hide."""
+    for name in candidate_kv_interfaces():
+        assert name not in ("lo", "lo0")

@@ -634,3 +634,45 @@ def test_a_routerless_group_registers_nothing():
         )
         == []
     )
+
+
+# --- turning disaggregation off -------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_removing_roles_retires_the_group_first():
+    """The role-less rule ranks every instance in one comparison, which an
+    eight-card prefill and a cpu_only router cannot share — and the gateway
+    filter keys on `model.roles`, so the moment roles are gone every leftover
+    member becomes a registered upstream answering whole requests it cannot
+    serve."""
+    members = [
+        _instance(1, role="prefill", group_id="1-abc", spec_digest="sha1:abc"),
+        _instance(2, role="decode", group_id="1-abc", spec_digest="sha1:abc"),
+        _instance(3, role="router", group_id="1-abc", spec_digest="sha1:abc"),
+    ]
+    recorder = await _run(_model(replicas=1, roles=None), members)
+
+    assert len(recorder.deleted) == 3
+    # Nothing is built in the same pass: the deletion has to be settled before
+    # anything counts what is left.
+    assert not recorder.created
+
+
+@pytest.mark.asyncio
+async def test_plain_replicas_are_built_on_the_next_pass():
+    recorder = await _run(_model(replicas=2, roles=None), [])
+
+    assert len(recorder.created) == 2
+    assert all(c.role is None for c in recorder.created)
+
+
+@pytest.mark.asyncio
+async def test_a_mix_of_leftover_and_plain_instances_only_retires_the_leftovers():
+    members = [
+        _instance(1, role="prefill", group_id="1-abc", spec_digest="sha1:abc"),
+        _instance(2),
+    ]
+    recorder = await _run(_model(replicas=1, roles=None), members)
+
+    assert [i.id for i in recorder.deleted] == [1]

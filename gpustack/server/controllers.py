@@ -64,6 +64,7 @@ from gpustack.schemas.models import (
     role_effective_model,
 )
 from gpustack.schemas.gpu_instance_types import GPUInstanceType
+from gpustack.server.workqueue import WorkEvent, WorkEventType, WorkQueue
 from gpustack.schemas.links import (
     ModelInstanceModelFileLink,
     ModelInstanceDraftModelFileLink,
@@ -206,13 +207,84 @@ def _gateway_registrable_instances(
     ]
 
 
+# The bus speaks CREATED/UPDATED/DELETED and the work queue speaks
+# ADDED/MODIFIED/DELETED. Mapped rather than unified because the queue's
+# DELETED carries queue semantics — it jumps the ready queue and is sticky
+# under coalescing — which the bus's has no opinion about.
+_WORK_EVENT_TYPE_BY_BUS = {
+    EventType.CREATED: WorkEventType.ADDED,
+    EventType.UPDATED: WorkEventType.MODIFIED,
+    EventType.DELETED: WorkEventType.DELETED,
+}
+
+
 class ModelController:
+    """Reconciles a model's replicas, status, routes and gateway registration.
+
+    Events go through a per-model work queue rather than straight into
+    `_reconcile`, and for a role-bearing model that is a correctness
+    requirement rather than a throughput one. The trigger chain is "instance
+    DELETED -> Model UPDATED -> reconcile", so retiring a 4P4D generation is
+    nine deletions and nine reconciles — and each of the middle ones sees a
+    group short of members. Reconciling on every one of them recreates what
+    the deletion is still in the middle of removing. One reconcile per burst,
+    reading the settled state, cannot make that mistake.
+    """
+
     def __init__(self, cfg: Config):
         self._config = cfg
         self._k8s_config = get_async_k8s_config(cfg=cfg)
         self._disable_gateway = cfg.gateway_mode == GatewayModeEnum.disabled
+        # Keyed by model id, so different models still reconcile concurrently
+        # while one model's events serialise.
+        self._queue: WorkQueue = WorkQueue(coalesce=self._merge_events)
+        self._inflight: Dict[Any, asyncio.Task] = {}
+        self._dispatch_task: Optional[asyncio.Task] = None
 
-        pass
+    @staticmethod
+    def _merge_events(existing: WorkEvent, incoming: WorkEvent) -> WorkEvent:
+        """Collapse a burst into one reconcile without losing what changed.
+
+        Plain latest-wins would be wrong here even though the row it carries is
+        the freshest one: `notify_model_route_target` decides whether to publish
+        by asking which fields moved, so dropping an intermediate event's
+        `changed_fields` drops the notification that event was carrying. A
+        `state` transition followed by an unrelated edit would leave the gateway
+        holding a target it was never told to update.
+
+        So the row is the newest and the changed-field set is the union — which
+        is what "one reconcile of everything that happened since the last one"
+        actually means. Per field the oldest before-value and the newest
+        after-value are kept, so the pair still describes the whole span rather
+        than its last step.
+
+        A pending DELETED stays sticky (the default policy): a model row that is
+        gone must not be reconciled as if it were merely updated.
+        """
+        if (
+            existing.type == WorkEventType.DELETED
+            and incoming.type != WorkEventType.DELETED
+        ):
+            return existing
+
+        old_event: Event = existing.object
+        new_event: Event = incoming.object
+        if (
+            old_event is None
+            or new_event is None
+            or not old_event.changed_fields
+            or new_event.changed_fields is None
+        ):
+            return incoming
+
+        merged = dict(new_event.changed_fields)
+        for field, (before, after) in old_event.changed_fields.items():
+            if field in merged:
+                merged[field] = (before, merged[field][1])
+            else:
+                merged[field] = (before, after)
+        new_event.changed_fields = merged
+        return incoming
 
     async def start(self):
         """
@@ -222,11 +294,52 @@ class ModelController:
             base_client = k8s_client.ApiClient(configuration=self._k8s_config)
             self._higress_network_api = NetworkingHigressIoV1Api(base_client)
 
-        async for event in Model.subscribe(source="model_controller"):
-            if event.type == EventType.HEARTBEAT:
-                continue
+        self._dispatch_task = asyncio.create_task(self._dispatch())
+        try:
+            async for event in Model.subscribe(source="model_controller"):
+                if event.type == EventType.HEARTBEAT:
+                    continue
+                model = event.data
+                if model is None:
+                    continue
+                self._queue.add(
+                    WorkEvent(
+                        keys=(model.id,),
+                        type=_WORK_EVENT_TYPE_BY_BUS.get(
+                            event.type, WorkEventType.MODIFIED
+                        ),
+                        object=event,
+                    )
+                )
+        finally:
+            tasks: List[asyncio.Task] = []
+            if self._dispatch_task is not None:
+                self._dispatch_task.cancel()
+                tasks.append(self._dispatch_task)
+            for task in list(self._inflight.values()):
+                task.cancel()
+                tasks.append(task)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            await self._reconcile(event)
+    async def _dispatch(self):
+        while True:
+            event = await self._queue.get()
+            self._inflight[event.keys] = asyncio.create_task(self._process(event))
+
+    async def _process(self, event: WorkEvent):
+        keys = event.keys
+        try:
+            await self._reconcile(event.object)
+            self._queue.forget(keys)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to reconcile model %s", keys)
+            self._queue.add_rate_limited(event)
+        finally:
+            self._queue.done(keys)
+            _ = self._inflight.pop(keys, None)
 
     async def _ensure_model_mcp_bridge(
         self, session: AsyncSession, event_type: EventType, model: Model
@@ -947,6 +1060,32 @@ async def sync_replicas(session: AsyncSession, model: Model):
 
     if model.roles:
         return await _sync_replicas_per_role(session, model)
+
+    # Turning disaggregation off leaves the group's members behind, and they
+    # cannot simply be handed to the role-less rule. Two reasons, and either
+    # alone would be enough: that rule ranks every instance in one comparison,
+    # which an eight-card prefill and a cpu_only router cannot share, so it
+    # would pick a plausible-looking wrong victim; and the gateway filter keys
+    # on `model.roles`, so the moment roles are gone every leftover member
+    # becomes a registered upstream — and a request balanced onto a former
+    # prefill returns after one token, with a 200.
+    #
+    # So the group is retired first and the plain replicas are built on the
+    # next pass. Two passes rather than one because the deletion has to be
+    # settled before anything counts what is left.
+    orphans = [
+        instance
+        for instance in await ModelInstance.all_by_field(session, "model_id", model.id)
+        if instance.role
+    ]
+    if orphans:
+        logger.info(
+            f"Model {model.name} no longer declares roles; retiring "
+            f"{len(orphans)} group member(s) before rebuilding plain replicas"
+        )
+        await _release_and_delete(session, orphans)
+        return
+
     return await _sync_replicas_legacy(session, model)
 
 

@@ -53,6 +53,7 @@ from gpustack.routes.worker.logs import (
 from gpustack.worker.model_meta import get_meta_from_running_instance
 from gpustack.client import ClientSet
 from gpustack.worker.pd_router import apply_managed_router
+from gpustack.worker.pd_diagnostics import RestartTracker, diagnose
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
@@ -68,7 +69,8 @@ from gpustack.schemas.models import (
     RoleNameEnum,
     role_effective_model,
 )
-from gpustack.schemas.pd_modes import PDPortSpec
+from gpustack.schemas.pd_modes import PDPortScopeEnum, PDPortSpec
+from gpustack.worker.pd_injection import _PARALLELISM_ALIASES
 from gpustack.server.bus import Event, EventType
 from gpustack.server.pd_mode_catalog import get_pd_mode
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
@@ -88,6 +90,17 @@ LOG_RECONNECT_GRACE_SECONDS = envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL + 2
 # Global lock for port assignment to avoid pickle serialization issues
 _port_lock = threading.Lock()
 
+# vLLM's mp path does not bind only VLLM_DP_MASTER_PORT: it derives nine more
+# ports from it (one per DP init attempt), so the connecting port is the *base*
+# of a band and every port in that band has to be probed, fenced and recorded
+# like any other allocation. Ten is vLLM's number, not ours.
+_VLLM_MP_CONNECTING_BAND = 10
+
+# Name the mp band is recorded under in `named_ports`. Prefixed so it cannot
+# collide with a band a pd-mode declares: the catalog's names come from
+# connectors and this one comes from the executor.
+_VLLM_MP_CONNECTING_BAND_NAME = "_vllm_mp_connecting"
+
 _SERVER_CLASS_MAPPING = {
     BackendEnum.VLLM: VLLMServer,
     BackendEnum.SGLANG: SGLangServer,
@@ -99,6 +112,19 @@ _SERVER_CLASS_MAPPING = {
 # e.g. {"<container>": {"devices": {"groups": [{"accelerators": [{"id": "<GPU UUID>",
 # "index": 0, "mode": 3, "allocated": 640000}]}]}, "deviceIDs": [...]}}.
 _ALLOCATED_ACCELERATORS_ANNOTATION = "device.gpustack.ai/accelerator.allocated"
+
+
+class PDPortScopeUnsupportedError(Exception):
+    """A band declares a scope this allocator cannot honour.
+
+    Raised rather than degraded to per-instance. `PDPortScopeEnum.ROLE` means
+    "every member of this role shares one band", which needs a registry keyed
+    by (group, role) that does not exist yet. Allocating such a band per
+    instance produces the one thing worse than an unimplemented feature: a
+    band of the right *width* at the wrong *base* on each member, so the
+    connector that was supposed to meet on it only fails at handshake, long
+    after the instances report healthy.
+    """
 
 
 def _parse_allocated_accelerators(annotations: Optional[Dict[str, str]]) -> List[dict]:
@@ -267,6 +293,10 @@ class ServeManager:
         # Instance-level port tracking to avoid conflicts
         self._assigned_ports: Dict[int, Set[int]] = {}
         self._restart_backoff_counts: Dict[int, int] = {}
+        # Recognises a member that keeps restarting without ever serving. In
+        # this process rather than on the row because the signal is a rate, and
+        # the row records only a cumulative count and the last restart's time.
+        self._restart_tracker = RestartTracker()
 
         # Inference health check failure tracking
         # {model_instance_id: failure_count}
@@ -487,6 +517,15 @@ class ServeManager:
                 WorkloadStatusStateEnum.PENDING,
                 WorkloadStatusStateEnum.INITIALIZING,
             ]:
+                # "Still launching" is also what a crash loop looks like. A
+                # container that binds, fails and is restarted never reaches
+                # FAILED, so the branch below never runs and the instance sits
+                # at `starting` for as long as anyone leaves it — which is the
+                # shape every port-level failure in a disaggregated deployment
+                # takes. Ask whether it is launching or looping before
+                # accepting the former.
+                if self._mark_crash_loop(model_instance, workload, is_main_worker):
+                    continue
                 logger.trace(
                     f"Model instance {model_instance.name} workload is still launching. Skipping sync."
                 )
@@ -575,6 +614,10 @@ class ServeManager:
                             continue
 
                         self._restart_backoff_counts.pop(model_instance.id, None)
+                        # A member that served is not a member that never
+                        # started: a later crash loop is a different failure
+                        # and must not be reported as a bad configuration.
+                        self._restart_tracker.observe_running(model_instance.id)
                         patch_dict = {
                             "state": ModelInstanceStateEnum.RUNNING,
                             "state_message": "",
@@ -1702,37 +1745,42 @@ class ServeManager:
             #   ports[1]: --data-parallel-rpc-port (DP coordinator ZMQ)
             #   ports[2]: --master-port (PyTorch distributed TCP store)
             #   ports[3]: env VLLM_PORT (dp_only only; reserved but unused otherwise)
+            #   ports[4:-1]: named bands, then the connecting band's derived
+            #                ports — fenced, addressed by nobody
             #   ports[-1]: connecting port (= VLLM_DP_MASTER_PORT for dp_only/nested)
             # Ray path: only ports[1] (DP RPC), when user dp > 1.
             connecting_port: Optional[int] = None
+            connecting_band: List[int] = []
             if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
-                # Allocate first so we can fence off the 10-port band vLLM reserves
-                # around VLLM_DP_MASTER_PORT (= connecting port), keeping the cross
-                # ports (incl. VLLM_PORT) outside it.
-                connecting_port = network.get_free_port(
+                executor_backend = (
+                    resolve_executor_backend(
+                        model.backend_parameters, model.backend_version
+                    )
+                    if backend == BackendEnum.VLLM
+                    else None
+                )
+                # The connecting port doubles as VLLM_DP_MASTER_PORT, and on the
+                # mp path vLLM derives nine more ports from it, so what has to
+                # be free is a run of ten — not one port with nine unprobed
+                # neighbours, which is what a `get_free_port` here used to hand
+                # out. Allocated first so the cross ports (incl. VLLM_PORT)
+                # land outside the band rather than inside it.
+                band_count = _VLLM_MP_CONNECTING_BAND if executor_backend == "mp" else 1
+                connecting_port = network.get_free_band(
                     port_range=self._config.service_port_range,
+                    count=band_count,
                     unavailable_ports=unavailable_ports,
                     host=mi.worker_ip,
                 )
-                unavailable_ports.add(connecting_port)
+                connecting_band = list(
+                    range(connecting_port, connecting_port + band_count)
+                )
+                unavailable_ports |= set(connecting_band)
 
                 cross_ports: List[int] = []
                 if backend == BackendEnum.VLLM:
-                    executor_backend = resolve_executor_backend(
-                        model.backend_parameters, model.backend_version
-                    )
                     if executor_backend == "mp":
-                        # DP RPC + PyTorch master + VLLM_PORT. Clamp the band to
-                        # service_port_range; out-of-range ports would inflate
-                        # get_free_port's exhaustion count.
-                        _, end_port = network.parse_port_range(
-                            self._config.service_port_range
-                        )
-                        unavailable_ports |= set(
-                            range(
-                                connecting_port, min(connecting_port + 10, end_port + 1)
-                            )
-                        )
+                        # DP RPC + PyTorch master + VLLM_PORT.
                         cross_port_count = 3
                     else:
                         dps = find_int_parameter(
@@ -1764,13 +1812,112 @@ class ServeManager:
             mi.ports.extend(named_band_ports)
 
             if connecting_port is not None:
-                # Last, because the distributed backends read the connecting
-                # port as `ports[-1]` (VLLM_DP_MASTER_PORT / VLLM_PORT). The
-                # named bands go *before* it so that "append at the tail"
-                # doesn't quietly redefine which port that is.
+                # Only the base goes into `mi.ports`, and it goes last: the
+                # distributed backends read the connecting port as `ports[-1]`
+                # (VLLM_DP_MASTER_PORT / VLLM_PORT), so nothing may be appended
+                # after it.
                 mi.ports.append(connecting_port)
+                if len(connecting_band) > 1:
+                    # The nine ports vLLM derives from the base are recorded in
+                    # `named_ports` rather than in `mi.ports`, and the
+                    # distinction is deliberate. Both indexes persist and both
+                    # are re-fenced on a worker restart, so either one fixes
+                    # what was broken here: ten ports that were bound but
+                    # neither probed nor registered. Only `mi.ports` is turned
+                    # into host ports by the runtime — so putting them there
+                    # would also rewrite the container spec of every existing
+                    # multi-worker vLLM deployment, which is a change to
+                    # non-disaggregated behaviour and belongs to whoever
+                    # decides to make it, not to this one. What that costs:
+                    # a collision with a process outside this worker still
+                    # surfaces as a crash loop rather than as an unschedulable
+                    # Pod. Within one worker the fence now prevents it, which
+                    # is where two members of one deployment actually collide.
+                    named_ports = dict(mi.named_ports or {})
+                    named_ports[_VLLM_MP_CONNECTING_BAND_NAME] = PortBand(
+                        base=connecting_port, count=len(connecting_band)
+                    )
+                    mi.named_ports = named_ports
 
             self._assigned_ports[mi.id] = set(mi.ports)
+            for band in (mi.named_ports or {}).values():
+                self._assigned_ports[mi.id] |= set(
+                    range(band.base, band.base + max(band.count, 1))
+                )
+
+    def _mark_crash_loop(
+        self, mi: ModelInstance, workload, is_main_worker: bool
+    ) -> bool:
+        """Turn a member that keeps restarting without serving into an ERROR.
+
+        Returns True once it has been marked, so the caller stops treating the
+        workload as merely slow to start.
+
+        Only the main worker's row is written. A subordinate worker's state
+        lives inside `distributed_servers`, and the existing failure path above
+        already owns that shape; duplicating it here to catch a loop would mean
+        two writers for one field.
+        """
+        if not is_main_worker or mi.state == ModelInstanceStateEnum.ERROR:
+            return False
+
+        restarts = max(
+            (
+                exit_.restart_count or 0
+                for exit_ in (getattr(workload, "exits", None) or [])
+            ),
+            default=0,
+        )
+        now = datetime.now(timezone.utc)
+        if not self._restart_tracker.observe_restart_count(mi.id, restarts, now):
+            return False
+
+        # The reason comes from the log rather than from the workload, because
+        # the workload has none: a container that exited and was restarted
+        # reports no message on Kubernetes and no exit code worth surfacing.
+        # The log is where the root cause was written, several lines before the
+        # exception that ended the process.
+        diagnosis = diagnose(self._read_container_log(mi), mi.named_ports)
+        message = f"Restarted {restarts} times without serving. " + (
+            f"{diagnosis.summary} Log: {diagnosis.line}"
+            if diagnosis
+            else "No known failure signature was found in its log; check "
+            "the instance log for the first error, not the last."
+        )
+        with contextlib.suppress(NotFoundException):
+            self._update_model_instance(
+                mi.id,
+                state=ModelInstanceStateEnum.ERROR,
+                state_message=message,
+            )
+        logger.warning(f"Model instance {mi.name} is crash-looping: {message}")
+        return True
+
+    def _read_container_log(self, mi: ModelInstance, limit: int = 256_000) -> str:
+        """The tail of this instance's most recent container log.
+
+        A tail rather than the whole file: an engine's startup log is large and
+        the signatures being looked for are startup-time. Failures to read are
+        swallowed — a missing log makes the diagnosis less specific, and must
+        not stop the instance being marked failed.
+        """
+        try:
+            log_dir = Path(self._serve_log_dir)
+            candidates = sorted(
+                log_dir.glob(f"{mi.id}.container.*.log"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if not candidates:
+                return ""
+            path = candidates[-1]
+            size = path.stat().st_size
+            with open(path, "r", errors="replace") as f:
+                if size > limit:
+                    f.seek(size - limit)
+                return f.read()
+        except Exception as e:
+            logger.debug(f"Failed to read the container log for {mi.name}: {e}")
+            return ""
 
     def _register_assigned_ports(self, mi: ModelInstance) -> None:
         """Re-register an instance's already-persisted ports as taken.
@@ -1850,7 +1997,27 @@ class ServeManager:
         named_ports: Dict[str, PortBand] = dict(mi.named_ports or {})
         band_ports: List[int] = []
         for spec in holder.ports:
-            count = self._resolve_band_count(mi, spec)
+            if spec.scope == PDPortScopeEnum.ROLE:
+                # Not implemented, and therefore refused. See
+                # PDPortScopeUnsupportedError: per-instance allocation of a
+                # role-scoped band is not a partial implementation of it, it is
+                # a different band on every member.
+                raise PDPortScopeUnsupportedError(
+                    f"Model instance {mi.name} (role '{mi.role}', PD mode "
+                    f"'{mode_name}') declares port band '{spec.name}' with "
+                    f"scope '{PDPortScopeEnum.ROLE.value}'. Role-scoped bands "
+                    "need a registry shared by the members of one role, which "
+                    "does not exist yet, and allocating one per instance would "
+                    "give each member a different base for a band they are "
+                    "supposed to meet on."
+                )
+            count = self._resolve_band_count(mi, model, spec)
+            if count is None:
+                # Warned in the resolver. Skipping the band leaves
+                # `{{ports.<name>}}` unresolved in the launch, which the
+                # renderer logs and the engine rejects by name; allocating a
+                # guessed width would instead look like it worked.
+                continue
             try:
                 base = network.get_free_band(
                     port_range=self._config.service_port_range,
@@ -1876,28 +2043,59 @@ class ServeManager:
         return band_ports
 
     @staticmethod
-    def _resolve_band_count(mi: ModelInstance, spec: PDPortSpec) -> int:
-        """The width of one declared band.
+    def _resolve_band_count(
+        mi: ModelInstance, model: Model, spec: PDPortSpec
+    ) -> Optional[int]:
+        """The width of one declared band, or None if it cannot be determined.
 
-        A `count` may be a placeholder (`{{tensor_parallel_size}}`) resolved
-        from the deployment context. Phase one has no such resolver, so a
-        templated width is narrowed to a single port — and said so out loud:
-        silently reserving one port where the connector will bind eight is
-        precisely the collision this whole mechanism exists to prevent, and
-        it would surface as an instance wedged in `starting` with nothing in
-        the allocator's log to explain it.
+        A templated `count` (`{{tensor_parallel_size}}`) is the connector's own
+        rule about its base: Mooncake's `kv_port` binds one port per
+        tensor-parallel rank, TP8 measured holding 41100-41107. So the width
+        comes from the parallelism *this role* actually starts with, read off
+        the same parameter spellings `pd_injection` reads for the `tp_size` it
+        renders into the connector descriptor — the two have to agree, which is
+        why they share one alias table. `model` is already the role's
+        projection (`_get_model`), so `backend_parameters` are its effective
+        ones.
+
+        None, never a guess, when the parameter is absent. vLLM's own default
+        is 1, but GPUStack injects a tensor-parallel size of its own further
+        down the vLLM path, so "the user did not write -tp" does not mean "one
+        rank" — the reasoning `pd_injection` already applies to the same
+        numbers. And the two failure modes are not comparable: a band one port
+        wide where the connector binds eight is exactly the collision this
+        mechanism exists to prevent, and it shows up as an instance wedged in
+        `starting`, while an unallocated band leaves `{{ports.<name>}}` in the
+        launch for the renderer to log and the engine to reject by name.
         """
         count = spec.count
         if isinstance(count, int):
             return max(count, 1)
-        logger.warning(
-            f"Model instance {mi.name} declares port band '{spec.name}' with a "
-            f"templated count '{count}', which phase one cannot resolve. "
-            "Reserving 1 port. If the connector derives more from this base "
-            "they are not fenced, and a second instance on this host may "
-            "collide with them."
+
+        key = count[2:-2] if count.startswith("{{") and count.endswith("}}") else count
+        aliases = _PARALLELISM_ALIASES.get(key)
+        resolved = (
+            find_int_parameter(model.backend_parameters or [], aliases)
+            if aliases
+            else None
         )
-        return 1
+        if resolved is not None and resolved >= 1:
+            return resolved
+
+        logger.warning(
+            f"Model instance {mi.name} (role '{mi.role}') declares port band "
+            f"'{spec.name}' with a templated count '{count}' that its backend "
+            "parameters do not resolve"
+            + (
+                f" (looked for {'/'.join(aliases)})."
+                if aliases
+                else ", and no parallelism parameter answers to that name."
+            )
+            + " No ports are reserved for it, so the placeholder reaches the "
+            "engine verbatim and the launch fails naming it. Set the "
+            "parallelism explicitly on this role to allocate the band."
+        )
+        return None
 
     def _restart_model_instance(self, mi: ModelInstance):
         """
@@ -1994,6 +2192,13 @@ class ServeManager:
         self._model_instance_by_instance_id.pop(mi.id, None)
         if clear_restart_backoff:
             self._restart_backoff_counts.pop(mi.id, None)
+            # Same condition as the backoff on purpose. The crash-loop verdict
+            # and the restart backoff answer the same question — "is this one
+            # still worth retrying" — so a stop that keeps the backoff (the
+            # restart path) has to keep the loop history too, or a member being
+            # restarted for the fourth time looks like one being started for
+            # the first.
+            self._restart_tracker.forget(mi.id)
         self._inference_health_check_failures.pop(mi.id, None)
         self._last_health_check_time.pop(mi.id, None)
         self._last_successful_inference.pop(mi.id, None)

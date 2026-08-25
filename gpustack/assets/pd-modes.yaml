@@ -403,7 +403,10 @@ modes:
         style: repeated_flag
         # A prefill peer is "URL BOOTSTRAP_PORT": the second positional
         # value is the named band above.
-        prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}} {{ports.bootstrap}}" }
+        # `peer.ports.` and not `ports.`: in the deployment scope that name
+        # means the *router's* band, and for a two-prefill group there is no
+        # single right answer there at all — each prefill was allocated its own.
+        prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}} {{peer.ports.bootstrap}}" }
         decode: { flag: "--decode", value: "http://{{peer.ip}}:{{peer.port}}" }
       capabilities:
         metrics: true
@@ -481,7 +484,10 @@ modes:
         - "3"
       peers:
         style: repeated_flag
-        prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}} {{ports.bootstrap}}" }
+        # `peer.ports.` and not `ports.`: in the deployment scope that name
+        # means the *router's* band, and for a two-prefill group there is no
+        # single right answer there at all — each prefill was allocated its own.
+        prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}} {{peer.ports.bootstrap}}" }
         decode: { flag: "--decode", value: "http://{{peer.ip}}:{{peer.port}}" }
       capabilities:
         metrics: true

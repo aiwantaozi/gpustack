@@ -29,6 +29,7 @@ from gpustack.schemas.pd_modes import (
 from gpustack.worker.pd_router import (
     RouterPeersUnavailable,
     group_peer_addresses,
+    PeerAddress,
     render_router,
 )
 
@@ -44,8 +45,11 @@ VARIABLES = {
 }
 
 PEERS = {
-    "prefill": [("10.0.0.1", 40027), ("10.0.0.2", 40029)],
-    "decode": [("10.0.0.3", 40028)],
+    "prefill": [
+        PeerAddress("10.0.0.1", 40027),
+        PeerAddress("10.0.0.2", 40029),
+    ],
+    "decode": [PeerAddress("10.0.0.3", 40028)],
 }
 
 
@@ -243,8 +247,11 @@ def test_peers_are_scoped_to_one_generation():
     to make structurally impossible."""
     peers = group_peer_addresses(_instances(), "g1", IPS)
 
-    assert peers["prefill"] == [("10.0.0.1", 40027), ("10.0.0.2", 40029)]
-    assert ("10.0.0.1", 40031) not in peers["prefill"]
+    assert peers["prefill"] == [
+        PeerAddress("10.0.0.1", 40027),
+        PeerAddress("10.0.0.2", 40029),
+    ]
+    assert PeerAddress("10.0.0.1", 40031) not in peers["prefill"]
 
 
 def test_only_running_members_contribute_an_address():
@@ -252,7 +259,7 @@ def test_only_running_members_contribute_an_address():
     that has not started is a placeholder the router would carry for life."""
     peers = group_peer_addresses(_instances(), "g1", IPS)
 
-    assert peers["decode"] == [("10.0.0.1", 40028)]
+    assert peers["decode"] == [PeerAddress("10.0.0.1", 40028)]
 
 
 def test_the_order_is_stable():
@@ -267,7 +274,7 @@ def test_the_order_is_stable():
 def test_a_worker_with_no_known_ip_is_skipped_not_guessed():
     peers = group_peer_addresses(_instances(), "g1", {1: "10.0.0.1"})
 
-    assert peers["prefill"] == [("10.0.0.1", 40027)]
+    assert peers["prefill"] == [PeerAddress("10.0.0.1", 40027)]
 
 
 # --- materialising a managed router ---------------------------------------- #
@@ -562,3 +569,57 @@ def test_a_role_command_survives_the_catalogs():
 
     assert projected.run_command == "my-router --go"
     assert projected.image_name == "gpustack/runner:cuda12.9-vllm0.17.1"
+
+
+# --- a peer's own named ports ---------------------------------------------- #
+
+
+def test_each_prefill_peer_carries_its_own_bootstrap_port():
+    """SGLang's `--prefill URL BOOTSTRAP_PORT`, which the deployment scope
+    cannot express: the band is allocated per member because the engine's fixed
+    default (8998) collides as soon as two prefills share a host, so there is no
+    single value for the whole render."""
+    peers = {
+        "prefill": [
+            PeerAddress("10.0.0.1", 40101, {"bootstrap": 40300}),
+            PeerAddress("10.0.0.2", 40111, {"bootstrap": 40400}),
+        ],
+        "decode": [PeerAddress("10.0.0.3", 40102)],
+    }
+
+    command = render_router(get_pd_mode("sglang-mooncake"), VARIABLES, peers).command
+
+    # Separate argv tokens, not one string: the router parses the pair
+    # positionally.
+    i = command.index("--prefill")
+    assert command[i : i + 3] == ["--prefill", "http://10.0.0.1:40101", "40300"]
+    j = command.index("--prefill", i + 1)
+    assert command[j : j + 3] == ["--prefill", "http://10.0.0.2:40111", "40400"]
+
+
+def test_a_peer_port_never_resolves_from_the_deployment_scope():
+    """The regression that shipped: `{{ports.bootstrap}}` in a peer address
+    reached the router verbatim, and `sglang_router` would have parsed the
+    literal `{{ports.bootstrap}}` as a port number. Nothing in a rendered
+    command may carry an unresolved placeholder."""
+    peers = {
+        "prefill": [PeerAddress("10.0.0.1", 40101, {"bootstrap": 40300})],
+        "decode": [PeerAddress("10.0.0.3", 40102)],
+    }
+
+    for mode in ("sglang-mooncake", "sglang-nixl"):
+        command = render_router(get_pd_mode(mode), VARIABLES, peers).command
+        unresolved = [c for c in command if "{{" in str(c)]
+        assert not unresolved, f"{mode} left {unresolved}"
+
+
+def test_a_decode_peer_needs_no_band_and_renders_without_one():
+    peers = {
+        "prefill": [PeerAddress("10.0.0.1", 40101, {"bootstrap": 40300})],
+        "decode": [PeerAddress("10.0.0.3", 40102)],
+    }
+
+    command = render_router(get_pd_mode("sglang-mooncake"), VARIABLES, peers).command
+
+    i = command.index("--decode")
+    assert command[i : i + 2] == ["--decode", "http://10.0.0.3:40102"]

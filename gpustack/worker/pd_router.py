@@ -18,7 +18,7 @@ catalog entry keeps the router under `router:` and not under `roles:`.
 """
 
 import logging
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 from pydantic import BaseModel
 
@@ -31,7 +31,25 @@ from gpustack.utils.template import render
 
 logger = logging.getLogger(__name__)
 
-PeerAddress = Tuple[str, int]
+
+class PeerAddress(NamedTuple):
+    """One member of the group, as the router needs to address it.
+
+    Carries the member's named port bands as well as its HTTP port, because
+    some routers need a second port per peer and it is a *per-peer* value.
+    SGLang's is the case that forced this: `--prefill URL BOOTSTRAP_PORT`
+    takes each prefill's own bootstrap band, and the engine's fixed default
+    (8998) collides the moment two prefills share a host — so the band is
+    allocated per member and cannot come from the deployment scope, which has
+    exactly one value for the whole render.
+    """
+
+    ip: str
+    port: int
+    ports: Mapping[str, int] = {}
+    """Named port bands of this peer, base only, by declared name."""
+
+
 PeerMap = Mapping[str, Sequence[PeerAddress]]
 
 
@@ -61,7 +79,7 @@ class RouterPeersUnavailable(Exception):
     """
 
 
-def _peer_scope(ip: str, port: int) -> Dict[str, object]:
+def _peer_scope(peer: PeerAddress) -> Dict[str, object]:
     """The variables visible while rendering ONE peer's address.
 
     Deliberately not merged with the deployment scope. The catalog first spelled
@@ -70,8 +88,16 @@ def _peer_scope(ip: str, port: int) -> Dict[str, object]:
     the *router's* port. That is a wrong address rather than a failure, which is
     the class of bug this whole design keeps having to defend against. The
     `peer.` prefix makes the two scopes unmergeable by construction.
+
+    The same reasoning is why a peer's named ports are `peer.ports.<name>` and
+    not `ports.<name>`: the deployment scope already has a `ports.<name>`
+    meaning the *router's* band of that name, and for a two-prefill group there
+    is no single right answer there at all — each prefill has its own.
     """
-    return {"peer.ip": ip, "peer.port": port}
+    scope: Dict[str, object] = {"peer.ip": peer.ip, "peer.port": peer.port}
+    for name, base in (peer.ports or {}).items():
+        scope[f"peer.ports.{name}"] = base
+    return scope
 
 
 def _repeated_flag(spec: Mapping[str, str], peers: Sequence[PeerAddress]) -> List[str]:
@@ -81,9 +107,14 @@ def _repeated_flag(spec: Mapping[str, str], peers: Sequence[PeerAddress]) -> Lis
     if not flag or not value:
         return []
     args: List[str] = []
-    for ip, port in peers:
+    for peer in peers:
         args.append(flag)
-        args.append(render(value, _peer_scope(ip, port), context="router peer address"))
+        rendered = render(value, _peer_scope(peer), context="router peer address")
+        # A peer address is a positional pair for some routers
+        # (`--prefill URL BOOTSTRAP_PORT`), and argv carries the split, not the
+        # string. Splitting here rather than in the catalog keeps the catalog
+        # writing one readable value per peer.
+        args.extend(rendered.split())
     return args
 
 
@@ -98,8 +129,8 @@ def _parallel_lists(spec: Mapping[str, str], peers: Sequence[PeerAddress]) -> Li
     port_flag = spec.get("port_flag")
     if not host_flag or not port_flag:
         return []
-    hosts = [ip for ip, _ in peers]
-    ports = [str(port) for _, port in peers]
+    hosts = [peer.ip for peer in peers]
+    ports = [str(peer.port) for peer in peers]
     return [host_flag, *hosts, port_flag, *ports]
 
 
@@ -323,8 +354,20 @@ def group_peer_addresses(
         port = getattr(instance, "port", None)
         if not ip or not port:
             continue
-        peers.setdefault(role, []).append((ip, int(port)))
+        # Bands, not points: a peer flag needs the base, and carrying the whole
+        # band here would put a width into an address. Absent on a member that
+        # declares none, which is most of them.
+        bands = getattr(instance, "named_ports", None) or {}
+        named = {
+            name: band.base
+            for name, band in bands.items()
+            if getattr(band, "base", None) is not None
+        }
+        peers.setdefault(role, []).append(PeerAddress(ip, int(port), named))
 
     for role in peers:
-        peers[role].sort()
+        # By address only. The named ports are a mapping and would not compare,
+        # and two members never share an (ip, port) anyway — so sorting on the
+        # pair is both total and stable.
+        peers[role].sort(key=lambda peer: (peer.ip, peer.port))
     return peers

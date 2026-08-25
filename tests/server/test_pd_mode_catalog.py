@@ -370,10 +370,13 @@ def test_router_peer_styles_and_prometheus_band():
     }
     assert ascend.router.ports == []
 
-    # A prefill peer carries prefill's bootstrap band as a second
-    # positional value — the one cross-role port read, and safe because the
-    # router waits on its dependencies.
-    assert "{{ports.bootstrap}}" in sglang.router.peers.prefill["value"]
+    # A prefill peer carries THAT PEER'S bootstrap band as a second positional
+    # value. `peer.ports.` and not `ports.`: the latter is the deployment scope
+    # and means the router's own band of that name, so it renders verbatim into
+    # the address — which is what shipped, and what a two-prefill group could
+    # not have expressed correctly even if it had resolved.
+    assert "{{peer.ports.bootstrap}}" in sglang.router.peers.prefill["value"]
+    assert "{{ports.bootstrap}}" not in sglang.router.peers.prefill["value"]
 
     # custom supplies nothing: image, command and ports are the user's.
     assert custom.router.protocol == PDRouterProtocolEnum.USER_PROVIDED

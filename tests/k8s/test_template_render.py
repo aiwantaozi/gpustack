@@ -994,3 +994,47 @@ def test_operator_env_static_address_survives_yaml_metacharacters():
     ):
         env = _gpu_instance_env(gpu_instances_access_static_address=address)
         assert env["GPUSTACK_INSTANCE_ACCESS_STATIC_ADDRESS"] == address, address
+
+
+# ---------------------------------------------------------------------------
+# Pod Security Admission — the namespaces this manifest creates have to accept
+# what GPUStack actually runs in them.
+# ---------------------------------------------------------------------------
+
+_PSA_LABELS = {
+    "pod-security.kubernetes.io/enforce": "privileged",
+    "pod-security.kubernetes.io/audit": "privileged",
+    "pod-security.kubernetes.io/warn": "privileged",
+}
+
+
+def _namespaces(docs):
+    return {d["metadata"]["name"]: d for d in docs if d.get("kind") == "Namespace"}
+
+
+def test_every_namespace_is_labelled_for_pod_security():
+    """PSA is enforced at Pod creation, so an unlabelled namespace on a cluster
+    defaulting to `baseline` does not degrade — the Pod is simply never
+    created. The worker DaemonSet mounts host paths and shares host namespaces;
+    workload Pods additionally need hostNetwork, hostPort and host IPC."""
+    namespaces = _namespaces(_render_docs())
+
+    assert namespaces, "the manifest must still create its namespaces"
+    for name, doc in namespaces.items():
+        labels = doc["metadata"].get("labels") or {}
+        missing = {k: v for k, v in _PSA_LABELS.items() if labels.get(k) != v}
+        assert not missing, f"namespace {name} is missing {sorted(missing)}"
+
+
+def test_all_three_pod_security_keys_are_set_not_just_enforce():
+    """`enforce` alone leaves `warn`/`audit` on the cluster default, so every
+    Pod creation still returns a warning and writes an audit annotation."""
+    for doc in _namespaces(_render_docs()).values():
+        labels = doc["metadata"].get("labels") or {}
+        assert len([k for k in labels if k.startswith("pod-security.")]) == 3
+
+
+def test_the_workload_namespace_is_among_them():
+    """The cluster owner's namespace is where model, cache service and
+    benchmark Pods land — the family that needs `privileged` most."""
+    assert "gpustack-alice" in _namespaces(_render_docs())

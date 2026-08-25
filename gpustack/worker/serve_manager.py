@@ -555,6 +555,15 @@ class ServeManager:
                     # admission rejection, an image-pull failure, an exit code)
                     # when available.
                     failure_message = _describe_workload_failure(workload)
+                    # And then the log's, because the workload's is often just
+                    # a number. A container that exits once and permanently —
+                    # `exit code 127`, a command the image does not contain —
+                    # never reaches the crash-loop path that used to be the
+                    # only caller of this, so the failure that can never
+                    # recover was the one explained least.
+                    failure_message = self._append_log_diagnosis(
+                        model_instance, failure_message
+                    )
                     with contextlib.suppress(NotFoundException):
                         # Get patch dict for main worker.
                         if is_main_worker:
@@ -1957,6 +1966,27 @@ class ServeManager:
             )
         logger.warning(f"Model instance {mi.name} is crash-looping: {message}")
         return True
+
+    def _append_log_diagnosis(self, mi: ModelInstance, message: str) -> str:
+        """Add what the log says to what the runtime says, when it knows more.
+
+        The runtime's account of a failure is frequently just an exit code, and
+        an exit code names the symptom. The log holds the cause, usually
+        several lines before whatever ended the process — which is why the
+        signature scan reports the earliest match rather than the last.
+
+        Best-effort in both directions: no log, no match, or a read that throws
+        all leave the message exactly as it arrived. A less specific failure
+        message is a much smaller problem than an instance that fails to be
+        marked failed.
+        """
+        try:
+            diagnosis = diagnose(self._read_container_log(mi), mi.named_ports)
+        except Exception:
+            return message
+        if not diagnosis:
+            return message
+        return f"{message} {diagnosis.summary} Log: {diagnosis.line}"
 
     def _read_container_log(self, mi: ModelInstance, limit: int = 256_000) -> str:
         """The tail of this instance's most recent container log.

@@ -232,3 +232,27 @@ def test_members_are_tracked_independently():
 
     assert tracker.observe_restart_count(1, 2, T0 + timedelta(seconds=10)) is True
     assert tracker.observe_restart_count(2, 1, T0 + timedelta(seconds=10)) is False
+
+
+def test_a_command_the_image_lacks_is_named_as_such():
+    """`exit code 127` is the symptom; "the image has no such binary" is the
+    cause, and it is one the operator can act on. Observed verbatim from a
+    managed router launched on an engine runner image that does not ship
+    `vllm-router` — the single biggest thing standing between vLLM PD and
+    working out of the box."""
+    log = "[FATAL tini (65)] exec vllm-router failed: No such file or directory"
+
+    diagnosis = diagnose(log, None)
+
+    assert diagnosis is not None
+    assert diagnosis.signature == "command not in image"
+    assert "image of its own" in diagnosis.summary
+
+
+def test_the_other_shells_wording_is_caught_too():
+    """Not every runtime uses tini, and the phrasing differs per runtime."""
+    for log in (
+        "bash: vllm-router: command not found",
+        'exec: "vllm-router": executable file not found in $PATH',
+    ):
+        assert diagnose(log, None) is not None, log

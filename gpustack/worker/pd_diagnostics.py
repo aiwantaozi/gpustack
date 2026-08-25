@@ -98,6 +98,18 @@ _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
         "a network interface that could not be derived.",
     ),
     (
+        "command not in image",
+        r"exec .*failed: No such file or directory|"
+        r"executable file not found|"
+        r"[Cc]ommand not found|"
+        r"No such file or directory: '[^']*'",
+        "The image does not contain the command this member was started "
+        "with, so it can never start rather than having failed to. A managed "
+        "router is the usual case: the mode's recipe launches a router binary "
+        "that the engine's runner image does not ship, and the fix is to give "
+        "the router role an image of its own that carries it.",
+    ),
+    (
         "kv connector conflict",
         r"kv[-_]transfer[-_]config.*(specified|duplicate|already)|"
         r"multiple.*kv_connector",

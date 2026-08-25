@@ -256,3 +256,45 @@ def test_the_other_shells_wording_is_caught_too():
         'exec: "vllm-router": executable file not found in $PATH',
     ):
         assert diagnose(log, None) is not None, log
+
+
+def test_a_members_ranks_colliding_with_themselves_is_explained():
+    """Measured twice, on our runner image and on the vendor's: a dense model
+    with DP>1 has every rank compute the same Mooncake handshake port because
+    vLLM zeroes data_parallel_rank for non-MoE models. On vllm-ascend v0.23.0
+    the process does not even exit -- it sits there with no serving port, which
+    is the `starting` forever that this whole diagnostic path exists for."""
+    diagnosis = diagnose(
+        "ERROR mooncake_connector.py:269 Mooncake KVCacheSendingThread "
+        "encountered exception. Thread: tp_rank=0, pp_rank=0, "
+        "listening_path=tcp://192.168.13.3:20001. "
+        "Error: Address already in use (addr='tcp://192.168.13.3:20001')"
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.signature == "address already in use"
+    assert "mixture of experts" in diagnosis.summary
+
+
+def test_a_conflicting_dp_size_in_the_connector_config_is_recognised():
+    diagnosis = diagnose(
+        "ValueError: KV transfer 'prefill' config has a conflicting data "
+        "parallel size. Expected 1, but got 2."
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.signature == "kv connector dp size mismatch"
+    assert "--data-parallel-size" in diagnosis.summary
+
+
+def test_a_missing_transport_library_is_named_as_a_packaging_fault():
+    """Hit on our own runner image: the file ships, but at /usr/local/lib
+    instead of beside mooncake's engine.so, and engine.so's RPATH is $ORIGIN."""
+    diagnosis = diagnose(
+        "RuntimeError: Worker failed with error 'ascend_transport.so: "
+        "cannot open shared object file: No such file or directory'"
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.signature == "kv transport library missing"
+    assert "packaging" in diagnosis.summary

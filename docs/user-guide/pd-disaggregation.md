@@ -177,8 +177,10 @@ save time rather than at run time:
   across roles requires the `custom` mode, where the connection parameters are
   yours to supply.
 - **A disaggregated deployment cannot also use an extended KV cache** on a role
-  whose mode configures a KV connector. Both write the same engine setting, and
-  the engine accepts only one of them.
+  whose mode configures a KV connector. GPUStack writes one connector into the
+  engine's KV transfer setting, so it cannot configure both. The engine itself
+  can compose connectors, so the combination is not impossible — it is not
+  assembled for you. Use the `custom` mode if you want to write it yourself.
 - **Scheduled scaling and disaggregation cannot be combined.**
 
 ## Limitations

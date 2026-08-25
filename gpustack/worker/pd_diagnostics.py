@@ -71,7 +71,34 @@ _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
         "A port this member needs was already taken. Two members of one role "
         "on one host collide unless their connector ports are allocated as "
         "separate bands; if the port below is outside the service port range, "
-        "it is one the engine chose itself and GPUStack cannot reserve it.",
+        "it is one the engine chose itself and GPUStack cannot reserve it. "
+        "A member can also collide with itself: Mooncake offsets each rank's "
+        "handshake port by the data-parallel rank, and vLLM zeroes that rank "
+        "for a model that is not a mixture of experts (its ranks are "
+        "independent, so it collapses them to DP=1), which makes every rank "
+        "compute the same port. Data parallelism above one needs an MoE model "
+        "on this connector.",
+    ),
+    (
+        "kv connector dp size mismatch",
+        r"conflicting data parallel size",
+        "The data-parallel size in the connector's extra config does not match "
+        "the one the engine resolved. It has to equal --data-parallel-size. If "
+        "the engine says it expected 1 while the role declares more, the model "
+        "is not a mixture of experts and vLLM has collapsed its data-parallel "
+        "ranks to independent DP=1 engines — this connector cannot be used "
+        "with data parallelism on such a model.",
+    ),
+    (
+        "kv transport library missing",
+        r"ascend_transport\.so: cannot open shared object file|"
+        r"libmooncake[^\s]*\.so: cannot open shared object file",
+        "The KV transport's own shared library is not on the loader's path in "
+        "this image. Mooncake's engine.so has RPATH $ORIGIN and so looks for "
+        "ascend_transport.so beside itself; a copy elsewhere on the filesystem "
+        "is not found, and ldconfig will not cache it either because the name "
+        "has no lib prefix. This is an image packaging fault, not a "
+        "deployment one.",
     ),
     (
         "rdma unavailable",
@@ -113,10 +140,12 @@ _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
         "kv connector conflict",
         r"kv[-_]transfer[-_]config.*(specified|duplicate|already)|"
         r"multiple.*kv_connector",
-        "More than one KV connector configuration reached the engine, and it "
-        "accepts exactly one. A disaggregated role cannot also enable an "
+        "More than one KV connector configuration reached the engine in a "
+        "flag that carries one. A disaggregated role cannot also enable an "
         "extended KV cache, and its engine parameters must not carry a "
-        "hand-written --kv-transfer-config.",
+        "hand-written --kv-transfer-config. The engine can compose connectors "
+        "(MultiConnector) — GPUStack does not assemble that for you, so a "
+        "combination has to be written by hand under pd mode 'custom'.",
     ),
 )
 

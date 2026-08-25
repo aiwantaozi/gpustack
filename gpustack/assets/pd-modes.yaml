@@ -596,11 +596,25 @@ modes:
       prefill:
         ports:
           # kv_port is a base address and the connector binds one port per
-          # tensor-parallel rank: TP8 was measured holding 41100-41107.
-          # The width is the connector's rule, so it is declared here
-          # instead of derived from data parallelism in code. It has no
-          # engine default at all and must be given explicitly.
-          - { name: kv_port, count: "{{tensor_parallel_size}}", inject_to: args }
+          # worker rank, so the band is as wide as the member's card count:
+          #
+          #   handshake_port = kv_port
+          #                  + data_parallel_rank * tp_size * pp_size
+          #                  + (pp_rank + pcp_rank) * tp_size + tp_rank
+          #
+          # Measured: TP8/DP1 held 41100-41107, and DP2xTP2 held 20001-20004
+          # (rank 0 -> base+0, rank 1 -> base+2). The width is the connector's
+          # rule, declared here rather than derived in code, and it has no
+          # engine default at all — it must be given explicitly.
+          #
+          # 🔴 The dp term only counts under MoE. vllm/v1/engine/core.py sends
+          # non-MoE data-parallel ranks down a "completely independent, so
+          # treat like DP=1" branch that zeroes data_parallel_rank, so every
+          # rank computes the same base and the second one to bind fails with
+          # `Address already in use` — on vllm-ascend v0.23.0 without exiting,
+          # leaving the instance wedged in `starting`. Admission refuses that
+          # combination rather than letting the band absorb it.
+          - { name: kv_port, count: "{{accelerator_count}}", inject_to: args }
         connector:
           kv_connector: MooncakeHybridConnector
           kv_role: kv_producer
@@ -635,7 +649,9 @@ modes:
           TP_SOCKET_IFNAME: "{{net_device}}"
       decode:
         ports:
-          - { name: kv_port, count: "{{tensor_parallel_size}}", inject_to: args }
+          # Same rule as prefill's: one port per worker rank, so the band is
+          # the member's card count.
+          - { name: kv_port, count: "{{accelerator_count}}", inject_to: args }
         connector:
           kv_connector: MooncakeHybridConnector
           kv_role: kv_consumer

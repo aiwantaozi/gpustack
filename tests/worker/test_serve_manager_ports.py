@@ -64,11 +64,52 @@ def _pd_model(mode: PDModeEnum = PDModeEnum.VLLM_NIXL, **kwargs):
     )
 
 
-def _instance(instance_id: int = 1, role: str = "prefill"):
-    mi = new_model_instance(instance_id, f"pd-{instance_id}", 1, worker_id=1)
+def _instance(instance_id: int = 1, role: str = "prefill", cards: int = 0):
+    mi = new_model_instance(
+        instance_id,
+        f"pd-{instance_id}",
+        1,
+        worker_id=1,
+        gpu_indexes=list(range(cards)) or None,
+    )
     mi.worker_ip = "127.0.0.1"
     mi.role = role
     return mi
+
+
+def _parallelism_band_mode(placeholder: str = "{{tensor_parallel_size}}") -> PDMode:
+    """A mode that sizes its band from a parallelism parameter.
+
+    The shipped Ascend entry sizes `kv_port` by card count instead, so the
+    parameter-driven branch of the resolver needs a mode of its own to stay
+    covered — a connector that sizes its band by TP/DP/PP is a YAML change,
+    not a code change, and that has to keep working.
+    """
+    return PDMode(
+        name="test-parallelism-band",
+        roles={
+            "prefill": PDModeRole(
+                ports=[
+                    PDPortSpec(
+                        name="kv_port",
+                        count=placeholder,
+                        inject_to=PDInjectTargetEnum.ARGS,
+                    )
+                ],
+                connector={"kv_port": "{{ports.kv_port}}"},
+            ),
+            "decode": PDModeRole(
+                ports=[
+                    PDPortSpec(
+                        name="kv_port",
+                        count=placeholder,
+                        inject_to=PDInjectTargetEnum.ARGS,
+                    )
+                ],
+                connector={"kv_port": "{{ports.kv_port}}"},
+            ),
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -250,15 +291,24 @@ def test_refilled_ports_are_honoured_by_the_next_allocation():
     assert not set(fresh.ports) & {40000, 40001, 40002, 40003, 40004}
 
 
-def test_templated_count_resolves_from_the_roles_parallelism():
+def test_the_kv_band_is_as_wide_as_the_members_cards():
     """Mooncake's `kv_port` is a base and the connector binds one port per
-    tensor-parallel rank: TP8 was measured holding 41100-41107. The width has
-    to come from the parallelism the role actually starts with."""
+    *worker rank*:
+
+        handshake_port = kv_port + dp_rank * tp * pp + (pp_rank + pcp_rank) * tp
+                       + tp_rank
+
+    so the band is `dp x tp x pp` wide -- the member's own card count. TP8/DP1
+    was measured holding 41100-41107 and DP2xTP2 holding 20001-20004; reading
+    the width as the tensor-parallel size fits the first sample and
+    under-reserves the second by a factor of dp.
+    """
     manager = _manager(port_range="40000-40063")
-    mi = _instance(role="prefill")
+    mi = _instance(role="prefill", cards=8)
     model = _pd_model(
         PDModeEnum.VLLM_ASCEND_MOONCAKE,
-        backend_parameters=["--tensor-parallel-size", "8"],
+        # DP2xTP4 across the 8 cards: neither factor alone gives 8.
+        backend_parameters=["--tensor-parallel-size", "4", "--data-parallel-size", "2"],
     )
 
     manager._assign_ports(mi, model, BackendEnum.VLLM)
@@ -269,6 +319,40 @@ def test_templated_count_resolves_from_the_roles_parallelism():
     # The whole run is fenced, not just the base — that is the point.
     assert expected <= set(mi.ports)
     assert expected <= manager._assigned_ports[mi.id]
+
+
+def test_a_card_count_band_does_not_follow_tensor_parallel_size():
+    """The regression this replaces: a DP member whose band was sized by TP
+    reserved `tp` ports and bound `dp x tp`, and the second rank to bind died
+    on `Address already in use` — an instance wedged in `starting`."""
+    manager = _manager()
+    mi = _instance(role="prefill", cards=4)
+    model = _pd_model(
+        PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        backend_parameters=["--tensor-parallel-size", "2", "--data-parallel-size", "2"],
+    )
+
+    manager._assign_ports(mi, model, BackendEnum.VLLM)
+
+    assert mi.named_ports["kv_port"].count == 4
+
+
+def test_a_member_without_cards_gets_no_band_and_says_why(caplog):
+    """`{{accelerator_count}}` on a member with nothing scheduled onto it is
+    not a one-port band: same refusal as an unresolvable parallelism
+    parameter, so the placeholder reaches the launch and names itself."""
+    manager = _manager()
+    mi = _instance(role="prefill", cards=0)
+
+    with caplog.at_level(logging.WARNING, logger="gpustack.worker.serve_manager"):
+        manager._assign_ports(
+            mi, _pd_model(PDModeEnum.VLLM_ASCEND_MOONCAKE), BackendEnum.VLLM
+        )
+
+    assert not mi.named_ports
+    assert mi.ports == [mi.port]
+    assert "kv_port" in caplog.text
+    assert "no accelerators assigned" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -283,9 +367,13 @@ def test_templated_count_accepts_every_spelling_of_tp(parameters, expected):
     """The engines accept three spellings and users write all three."""
     manager = _manager()
     mi = _instance(role="prefill")
-    model = _pd_model(PDModeEnum.VLLM_ASCEND_MOONCAKE, backend_parameters=parameters)
+    model = _pd_model(backend_parameters=parameters)
 
-    manager._assign_ports(mi, model, BackendEnum.VLLM)
+    with patch(
+        "gpustack.worker.serve_manager.get_pd_mode",
+        return_value=_parallelism_band_mode(),
+    ):
+        manager._assign_ports(mi, model, BackendEnum.VLLM)
 
     assert mi.named_ports["kv_port"].count == expected
 
@@ -332,7 +420,6 @@ def test_templated_count_reads_the_roles_own_override():
     manager = _manager()
     mi = _instance(role="decode")
     model = _pd_model(
-        PDModeEnum.VLLM_ASCEND_MOONCAKE,
         backend_parameters=["--tensor-parallel-size", "8"],
         roles=[
             RoleSpec(name="prefill"),
@@ -340,7 +427,13 @@ def test_templated_count_reads_the_roles_own_override():
         ],
     )
 
-    manager._assign_ports(mi, role_effective_model(model, "decode"), BackendEnum.VLLM)
+    with patch(
+        "gpustack.worker.serve_manager.get_pd_mode",
+        return_value=_parallelism_band_mode(),
+    ):
+        manager._assign_ports(
+            mi, role_effective_model(model, "decode"), BackendEnum.VLLM
+        )
 
     assert mi.named_ports["kv_port"].count == 2
 
@@ -354,10 +447,14 @@ def test_unresolvable_templated_count_allocates_nothing_and_says_why(caplog):
     manager = _manager()
     mi = _instance(role="prefill")
 
-    with caplog.at_level(logging.WARNING, logger="gpustack.worker.serve_manager"):
-        manager._assign_ports(
-            mi, _pd_model(PDModeEnum.VLLM_ASCEND_MOONCAKE), BackendEnum.VLLM
-        )
+    with (
+        caplog.at_level(logging.WARNING, logger="gpustack.worker.serve_manager"),
+        patch(
+            "gpustack.worker.serve_manager.get_pd_mode",
+            return_value=_parallelism_band_mode(),
+        ),
+    ):
+        manager._assign_ports(mi, _pd_model(), BackendEnum.VLLM)
 
     assert not mi.named_ports
     assert mi.ports == [mi.port]

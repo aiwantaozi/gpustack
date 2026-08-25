@@ -97,6 +97,11 @@ LOG_RECONNECT_GRACE_SECONDS = envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL + 2
 # Global lock for port assignment to avoid pickle serialization issues
 _port_lock = threading.Lock()
 
+# The `count` spelling that means "as many ports as this member has cards".
+# Not in _PARALLELISM_ALIASES: it is read off the schedule, not parsed out of
+# backend parameters, so it has no parameter spellings to alias.
+_ACCELERATOR_COUNT_KEY = "accelerator_count"
+
 # vLLM's mp path does not bind only VLLM_DP_MASTER_PORT: it derives nine more
 # ports from it (one per DP init attempt), so the connecting port is the *base*
 # of a band and every port in that band has to be probed, fenced and recorded
@@ -2143,15 +2148,31 @@ class ServeManager:
     ) -> Optional[int]:
         """The width of one declared band, or None if it cannot be determined.
 
-        A templated `count` (`{{tensor_parallel_size}}`) is the connector's own
-        rule about its base: Mooncake's `kv_port` binds one port per
-        tensor-parallel rank, TP8 measured holding 41100-41107. So the width
-        comes from the parallelism *this role* actually starts with, read off
-        the same parameter spellings `pd_injection` reads for the `tp_size` it
-        renders into the connector descriptor — the two have to agree, which is
-        why they share one alias table. `model` is already the role's
-        projection (`_get_model`), so `backend_parameters` are its effective
-        ones.
+        A templated `count` is the connector's own rule about its base. Two
+        spellings resolve here:
+
+        `{{accelerator_count}}` — the accelerators this member was scheduled
+        onto. Mooncake's `kv_port` is a base and the connector binds one port
+        per *worker rank*, not per tensor-parallel rank:
+
+            handshake_port = kv_port
+                           + data_parallel_rank * tp_size * pp_size [* pcp_size]
+                           + (pp_rank + pcp_rank) * tp_size + tp_rank
+
+        so the band a member holds is `dp x tp x pp` wide — its own card count.
+        The earlier `{{tensor_parallel_size}}` reading came from a TP8/DP1
+        measurement, where TP and card count are the same number and the two
+        rules are indistinguishable; a DP4xTP4 member reserves 4 ports under
+        that rule and binds 16. Card count is also read off the schedule
+        instead of parsed out of parameters, so it needs no aliases and cannot
+        disagree with what the instance actually got.
+
+        `{{tensor_parallel_size}}` and friends — the parallelism *this role*
+        starts with, read off the same parameter spellings `pd_injection` reads
+        for the `tp_size` it renders into the connector descriptor: the two have
+        to agree, which is why they share one alias table. `model` is already
+        the role's projection (`_get_model`), so `backend_parameters` are its
+        effective ones.
 
         None, never a guess, when the parameter is absent. vLLM's own default
         is 1, but GPUStack injects a tensor-parallel size of its own further
@@ -2168,6 +2189,23 @@ class ServeManager:
             return max(count, 1)
 
         key = count[2:-2] if count.startswith("{{") and count.endswith("}}") else count
+
+        if key == _ACCELERATOR_COUNT_KEY:
+            cards = len(mi.gpu_indexes or [])
+            if cards >= 1:
+                return cards
+            # A member with no accelerators assigned is either cpu_only (a
+            # router, which has no KV band to declare) or not scheduled yet.
+            # Falls through to the same warning as an unresolved parallelism
+            # parameter: no guess, and the placeholder reaches the launch where
+            # it is named in the failure.
+            logger.warning(
+                f"Model instance {mi.name} (role '{mi.role}') declares port "
+                f"band '{spec.name}' with count '{count}' but has no "
+                "accelerators assigned."
+            )
+            return None
+
         aliases = _PARALLELISM_ALIASES.get(key)
         resolved = (
             find_int_parameter(model.backend_parameters or [], aliases)

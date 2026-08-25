@@ -527,9 +527,16 @@ def validate_roles(  # noqa: C901
 def _reject_cache_and_connector_on_one_flag(field, roles, disaggregation) -> None:
     """An extended KV cache and a PD connector cannot share one deployment.
 
-    Both are written into ``--kv-transfer-config``, and vLLM reads that flag
-    once, so the second one is silently dropped — the deployment starts and
-    serves with whichever won. The worker already refuses to build such a
+    GPUStack writes one connector into ``--kv-transfer-config``, so asking it
+    for both means one of them is not configured at all.
+
+    Not an engine limit, and the wording matters because a user told the first
+    would give up on a combination that is legitimate and valuable: vLLM ships
+    a ``MultiConnector`` that composes several connectors under one flag
+    (``kv_connector_extra_config.connectors``), so the pair runs today if the
+    configuration is written by hand. What is missing is GPUStack assembling
+    it, which is why ``custom`` mode is offered as the way out rather than
+    "pick one". The worker already refuses to build such a
     command, but refusing there means two containers are scheduled, given
     accelerators, and then fail; the constraint is knowable from the spec
     alone, so it belongs at save time where the message can name the field to
@@ -566,12 +573,13 @@ def _reject_cache_and_connector_on_one_flag(field, roles, disaggregation) -> Non
         raise BadRequestException(
             message=(
                 f"Role '{role.name}' enables the extended KV cache while pd "
-                f"mode '{disaggregation.mode.value}' configures a KV connector. "
-                "Both are written into --kv-transfer-config and the engine "
-                "reads it once, so one would be silently dropped. Turn the "
-                "extended KV cache off for this deployment or for this role, "
-                "or use pd mode 'custom', which injects no connector and "
-                "leaves the flag to you."
+                f"mode '{disaggregation.mode.value}' configures a KV connector, "
+                "and GPUStack writes one connector into --kv-transfer-config, "
+                "so it cannot configure both. Turn the extended KV cache off "
+                "for this deployment or for this role, or use pd mode "
+                "'custom', which injects no connector and leaves the flag to "
+                "you: the engine can compose connectors, so the pair is "
+                "assemblable by hand."
             )
         )
 

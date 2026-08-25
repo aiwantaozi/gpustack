@@ -206,12 +206,14 @@ def test_port_band_count_is_declared_by_the_connector():
     nixl = get_pd_mode(PDModeEnum.VLLM_NIXL.value)
 
     # Measured: kv_port is a base address and Mooncake binds one port per
-    # tensor-parallel rank (TP8 held 41100-41107), so the width is a
-    # template resolved at allocation time, not a constant and not derived
-    # from data parallelism.
+    # *worker rank* -- TP8/DP1 held 41100-41107 and DP2xTP2 held 20001-20004
+    # (rank 0 -> base+0, rank 1 -> base+2) -- so the width is the member's
+    # card count, resolved at allocation time. Reading it as the
+    # tensor-parallel size is indistinguishable on the TP8/DP1 sample and
+    # under-reserves by a factor of dp on every DP member.
     for role in ("prefill", "decode"):
         band = ascend.role(role).ports[0]
-        assert band.count == "{{tensor_parallel_size}}"
+        assert band.count == "{{accelerator_count}}"
         assert band.scope == PDPortScopeEnum.INSTANCE
     # NIXL's side channel is offset per DP index instead; phase one ships
     # no local DP, so the declared width is one.
@@ -704,7 +706,7 @@ def test_all_five_capabilities_round_trip_through_serialization():
     # 4: router capabilities, 5: the lease window.
     assert nixl["roles"]["prefill"]["ports"][0]["inject_to"] == "env"
     assert ascend["roles"]["prefill"]["ports"][0]["inject_to"] == "args"
-    assert ascend["roles"]["decode"]["ports"][0]["count"] == "{{tensor_parallel_size}}"
+    assert ascend["roles"]["decode"]["ports"][0]["count"] == "{{accelerator_count}}"
     assert (
         ascend["roles"]["prefill"]["connector"]["kv_connector_extra_config"]["decode"][
             "tp_size"

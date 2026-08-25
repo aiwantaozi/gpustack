@@ -425,11 +425,13 @@ def _reject_conflicting_kv_transfer_config(
     if extended is not None and getattr(extended, "enabled", False):
         raise PDInjectionError(
             f"Role '{role_name}' enables the extended KV cache and PD mode "
-            f"'{mode.name}', and both are configured through "
-            f"{KV_TRANSFER_CONFIG_FLAG}, which vLLM reads only once. Detach the "
-            f"KV cache from this deployment (or from this role), or switch to "
-            f"PD mode 'custom' and write the combined connector configuration "
-            f"yourself."
+            f"'{mode.name}', and GPUStack writes one connector into "
+            f"{KV_TRANSFER_CONFIG_FLAG}, so it cannot configure both. Detach "
+            f"the KV cache from this deployment (or from this role), or switch "
+            f"to PD mode 'custom' and write the combined connector "
+            f"configuration yourself — the engine composes connectors through "
+            f"MultiConnector, so the pair is assemblable by hand today and is "
+            f"a GPUStack gap rather than an engine limit."
         )
 
 

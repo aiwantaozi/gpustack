@@ -62,6 +62,11 @@ The unauthenticated GitHub API allows 60 requests per hour per IP. If it rate li
 
 Install the plugin under `/usr/local/lib/docker/cli-plugins` rather than `~/.docker/cli-plugins` when packaging with `sudo`, otherwise the changed `HOME` hides it from the Docker CLI.
 
+## Testing Unreleased Code on Kubernetes
+
+To get uncommitted `gpustack` / `gpustack-runtime` / `gpustack-operator` code into a real cluster
+for an end-to-end run, see [Testing Unreleased Code on a Kubernetes Cluster](./development-kubernetes.md).
+
 ## Update Dependencies
 
 ```bash

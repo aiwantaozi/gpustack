@@ -15,9 +15,10 @@ def _build_cleaner(worker_id: int = 1):
     return cleaner, clientset
 
 
-def _cache_workload(name: str):
+def _cache_workload(name: str, namespace: str | None = None):
     return SimpleNamespace(
         name=name,
+        namespace=namespace,
         labels={"type": "cache-service"},
         # Far past the orphan grace period.
         created_at="2020-01-01T00:00:00Z",
@@ -37,8 +38,8 @@ def test_cleanup_keeps_workloads_of_this_workers_instances():
     )
 
     workloads = [
-        _cache_workload("cache-svc-5-i11"),
-        _cache_workload("cache-svc-5-i99"),
+        _cache_workload("cache-svc-5-i11", namespace="gpustack-acme"),
+        _cache_workload("cache-svc-5-i99", namespace="gpustack-acme"),
     ]
     with (
         patch(
@@ -53,7 +54,10 @@ def test_cleanup_keeps_workloads_of_this_workers_instances():
         "worker_id": 1,
         "page": -1,
     }
-    delete.assert_called_once_with("cache-svc-5-i99")
+    # The namespace comes from the workload the cleaner found, not from a
+    # caller's guess: the cleaner sweeps every tenant's namespace at once and
+    # has no per-tenant context to guess from.
+    delete.assert_called_once_with("cache-svc-5-i99", namespace="gpustack-acme")
 
 
 def test_cleanup_spares_recent_cache_service_workloads():

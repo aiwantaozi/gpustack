@@ -325,6 +325,7 @@ class BenchmarkRunner:
 
         workload_plan = WorkloadPlan(
             name=deployment_metadata.name,
+            namespace=deployment_metadata.namespace,
             host_network=True,
             shm_size=10 * 1 << 30,  # 10 GiB
             containers=[run_container],

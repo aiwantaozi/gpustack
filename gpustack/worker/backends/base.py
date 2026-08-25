@@ -1627,6 +1627,14 @@ exec "$@"
             # Hand the operator InstanceType name to the runtime; the
             # runtime's Kubernetes deployer owns queue admission from here.
             workload.instance_type = selector.type
+        # The tenant's namespace, decided by the server when the instance row
+        # was created. Set here rather than at each backend's `WorkloadPlan(`
+        # so the five engines cannot drift apart on where they deploy; None
+        # (a row predating per-tenant namespaces) leaves the runtime's default.
+        # Read off the instance rather than the deployment metadata: a
+        # subordinate worker's workload has its own *name* but the same
+        # namespace, and this runs for followers too.
+        workload.namespace = getattr(self._model_instance, "namespace", None)
         self._apply_gang_markers(workload)
         return transform_workload_plan(self._config, workload, self._fallback_registry)
 

@@ -47,7 +47,7 @@ def _get_workload_sequence(states):
     the reconnect loop forever."""
     remaining = list(states)
 
-    def next_state(name):
+    def next_state(name, **kwargs):
         return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
     return next_state
@@ -1047,3 +1047,21 @@ def test_sync_vgpu_allocation_steady_state_skips_worker_fetch():
         manager.sync_model_instances_state()
 
     clientset.workers.get.assert_not_called()
+
+
+def test_stopping_an_instance_deletes_in_its_own_namespace():
+    """A Pod deleted in the wrong namespace is not deleted, and it goes on
+    holding its accelerators — so the delete carries the namespace the server
+    stamped on the row, not whatever the runtime falls back to."""
+    manager, _clients = _build_serve_manager(worker_id=1)
+    mi = new_model_instance(1, "m-abcde", 1, worker_id=1)
+    mi.namespace = "gpustack-acme"
+
+    with (
+        patch.object(manager, "_stop_container_log_persistence"),
+        patch.object(manager, "_gang_delete_annotations", return_value={}),
+        patch("gpustack.worker.serve_manager.delete_workload") as delete,
+    ):
+        manager._stop_model_instance(mi)
+
+    assert delete.call_args.kwargs["namespace"] == "gpustack-acme"

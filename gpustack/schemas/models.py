@@ -1165,6 +1165,12 @@ class ModelInstanceDeploymentMetadata:
     Index of the follower in distributed mode.
     It is None for leader or non-distributed mode.
     """
+    namespace: Optional[str] = None
+    """
+    Namespace the workload lives in. None means "wherever the runtime puts a
+    workload that declares none" — the deployer's configured default — which
+    is what every row created before the per-tenant namespaces carries.
+    """
 
 
 class ModelInstanceBase(SQLModel, ModelSource):
@@ -1230,6 +1236,17 @@ class ModelInstanceBase(SQLModel, ModelSource):
             nullable=False,
         ),
     )
+    namespace: Optional[str] = None
+    """The Kubernetes namespace this instance's workload lives in, resolved
+    from `owner_principal_id` when the row is created and never recomputed:
+    the namespace is where the Pod *is*, not where a Pod for this tenant
+    *would* go today, so reading, deleting and log-streaming keep finding it
+    even after the tenant's namespace convention changes.
+
+    None on rows created before per-tenant namespaces, which is what keeps
+    their Pods reachable: the runtime falls back to the deployer's configured
+    default namespace, the only one those Pods were ever created in.
+    """
 
     mounted_loras: Optional[List[LoraListEntry]] = Field(
         default=None,
@@ -1307,6 +1324,7 @@ class ModelInstanceBase(SQLModel, ModelSource):
 
         return ModelInstanceDeploymentMetadata(
             name=name,
+            namespace=self.namespace,
             distributed=distributed,
             distributed_leader=distributed_leader,
             distributed_follower=distributed_follower,

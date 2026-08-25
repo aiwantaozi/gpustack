@@ -384,7 +384,7 @@ def test_start_instance_removes_stale_workload_first():
         ),
         patch(
             "gpustack.worker.cache_service_manager.delete_workload",
-            side_effect=lambda name: call_order.append(("delete", name)),
+            side_effect=lambda name, **kwargs: call_order.append(("delete", name)),
         ),
         patch(
             "gpustack.worker.cache_service_manager.create_workload",
@@ -1184,7 +1184,7 @@ def test_sync_workload_failed_restarts_with_incremented_count():
     ):
         manager.sync_cache_service_instances_state()
 
-    delete.assert_called_once_with(INSTANCE_WORKLOAD_NAME)
+    delete.assert_called_once_with(INSTANCE_WORKLOAD_NAME, namespace=None)
     update.assert_called_once_with(
         instance.id,
         state=CacheServiceStateEnum.PENDING,
@@ -1656,7 +1656,7 @@ def test_stop_instance_deletes_workload_and_frees_port():
     with patch("gpustack.worker.cache_service_manager.delete_workload") as delete:
         manager._stop_cache_service_instance(instance)
 
-    delete.assert_called_once_with(INSTANCE_WORKLOAD_NAME)
+    delete.assert_called_once_with(INSTANCE_WORKLOAD_NAME, namespace=None)
     assert instance.id not in manager._assigned_ports
 
 

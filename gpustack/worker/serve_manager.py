@@ -508,7 +508,9 @@ class ServeManager:
             # Use deployment metadata name for subordinate workers (e.g., "model-f0")
             # since their workload name differs from the model instance name.
             if is_main_worker:
-                workload = get_workload(model_instance.name)
+                workload = get_workload(
+                    model_instance.name, namespace=model_instance.namespace
+                )
             else:
                 deployment_metadata = model_instance.get_deployment_metadata(
                     self._worker_id
@@ -518,7 +520,9 @@ class ServeManager:
                     if deployment_metadata
                     else model_instance.name
                 )
-                workload = get_workload(workload_name)
+                workload = get_workload(
+                    workload_name, namespace=model_instance.namespace
+                )
 
             if workload and workload.state in [
                 WorkloadStatusStateEnum.PENDING,
@@ -1140,7 +1144,7 @@ class ServeManager:
                 workload_name = (
                     deployment_metadata.name if deployment_metadata else mi.name
                 )
-                workload = get_workload(workload_name)
+                workload = get_workload(workload_name, namespace=mi.namespace)
                 if not workload:
                     self._start_model_instance(mi)
                     logger.trace(
@@ -1190,6 +1194,7 @@ class ServeManager:
         log_path: str,
         stop_event: threading.Event,
         token: Optional[str] = None,
+        namespace: Optional[str] = None,
     ):
         """Persist container logs to local file (runs in a separate thread).
 
@@ -1206,6 +1211,8 @@ class ServeManager:
             stop_event: Event to signal thread to stop
             token: Operation token identifying a specific container in the workload.
                 If None, logs from the default (index=0) container are fetched.
+            namespace: Namespace the workload lives in. None lets the runtime
+                resolve it, at the cost of a cluster-wide lookup per attempt.
         """
         retry_count = 0
         first_connect = True
@@ -1217,6 +1224,7 @@ class ServeManager:
             try:
                 log_stream = logs_workload(
                     name=workload_name,
+                    namespace=namespace,
                     token=token,
                     tail=-1,
                     follow=True,
@@ -1267,7 +1275,7 @@ class ServeManager:
                 # A restart briefly looks terminated at EOF; wait for the
                 # container to return before giving up, so logs aren't dropped.
                 if stop_event.is_set() or not self._wait_for_container_recovery(
-                    workload_name, stop_event
+                    workload_name, stop_event, namespace=namespace
                 ):
                     break
                 logger.debug(
@@ -1288,11 +1296,13 @@ class ServeManager:
 
         logger.debug(f"Log persistence thread for {workload_name} exiting")
 
-    def _container_still_running(self, workload_name: str) -> bool:
+    def _container_still_running(
+        self, workload_name: str, namespace: Optional[str] = None
+    ) -> bool:
         """Whether the workload is still alive (a dead stream should reconnect
         rather than exit)."""
         try:
-            workload = get_workload(workload_name)
+            workload = get_workload(workload_name, namespace=namespace)
         except Exception:
             return True  # transient query failure: reconnect, don't drop logs
         return bool(workload) and workload.state in (
@@ -1307,6 +1317,7 @@ class ServeManager:
         stop_event: threading.Event,
         grace_seconds: float = LOG_RECONNECT_GRACE_SECONDS,
         poll_interval: float = 1.0,
+        namespace: Optional[str] = None,
     ) -> bool:
         """Poll until the workload is alive again (True -> reconnect) or the
         grace window elapses / stop_event fires (False -> give up). A restart
@@ -1317,7 +1328,7 @@ class ServeManager:
         for _ in range(attempts):
             if stop_event.is_set():
                 return False
-            if self._container_still_running(workload_name):
+            if self._container_still_running(workload_name, namespace=namespace):
                 return True
             stop_event.wait(timeout=poll_interval)
         return False
@@ -1328,6 +1339,7 @@ class ServeManager:
         workload_name: str,
         restart_count: int,
         stop_event: threading.Event,
+        namespace: Optional[str] = None,
     ):
         """Background thread that waits for sidecar containers to appear.
 
@@ -1340,10 +1352,11 @@ class ServeManager:
             workload_name: Workload name
             restart_count: Current restart count for log file naming
             stop_event: Event to signal thread to stop
+            namespace: Namespace the workload lives in
         """
         while not stop_event.is_set():
             try:
-                workload = get_workload(workload_name)
+                workload = get_workload(workload_name, namespace=namespace)
                 if workload and workload.loggable:
                     sidecars = [op for op in workload.loggable if op.name != "default"]
                     if sidecars:
@@ -1352,6 +1365,7 @@ class ServeManager:
                             workload_name,
                             workload.loggable,
                             restart_count,
+                            namespace=namespace,
                         )
                         logger.debug(f"Sidecar discovery for {workload_name} complete")
                         return
@@ -1365,6 +1379,7 @@ class ServeManager:
         workload_name: str,
         loggable_ops: list,
         restart_count: int,
+        namespace: Optional[str] = None,
     ):
         """Start additional log persistence threads for sidecar containers.
 
@@ -1390,7 +1405,7 @@ class ServeManager:
 
             thread = threading.Thread(
                 target=self._persist_container_logs,
-                args=(workload_name, log_path, stop_event, op.token),
+                args=(workload_name, log_path, stop_event, op.token, namespace),
                 daemon=True,
                 name=f"log-persist-{workload_name}-{op.name}",
             )
@@ -1425,6 +1440,7 @@ class ServeManager:
         # which differs for subordinate workers (e.g., "model-f0").
         deployment_metadata = mi.get_deployment_metadata(self._worker_id)
         workload_name = deployment_metadata.name if deployment_metadata else mi.name
+        namespace = mi.namespace
 
         restart_count = mi.restart_count or 0
         log_path = f"{self._serve_log_dir}/{mi.id}.container.{restart_count}.log"
@@ -1434,7 +1450,7 @@ class ServeManager:
         # Main container log thread.
         thread = threading.Thread(
             target=self._persist_container_logs,
-            args=(workload_name, log_path, stop_event),
+            args=(workload_name, log_path, stop_event, None, namespace),
             daemon=True,
             name=f"log-persist-{workload_name}",
         )
@@ -1444,7 +1460,7 @@ class ServeManager:
         # then starts additional log threads for each.
         discovery_thread = threading.Thread(
             target=self._discover_sidecar_logs,
-            args=(mi.id, workload_name, restart_count, stop_event),
+            args=(mi.id, workload_name, restart_count, stop_event, namespace),
             daemon=True,
             name=f"log-discover-{workload_name}",
         )
@@ -2232,7 +2248,9 @@ class ServeManager:
         deployment_metadata = mi.get_deployment_metadata(self._worker_id)
         if deployment_metadata:
             delete_workload(
-                deployment_metadata.name, **self._gang_delete_annotations(mi)
+                deployment_metadata.name,
+                namespace=deployment_metadata.namespace,
+                **self._gang_delete_annotations(mi),
             )
 
         # Cleanup internal states.

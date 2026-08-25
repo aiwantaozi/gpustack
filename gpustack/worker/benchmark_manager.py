@@ -427,7 +427,7 @@ class BenchmarkManager:
 
         # Delete workload.
         try:
-            delete_workload(benchmark.name)
+            delete_workload(benchmark.name, namespace=benchmark.namespace)
         except Exception as e:
             logger.error(
                 "Failed to delete the workload of benchmark "
@@ -499,7 +499,7 @@ class BenchmarkManager:
             return
 
         # Get workload and handle based on state
-        workload = get_workload(benchmark.name)
+        workload = get_workload(benchmark.name, namespace=benchmark.namespace)
 
         # Snapshot container logs while running, so we still have them if the
         # container is garbage-collected before we observe a terminal state.
@@ -1448,7 +1448,7 @@ class BenchmarkManager:
         preserving the provisioning logs.
         """
         try:
-            logs = logs_workload(name=benchmark.name)
+            logs = logs_workload(name=benchmark.name, namespace=benchmark.namespace)
         except Exception as e:
             logger.error(
                 f"Failed to fetch workload logs for benchmark {benchmark.name}(id={benchmark.id}): {e}"

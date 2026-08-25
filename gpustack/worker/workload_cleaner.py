@@ -74,6 +74,14 @@ class WorkloadCleaner:
         current_benchmark_names = self._current_benchmark_names()
         current_cache_service_names = self._current_cache_service_instance_names()
 
+        # Namespace-less on purpose: workloads of every tenant are orphan
+        # candidates, and the cleaner cannot know which namespaces exist. The
+        # runtime reads every workload namespace at once for this, degrading
+        # to its default namespace when the cluster denies a cluster-wide
+        # read — in which case other tenants' orphans stay invisible and the
+        # worker's ServiceAccount needs `list pods` cluster-wide.
+        # Each deletion below then targets the namespace the workload was
+        # actually found in, not the caller's guess.
         workloads = list_workloads()
         for w in workloads:
             create_at = parse_iso8601_to_utc(w.created_at)
@@ -94,7 +102,7 @@ class WorkloadCleaner:
                     ]
                     or w.name not in current_benchmark_names
                 ):
-                    delete_workload(w.name)
+                    delete_workload(w.name, namespace=w.namespace)
                     logger.info(
                         f"Deleted orphan benchmark workload {w.name}, created at {w.created_at}."
                     )
@@ -103,7 +111,7 @@ class WorkloadCleaner:
                     create_at, envs.WORKER_ORPHAN_WORKLOAD_CLEANUP_GRACE_PERIOD
                 )
                 if w.name not in current_cache_service_names and should_clean_orphan:
-                    delete_workload(w.name)
+                    delete_workload(w.name, namespace=w.namespace)
                     logger.info(
                         f"Deleted orphan cache service workload {w.name}, "
                         f"created at {w.created_at}."
@@ -113,7 +121,7 @@ class WorkloadCleaner:
                     create_at, envs.WORKER_ORPHAN_WORKLOAD_CLEANUP_GRACE_PERIOD
                 )
                 if w.name not in current_instance_names and should_clean_orphan:
-                    delete_workload(w.name)
+                    delete_workload(w.name, namespace=w.namespace)
                     logger.info(
                         f"Deleted orphan workload {w.name}, created at {w.created_at}."
                     )

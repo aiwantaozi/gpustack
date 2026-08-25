@@ -560,6 +560,11 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
     # row is visible to the owning Org via cluster_resource_visibility.
     mutated.cluster_id = instance.cluster_id
     mutated.owner_principal_id = instance.owner_principal_id
+    # A run is deployed on the target instance's worker, so it belongs in the
+    # target instance's namespace. Inheriting it rather than re-resolving from
+    # the owner also keeps the pair together for an instance created before
+    # per-tenant namespaces, whose Pod is still in the runtime's default one.
+    mutated.namespace = instance.namespace
     return mutated
 
 

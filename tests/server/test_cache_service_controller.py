@@ -38,6 +38,7 @@ def _service(**overrides):
         config=None,
         mode=CacheServiceModeEnum.MANAGED,
         cluster_id=1,
+        owner_principal_id=1,
         worker_id=5,
         worker_selector=None,
         state=CacheServiceStateEnum.PENDING,
@@ -95,6 +96,13 @@ def _patch_reconcile(
     monkeypatch.setattr(
         "gpustack.server.controllers.CacheServiceInstance.all_by_fields",
         AsyncMock(side_effect=list(instance_lists or [[], []])),
+    )
+    # Resolving it reads the owner Principal, and this harness runs against a
+    # mock session. Where the rows *land* is covered by
+    # tests/server/test_workload_namespace.py.
+    monkeypatch.setattr(
+        "gpustack.server.controllers.resolve_workload_namespace",
+        AsyncMock(return_value="gpustack-default"),
     )
     create = AsyncMock()
     monkeypatch.setattr(

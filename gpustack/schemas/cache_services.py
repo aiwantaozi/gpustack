@@ -129,6 +129,9 @@ class CacheServiceConfig(BaseModel):
 class CacheServiceDeploymentMetadata:
     name: str
     labels: Dict[str, str]
+    namespace: Optional[str] = None
+    """Namespace the workload lives in; None falls back to the deployer's
+    configured default (see ``CacheServiceInstanceBase.namespace``)."""
 
 
 class CacheServiceBase(SQLModel):
@@ -247,6 +250,16 @@ class CacheServiceInstanceBase(SQLModel):
     """Denormalized from the parent service so cluster-bound service
     accounts' reads (list conditions, watch filter) scope without a join."""
 
+    namespace: Optional[str] = None
+    """The Kubernetes namespace this instance's workload lives in, resolved
+    from the parent service's ``owner_principal_id`` when the row is created
+    and never recomputed — the namespace is where the container *is*.
+
+    None on rows created before per-tenant namespaces, which keeps them
+    readable and deletable: the runtime falls back to the deployer's
+    configured default, the only namespace those containers were created in.
+    """
+
     port: Optional[int] = None
     """Port allocated on the instance's worker."""
 
@@ -283,6 +296,7 @@ class CacheServiceInstanceBase(SQLModel):
     def get_deployment_metadata(self) -> CacheServiceDeploymentMetadata:
         return CacheServiceDeploymentMetadata(
             name=cache_service_instance_workload_name(self.cache_service_id, self.id),
+            namespace=self.namespace,
             labels={
                 "type": CACHE_SERVICE_WORKLOAD_TYPE,
                 "cache-service-id": str(self.cache_service_id),

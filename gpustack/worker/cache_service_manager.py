@@ -269,7 +269,10 @@ class CacheServiceManager:
             # first, so restart and first start share this code path.
             deployment_metadata = instance.get_deployment_metadata()
             try:
-                delete_workload(deployment_metadata.name)
+                delete_workload(
+                    deployment_metadata.name,
+                    namespace=deployment_metadata.namespace,
+                )
             except Exception as e:
                 # The workload may not exist yet.
                 logger.debug(
@@ -356,6 +359,7 @@ class CacheServiceManager:
             )
             workload_plan = WorkloadPlan(
                 name=deployment_metadata.name,
+                namespace=deployment_metadata.namespace,
                 host_network=True,
                 # Shares the host IPC namespace with the engine containers
                 # so the cache server can import their KV buffers by CUDA
@@ -797,7 +801,9 @@ class CacheServiceManager:
     ):
         """Synchronize a single cache service instance's state."""
         deployment_metadata = instance.get_deployment_metadata()
-        workload = get_workload(deployment_metadata.name)
+        workload = get_workload(
+            deployment_metadata.name, namespace=deployment_metadata.namespace
+        )
 
         if not workload or workload.state in [
             WorkloadStatusStateEnum.FAILED,
@@ -902,7 +908,7 @@ class CacheServiceManager:
             return
 
         try:
-            delete_workload(workload_name)
+            delete_workload(workload_name, namespace=instance.namespace)
         except Exception as e:
             # The workload may already be gone.
             logger.debug(
@@ -972,7 +978,9 @@ class CacheServiceManager:
         """
         deployment_metadata = instance.get_deployment_metadata()
         try:
-            delete_workload(deployment_metadata.name)
+            delete_workload(
+                deployment_metadata.name, namespace=deployment_metadata.namespace
+            )
         except Exception as e:
             # The workload may already be gone (never created or cleaned up).
             logger.warning(

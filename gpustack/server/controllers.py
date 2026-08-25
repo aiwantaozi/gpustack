@@ -91,6 +91,10 @@ from gpustack.schemas.cache_services import (
 from gpustack.server.cache_provider_catalog import get_cache_provider
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
 from gpustack.server.pd_observability import get_pd_observation
+from gpustack.server.workload_namespace import (
+    WorkloadNamespaceEnsurer,
+    resolve_workload_namespace,
+)
 from gpustack.schemas.workers import (
     Worker,
     WorkerStateEnum,
@@ -238,6 +242,7 @@ class ModelController:
         self._queue: WorkQueue = WorkQueue(coalesce=self._merge_events)
         self._inflight: Dict[Any, asyncio.Task] = {}
         self._dispatch_task: Optional[asyncio.Task] = None
+        self._namespaces = WorkloadNamespaceEnsurer(cfg)
 
     @staticmethod
     def _merge_events(existing: WorkEvent, incoming: WorkEvent) -> WorkEvent:
@@ -393,6 +398,15 @@ class ModelController:
             return
         try:
             async with async_session() as session:
+                # Before any instance row is created, because the worker acts
+                # on the row it reads and would otherwise be the one to
+                # discover the namespace does not exist — as a 404 on Pod
+                # creation, on a machine with no way to fix it.
+                await self._namespaces.ensure(
+                    session,
+                    model.cluster_id,
+                    await resolve_workload_namespace(session, model.owner_principal_id),
+                )
                 await sync_replicas(session, model)
                 # The status owner has to run on the spec side too, not only on
                 # instance events. `role_status.desired` is read straight off
@@ -549,6 +563,7 @@ class CacheServiceController:
 
     def __init__(self, cfg: Config):
         self._config = cfg
+        self._namespaces = WorkloadNamespaceEnsurer(cfg)
 
     async def start(self):
         """
@@ -858,6 +873,11 @@ class CacheServiceController:
             else:
                 existing_worker_ids.add(instance.worker_id)
 
+        namespace = await resolve_workload_namespace(
+            session, service.owner_principal_id
+        )
+        if desired_worker_ids - existing_worker_ids:
+            await self._namespaces.ensure(session, service.cluster_id, namespace)
         for worker_id in sorted(desired_worker_ids - existing_worker_ids):
             # Same display-name convention as model instances: the parent's
             # name (as of instance creation; a later service rename does not
@@ -872,6 +892,7 @@ class CacheServiceController:
                     cache_service_id=service.id,
                     worker_id=worker_id,
                     cluster_id=service.cluster_id,
+                    namespace=namespace,
                     state=CacheServiceStateEnum.PENDING,
                     spec_digest=cache_service_spec_digest(service),
                 ),
@@ -1056,8 +1077,12 @@ async def sync_replicas(session: AsyncSession, model: Model):
         return
     model = fresh_model
 
+    # Resolved once per pass rather than per row: it is the same answer for
+    # every instance of a model, and the answer costs a query.
+    namespace = await resolve_workload_namespace(session, model.owner_principal_id)
+
     if model.roles:
-        return await _sync_replicas_per_role(session, model)
+        return await _sync_replicas_per_role(session, model, namespace)
 
     # Turning disaggregation off leaves the group's members behind, and they
     # cannot simply be handed to the role-less rule. Two reasons, and either
@@ -1084,10 +1109,12 @@ async def sync_replicas(session: AsyncSession, model: Model):
         await _release_and_delete(session, orphans)
         return
 
-    return await _sync_replicas_legacy(session, model)
+    return await _sync_replicas_legacy(session, model, namespace)
 
 
-async def _sync_replicas_legacy(session: AsyncSession, model: Model):
+async def _sync_replicas_legacy(
+    session: AsyncSession, model: Model, namespace: Optional[str] = None
+):
     """The role-less rule, byte-for-byte what it has always been."""
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
@@ -1112,6 +1139,7 @@ async def _sync_replicas_legacy(session: AsyncSession, model: Model):
                 # default of platform_principal_id() would otherwise
                 # land instances of a non-Default-Org Model in Default.
                 owner_principal_id=model.owner_principal_id,
+                namespace=namespace,
                 draft_model_source=await get_draft_model_source(session, model),
                 backend=get_backend(model),
                 backend_version=model.backend_version,
@@ -1317,6 +1345,7 @@ async def _build_instance_create(
     role: RoleSpec,
     group_id: str,
     digest: str,
+    namespace: Optional[str] = None,
 ) -> ModelInstanceCreate:
     """One member row of `role` in the generation `group_id`.
 
@@ -1339,6 +1368,7 @@ async def _build_instance_create(
         state=ModelInstanceStateEnum.PENDING,
         cluster_id=model.cluster_id,
         owner_principal_id=model.owner_principal_id,
+        namespace=namespace,
         draft_model_source=await get_draft_model_source(session, model),
         # The backend is a per-role override, so it is resolved against the
         # role-effective model rather than the Model — a `custom` group may
@@ -1372,7 +1402,9 @@ async def _release_and_delete(
     return names
 
 
-async def _sync_replicas_per_role(session: AsyncSession, model: Model):
+async def _sync_replicas_per_role(
+    session: AsyncSession, model: Model, namespace: Optional[str] = None
+):
     """Converge a role-bearing model, one role at a time.
 
     Per role rather than per group because the group is not the unit of
@@ -1446,7 +1478,7 @@ async def _sync_replicas_per_role(session: AsyncSession, model: Model):
             for _ in range(role.replicas):
                 pending.append(
                     await _build_instance_create(
-                        session, model, role, group_id, generation_digest
+                        session, model, role, group_id, generation_digest, namespace
                     )
                 )
         if pending:
@@ -1468,7 +1500,7 @@ async def _sync_replicas_per_role(session: AsyncSession, model: Model):
                 continue
             pending = [
                 await _build_instance_create(
-                    session, model, role, group_id, generation_digest
+                    session, model, role, group_id, generation_digest, namespace
                 )
                 for _ in range(role.replicas - len(have))
             ]

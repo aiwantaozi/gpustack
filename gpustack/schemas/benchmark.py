@@ -289,6 +289,9 @@ class GPUSnapshot(GPUDeviceInfo):
 class BenchmarkDeploymentMetadata:
     name: str
     labels: dict[str, str]
+    namespace: Optional[str] = None
+    """Namespace the workload lives in; None falls back to the deployer's
+    configured default (see ``Benchmark.namespace``)."""
 
 
 class BenchmarkBase(SQLModel):
@@ -440,6 +443,10 @@ class BenchmarkBase(SQLModel):
 
         return BenchmarkDeploymentMetadata(
             name=self.name,
+            # Server-derived, and declared on the table / Public schemas rather
+            # than on this base (same reasoning as `owner_principal_id`), so a
+            # `BenchmarkCreate` reaching here reads it as absent.
+            namespace=getattr(self, "namespace", None),
             labels={
                 "benchmark-name": self.name,
                 "model-instance-name": self.model_instance_name or "",
@@ -697,6 +704,13 @@ class Benchmark(BenchmarkWithSnapshots, BenchmarkMetrics, BaseModelMixin, table=
         default=None,
         sa_column=Column(Integer, ForeignKey("principals.id"), nullable=True),
     )
+    # The namespace the run's workload lives in, resolved from
+    # `owner_principal_id` on create and never recomputed. Kept out of
+    # `BenchmarkBase` for the same reason as `owner_principal_id`: it is
+    # server-derived, so a create body must not be able to set it. None on
+    # rows predating per-tenant namespaces — the runtime then falls back to
+    # the deployer's configured default, where those containers actually are.
+    namespace: Optional[str] = Field(default=None)
 
     __tablename__ = 'benchmarks'
 
@@ -764,6 +778,9 @@ class BenchmarkFullPublic(
     # therefore kept out of BenchmarkBase / Create — declared on the
     # Public schemas so readers can render the owning Org.
     owner_principal_id: Optional[int] = None
+    # Same shape, and the worker reads it off this schema to find the run's
+    # workload (`workload_cleaner`, log snapshots, cleanup).
+    namespace: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -781,6 +798,7 @@ class BenchmarkPublic(
 ):
     id: int
     owner_principal_id: Optional[int] = None
+    namespace: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

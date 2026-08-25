@@ -157,6 +157,13 @@ async def _run(model, instances, instance_type_snapshot=None):
             "gpustack.server.controllers.get_draft_model_source",
             AsyncMock(return_value=None),
         ),
+        # Resolving it reads the owner Principal, and this harness runs
+        # against a mock session. Where the rows *land* is covered by
+        # tests/server/test_workload_namespace.py.
+        patch(
+            "gpustack.server.controllers.resolve_workload_namespace",
+            AsyncMock(return_value="gpustack-default"),
+        ),
         patch("gpustack.server.controllers.ModelInstanceService", recorder),
     ):
         await sync_replicas(MagicMock(), model)

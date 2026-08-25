@@ -269,32 +269,58 @@ modes:
         # health check to also be the fast path is what produced the values
         # this replaces.
         #
-        # `interval` is the one that was actually broken: 60s meant a dead
-        # prefill kept being selected for over a minute. Everything else
-        # here is upstream's own tolerance, restored.
+        # 🔴 `interval` is bounded on BOTH sides, and the upper bound is the
+        # one nobody expects.
+        #
+        # Above: 60s (upstream's default) meant a dead prefill kept being
+        # selected for over a minute. That is the failure this whole block
+        # was originally written for.
+        #
+        # Below: it must stay comfortably UNDER the engine's HTTP
+        # keep-alive timeout, which is uvicorn's default of 5s and which
+        # neither vLLM nor SGLang changes. The router pools connections to
+        # its workers, so if the interval equals the keep-alive the server
+        # may close a pooled connection in the same instant the checker
+        # reaches for it — every tick becomes a coin flip on a stale socket.
+        #
+        # Measured, and it reached a user: with interval == 5 == keep-alive,
+        # a health check on decode reused a connection the engine had just
+        # closed and never got it back, ~4.5% of ticks. One failed check was
+        # enough to eject decode (the threshold was 1 then), and with a
+        # single decode replica there was nothing to fail over to — the next
+        # request got "Decode policy failed to select a worker", a 503 in
+        # the playground, from a decode engine that was perfectly healthy.
+        #
+        # 3s keeps the pooled connection refreshed well inside the 5s window,
+        # so it stays genuinely alive instead of being raced.
         - --health-check-interval-secs
-        - "5"
+        - "3"
         # Upstream's default, and deliberately back to it. At 1, a single
-        # slow reply ejects the worker — and for a role with one replica
-        # ejection is not failover, it is an outage, because there is
-        # nothing to fail over to. Three consecutive misses at a 5s
-        # interval is 15s to condemn a genuinely dead worker, a window the
+        # slow or stale-socket reply ejects the worker — and for a role with
+        # one replica ejection is not failover, it is an outage, because
+        # there is nothing to fail over to. Three consecutive misses at a 3s
+        # interval is 9s to condemn a genuinely dead worker, a window the
         # circuit breaker already covers on the request path.
+        #
+        # This is also where the tolerance for a slow /health now lives.
+        # It belongs here rather than in the timeout below: a threshold
+        # distinguishes "blip" from "down", a timeout cannot.
         - --health-failure-threshold
         - "3"
         # Upstream defaults this to 2, which with the above is asymmetric in
         # the wrong direction: slow to condemn but also slow to forgive, so
-        # a worker that recovers stays out for another interval. Restore on
-        # the first success instead — a worker that flaps is the circuit
-        # breaker's problem, and it is already watching.
+        # a worker that recovers stays out for another interval. That pairing
+        # is exactly what turned the stale-socket blip above into a 503 —
+        # ejected on one check, restored only on the second. Restore on the
+        # first success instead; a worker that flaps is the circuit breaker's
+        # problem, and it is already watching.
         - --health-success-threshold
         - "1"
-        # Upstream's 5 is not available once the interval is 5: a timeout at
-        # or above the interval lets checks overlap. This is the largest
-        # value that stays strictly under it with headroom, which matters
-        # because /health on a loaded engine queues behind its event loop.
+        # Strictly under the interval, or checks overlap. Its job is only to
+        # stop a check hanging past the next tick — the tolerance for a slow
+        # reply is the threshold above, not this.
         - --health-check-timeout-secs
-        - "3"
+        - "2"
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries
@@ -389,13 +415,13 @@ modes:
         # discovered in production would be a choice, not an omission.
         # See the vllm-nixl recipe for why each value is what it is.
         - --health-check-interval-secs
-        - "5"
+        - "3"
         - --health-failure-threshold
         - "3"
         - --health-success-threshold
         - "1"
         - --health-check-timeout-secs
-        - "3"
+        - "2"
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries
@@ -479,13 +505,13 @@ modes:
         # discovered in production would be a choice, not an omission.
         # See the vllm-nixl recipe for why each value is what it is.
         - --health-check-interval-secs
-        - "5"
+        - "3"
         - --health-failure-threshold
         - "3"
         - --health-success-threshold
         - "1"
         - --health-check-timeout-secs
-        - "3"
+        - "2"
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries

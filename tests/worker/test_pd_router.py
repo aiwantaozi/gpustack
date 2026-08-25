@@ -103,7 +103,9 @@ def test_the_measured_failure_detection_values_are_carried():
     plan = render_router(get_pd_mode("vllm-nixl"), VARIABLES, PEERS)
     command = plan.command
 
-    assert command[command.index("--health-check-interval-secs") + 1] == "5"
+    # Bounded above by the measurement, below by the engine's keep-alive —
+    # see test_the_health_interval_stays_under_the_engines_keep_alive.
+    assert int(command[command.index("--health-check-interval-secs") + 1]) <= 5
     assert command[command.index("--retry-max-retries") + 1] == "3"
 
 
@@ -118,10 +120,36 @@ def test_ejection_tolerates_a_blip_and_restores_on_one_success():
     # Asymmetric in the other direction is the bug: slow to condemn AND slow
     # to forgive leaves a recovered worker out for another whole interval.
     assert command[command.index("--health-success-threshold") + 1] == "1"
-    # Must stay strictly under the interval or checks overlap.
-    timeout = int(command[command.index("--health-check-timeout-secs") + 1])
+
+
+# uvicorn's default, which is what both vLLM and SGLang serve behind and
+# neither overrides. Not a number we control — a property of the thing on the
+# other end of the connection.
+ENGINE_KEEP_ALIVE_SECS = 5
+
+
+@pytest.mark.parametrize("mode", ["vllm-nixl", "sglang-mooncake", "sglang-nixl"])
+def test_the_health_interval_stays_under_the_engines_keep_alive(mode):
+    """The bound nobody remembers, so it is pinned rather than commented.
+
+    The router pools its connections to workers. With the interval equal to
+    the engine's keep-alive, the engine may close a pooled connection in the
+    same instant the checker reaches for it, and the check fails on a socket
+    rather than on the worker. Measured at ~4.5% of ticks, and it reached a
+    user: one such failure ejected a single-replica decode and the next
+    request came back 503 from an engine that was perfectly healthy.
+
+    Also strictly under the interval on the other side, or checks overlap.
+    """
+    command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
     interval = int(command[command.index("--health-check-interval-secs") + 1])
-    assert timeout < interval
+    timeout = int(command[command.index("--health-check-timeout-secs") + 1])
+
+    assert interval < ENGINE_KEEP_ALIVE_SECS, (
+        f"{mode}: a {interval}s interval races the engine's "
+        f"{ENGINE_KEEP_ALIVE_SECS}s keep-alive"
+    )
+    assert timeout < interval, f"{mode}: checks would overlap"
 
 
 @pytest.mark.parametrize("mode", ["sglang-mooncake", "sglang-nixl"])
@@ -133,7 +161,7 @@ def test_the_sglang_routers_are_hardened_too(mode):
     command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
 
     for flag, value in (
-        ("--health-check-interval-secs", "5"),
+        ("--health-check-interval-secs", "3"),
         ("--health-failure-threshold", "3"),
         ("--health-success-threshold", "1"),
         ("--cb-failure-threshold", "2"),

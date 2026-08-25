@@ -353,16 +353,14 @@ def test_router_peer_styles_and_prometheus_band():
         nixl.router.command[nixl.router.command.index("--prometheus-host") + 1]
         == "{{worker_ip}}"
     )
-    # The five hardening flags are not tuning: with the router's own
-    # defaults a dead prefill kept returning 500s for over a minute.
-    for flag in (
-        "--health-check-interval-secs",
-        "--health-failure-threshold",
-        "--health-check-timeout-secs",
-        "--cb-failure-threshold",
-        "--retry-max-retries",
-    ):
+    # Fast failure detection is the circuit breaker's, not the health
+    # check's: the breaker runs on the request path and sees a dead worker at
+    # real traffic rate, while a short health-check interval lands near the
+    # engine's HTTP keep-alive and ejects healthy workers on a stale socket.
+    # See tests/worker/test_pd_router.py for the full argument.
+    for flag in ("--cb-failure-threshold", "--retry-max-retries"):
         assert flag in nixl.router.command
+    assert not [c for c in nixl.router.command if str(c).startswith("--health")]
 
     # Hosts and ports as two parallel flags.
     assert ascend.router.peers.style == PDPeerStyleEnum.PARALLEL_LISTS

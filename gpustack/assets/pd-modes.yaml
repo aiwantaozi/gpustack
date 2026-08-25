@@ -257,70 +257,53 @@ modes:
         - round_robin
         - --decode-policy
         - round_robin
-        # Not tuning. Measured with the router's own defaults, killing one
-        # prefill left >50% of requests returning 500 for more than a
-        # minute; with these the same run stayed at 8/8 200s.
+        # Two values, and only two. Everything the router's own defaults
+        # cover is left to them — the health check above all.
         #
-        # The two mechanisms have different jobs and the values follow that
-        # split. The circuit breaker runs on the *request* path, so it sees
-        # a dead worker at real traffic rate — under load it opens in well
-        # under a second. The health check is the background sweep that
-        # catches a worker nobody happens to be routing to. Asking the
-        # health check to also be the fast path is what produced the values
-        # this replaces.
+        # The division of labour is the whole argument. The circuit breaker
+        # runs on the *request* path, so it learns a worker is dead at real
+        # traffic rate: two failed requests and it is open, which under load
+        # is well under a second. The health check is the background sweep
+        # that eventually notices a worker nobody happens to be routing to.
+        # Fast failure detection is the breaker's job. Making the health
+        # check fast too buys a few seconds the breaker already covers, and
+        # costs far more than it looks like it should.
         #
-        # 🔴 `interval` is bounded on BOTH sides, and the upper bound is the
-        # one nobody expects.
+        # 🔴 What it costs, measured, twice:
         #
-        # Above: 60s (upstream's default) meant a dead prefill kept being
-        # selected for over a minute. That is the failure this whole block
-        # was originally written for.
+        # 1. A short interval sits near the engine's HTTP keep-alive, which
+        #    is uvicorn's default of 5s and which neither vLLM nor SGLang
+        #    overrides. The router pools its connections to workers, so an
+        #    interval in that neighbourhood means the engine can close a
+        #    pooled connection in the same instant the checker reaches for
+        #    it. At interval == 5 that happened on ~4.5% of ticks: the trace
+        #    shows every healthy tick logging `reuse idle connection` then
+        #    `pooling idle connection`, and the failing tick reusing decode's
+        #    connection and never getting it back.
+        # 2. That failure is indistinguishable, to the checker, from the
+        #    worker being down. With one replica of a role there is nothing
+        #    to fail over to, so the ejection is not failover, it is an
+        #    outage — the next request got "Decode policy failed to select a
+        #    worker", a 503 in the playground, from an engine that was
+        #    perfectly healthy. Reproduced 1 of 2 times at 25-30 minutes idle.
         #
-        # Below: it must stay comfortably UNDER the engine's HTTP
-        # keep-alive timeout, which is uvicorn's default of 5s and which
-        # neither vLLM nor SGLang changes. The router pools connections to
-        # its workers, so if the interval equals the keep-alive the server
-        # may close a pooled connection in the same instant the checker
-        # reaches for it — every tick becomes a coin flip on a stale socket.
+        # A long interval has none of this: at 60s the pooled connection is
+        # reliably gone and cleanly reopened, which is the path that never
+        # failed once in the trace. The hazard is the *boundary*, not the
+        # slowness.
         #
-        # Measured, and it reached a user: with interval == 5 == keep-alive,
-        # a health check on decode reused a connection the engine had just
-        # closed and never got it back, ~4.5% of ticks. One failed check was
-        # enough to eject decode (the threshold was 1 then), and with a
-        # single decode replica there was nothing to fail over to — the next
-        # request got "Decode policy failed to select a worker", a 503 in
-        # the playground, from a decode engine that was perfectly healthy.
+        # ⚠️ The measurement that originally justified overriding the health
+        # check does not survive re-reading. It recorded ">50% of requests
+        # returning 500 for over a minute after killing one prefill" and
+        # attributed it to `--health-check-interval-secs` defaulting to 60 —
+        # but five values were changed together, with no single-variable
+        # control, and the verification was 8 requests. `cb-failure-threshold`
+        # defaults to 10, so with half of ~8 requests reaching the dead
+        # prefill the breaker never came close to opening. The value that
+        # actually mattered was very probably this one, not the interval.
         #
-        # 3s keeps the pooled connection refreshed well inside the 5s window,
-        # so it stays genuinely alive instead of being raced.
-        - --health-check-interval-secs
-        - "3"
-        # Upstream's default, and deliberately back to it. At 1, a single
-        # slow or stale-socket reply ejects the worker — and for a role with
-        # one replica ejection is not failover, it is an outage, because
-        # there is nothing to fail over to. Three consecutive misses at a 3s
-        # interval is 9s to condemn a genuinely dead worker, a window the
-        # circuit breaker already covers on the request path.
-        #
-        # This is also where the tolerance for a slow /health now lives.
-        # It belongs here rather than in the timeout below: a threshold
-        # distinguishes "blip" from "down", a timeout cannot.
-        - --health-failure-threshold
-        - "3"
-        # Upstream defaults this to 2, which with the above is asymmetric in
-        # the wrong direction: slow to condemn but also slow to forgive, so
-        # a worker that recovers stays out for another interval. That pairing
-        # is exactly what turned the stale-socket blip above into a 503 —
-        # ejected on one check, restored only on the second. Restore on the
-        # first success instead; a worker that flaps is the circuit breaker's
-        # problem, and it is already watching.
-        - --health-success-threshold
-        - "1"
-        # Strictly under the interval, or checks overlap. Its job is only to
-        # stop a check hanging past the next tick — the tolerance for a slow
-        # reply is the threshold above, not this.
-        - --health-check-timeout-secs
-        - "2"
+        # ⇒ Do not re-add health-check overrides without a single-variable
+        # measurement that isolates them from the breaker.
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries
@@ -404,24 +387,14 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
-        # The same hardening as the vLLM recipe, for the same reason and
-        # from the same source: `vllm-project/router` is a fork of this
-        # gateway, and its resilience defaults are these ones verbatim
-        # (`health_check_interval_secs = 60`, `health_failure_threshold =
-        # 3`, `health_success_threshold = 2`, `cb_failure_threshold = 10`).
-        # The >60s of 500s measured after killing a prefill on the vLLM
-        # side is therefore this path's behaviour too, unmeasured only
-        # because nobody has killed a prefill here yet. Leaving it to be
-        # discovered in production would be a choice, not an omission.
-        # See the vllm-nixl recipe for why each value is what it is.
-        - --health-check-interval-secs
-        - "3"
-        - --health-failure-threshold
-        - "3"
-        - --health-success-threshold
-        - "1"
-        - --health-check-timeout-secs
-        - "2"
+        # The same two values as the vLLM recipe, and for the same reason.
+        # `vllm-project/router` is a fork of this gateway, so its defaults
+        # are this one's verbatim — `cb_failure_threshold = 10`,
+        # `retry_max_retries = 5`, `health_check_interval_secs = 60`. A
+        # breaker that needs ten failures to open is ten users' requests
+        # spent learning what two would have taught it, and that is as true
+        # here as there. See the vllm-nixl recipe for why the health check
+        # is deliberately left alone.
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries
@@ -494,24 +467,14 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
-        # The same hardening as the vLLM recipe, for the same reason and
-        # from the same source: `vllm-project/router` is a fork of this
-        # gateway, and its resilience defaults are these ones verbatim
-        # (`health_check_interval_secs = 60`, `health_failure_threshold =
-        # 3`, `health_success_threshold = 2`, `cb_failure_threshold = 10`).
-        # The >60s of 500s measured after killing a prefill on the vLLM
-        # side is therefore this path's behaviour too, unmeasured only
-        # because nobody has killed a prefill here yet. Leaving it to be
-        # discovered in production would be a choice, not an omission.
-        # See the vllm-nixl recipe for why each value is what it is.
-        - --health-check-interval-secs
-        - "3"
-        - --health-failure-threshold
-        - "3"
-        - --health-success-threshold
-        - "1"
-        - --health-check-timeout-secs
-        - "2"
+        # The same two values as the vLLM recipe, and for the same reason.
+        # `vllm-project/router` is a fork of this gateway, so its defaults
+        # are this one's verbatim — `cb_failure_threshold = 10`,
+        # `retry_max_retries = 5`, `health_check_interval_secs = 60`. A
+        # breaker that needs ten failures to open is ten users' requests
+        # spent learning what two would have taught it, and that is as true
+        # here as there. See the vllm-nixl recipe for why the health check
+        # is deliberately left alone.
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries

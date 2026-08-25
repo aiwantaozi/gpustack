@@ -96,78 +96,44 @@ def test_the_routers_own_placeholders_resolve():
     assert "40040" in plan.command
 
 
-def test_the_measured_failure_detection_values_are_carried():
-    """Not tuning. With the router's own defaults, killing one prefill left
-    >50% of requests returning 500 for over a minute — the health check
-    interval alone defaults to 60s. With these, the same run stayed 8/8."""
-    plan = render_router(get_pd_mode("vllm-nixl"), VARIABLES, PEERS)
-    command = plan.command
+ROUTER_MODES = ["vllm-nixl", "sglang-mooncake", "sglang-nixl"]
 
-    # Bounded above by the measurement, below by the engine's keep-alive —
-    # see test_the_health_interval_stays_under_the_engines_keep_alive.
-    assert int(command[command.index("--health-check-interval-secs") + 1]) <= 5
+
+@pytest.mark.parametrize("mode", ROUTER_MODES)
+def test_the_breaker_is_what_carries_fast_failure_detection(mode):
+    """Upstream opens the circuit breaker after ten failures, which is ten
+    users' requests spent learning what two would have taught it. This is the
+    fast path — it runs on the request path and sees a dead worker at real
+    traffic rate — so it is the one value worth overriding."""
+    command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
+
+    assert command[command.index("--cb-failure-threshold") + 1] == "2"
     assert command[command.index("--retry-max-retries") + 1] == "3"
 
 
-def test_ejection_tolerates_a_blip_and_restores_on_one_success():
-    """A role with one replica has nothing to fail over to, so ejecting it is
-    not failover, it is an outage. The health check is the background sweep;
-    the circuit breaker is the fast path, and it runs on real traffic. Letting
-    the health check try to be fast too is what a threshold of 1 did."""
-    command = render_router(get_pd_mode("vllm-nixl"), VARIABLES, PEERS).command
+@pytest.mark.parametrize("mode", ROUTER_MODES)
+def test_the_health_check_is_left_to_the_router(mode):
+    """The regression this guards is re-adding a short health-check interval,
+    which reads like an obvious improvement and is not.
 
-    assert command[command.index("--health-failure-threshold") + 1] == "3"
-    # Asymmetric in the other direction is the bug: slow to condemn AND slow
-    # to forgive leaves a recovered worker out for another whole interval.
-    assert command[command.index("--health-success-threshold") + 1] == "1"
-
-
-# uvicorn's default, which is what both vLLM and SGLang serve behind and
-# neither overrides. Not a number we control — a property of the thing on the
-# other end of the connection.
-ENGINE_KEEP_ALIVE_SECS = 5
-
-
-@pytest.mark.parametrize("mode", ["vllm-nixl", "sglang-mooncake", "sglang-nixl"])
-def test_the_health_interval_stays_under_the_engines_keep_alive(mode):
-    """The bound nobody remembers, so it is pinned rather than commented.
-
-    The router pools its connections to workers. With the interval equal to
-    the engine's keep-alive, the engine may close a pooled connection in the
-    same instant the checker reaches for it, and the check fails on a socket
-    rather than on the worker. Measured at ~4.5% of ticks, and it reached a
-    user: one such failure ejected a single-replica decode and the next
+    A short interval lands near the engine's HTTP keep-alive — uvicorn's
+    default 5s, which neither vLLM nor SGLang overrides — and the router pools
+    its connections to workers. At interval == 5 the engine closed a pooled
+    connection as the checker reached for it on ~4.5% of ticks, and with one
+    replica of a role an ejection is not failover but an outage: the next
     request came back 503 from an engine that was perfectly healthy.
 
-    Also strictly under the interval on the other side, or checks overlap.
+    Fast detection is the breaker's job, above. The health check is allowed to
+    be slow, and at 60s it is also nowhere near the keep-alive boundary.
     """
     command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
-    interval = int(command[command.index("--health-check-interval-secs") + 1])
-    timeout = int(command[command.index("--health-check-timeout-secs") + 1])
 
-    assert interval < ENGINE_KEEP_ALIVE_SECS, (
-        f"{mode}: a {interval}s interval races the engine's "
-        f"{ENGINE_KEEP_ALIVE_SECS}s keep-alive"
+    overrides = [c for c in command if str(c).startswith("--health")]
+    assert not overrides, (
+        f"{mode} overrides {overrides}; fast failure detection belongs to the "
+        "circuit breaker. Re-adding these needs a single-variable measurement "
+        "that isolates them from it."
     )
-    assert timeout < interval, f"{mode}: checks would overlap"
-
-
-@pytest.mark.parametrize("mode", ["sglang-mooncake", "sglang-nixl"])
-def test_the_sglang_routers_are_hardened_too(mode):
-    """`vllm-project/router` is a fork of this gateway and its resilience
-    defaults are these ones verbatim, so the >60s of 500s measured on the vLLM
-    side is this path's behaviour too — unmeasured only because nobody has
-    killed a prefill here yet."""
-    command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
-
-    for flag, value in (
-        ("--health-check-interval-secs", "3"),
-        ("--health-failure-threshold", "3"),
-        ("--health-success-threshold", "1"),
-        ("--cb-failure-threshold", "2"),
-        ("--retry-max-retries", "3"),
-    ):
-        assert command[command.index(flag) + 1] == value
 
 
 def test_capabilities_come_from_the_catalog_not_from_assumption():

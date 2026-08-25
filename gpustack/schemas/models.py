@@ -941,6 +941,34 @@ def find_role(model, role_name: Optional[str]) -> Optional[RoleSpec]:
     return None
 
 
+def servable_instances(model, instances):
+    """The members that can answer a whole request for `model`.
+
+    For a role-bearing group that is the router alone. Every member serves an
+    OpenAI-shaped API on its own port, so handing a request to any of them
+    succeeds — a prefill returns after a single token, a decode runs without
+    the prefix its KV was meant to carry, and both answer 200 with plausible
+    text. Balancing across the group therefore does not fail; it silently
+    answers two thirds of requests wrongly.
+
+    One function, because there are two places that route to an instance — the
+    gateway's upstream registration and the direct proxy — and a rule this
+    consequential must not be able to hold in one and not the other.
+
+    A group with no running router yields nothing rather than falling back to
+    its GPU members: there is no member of a group that can serve alone, so an
+    empty result is the honest answer and the caller reports the group as
+    unavailable.
+    """
+    if not getattr(model, "roles", None):
+        return list(instances)
+    return [
+        instance
+        for instance in instances
+        if getattr(instance, "role", None) == RoleNameEnum.ROUTER.value
+    ]
+
+
 def role_takes_no_accelerator(model, role_name: Optional[str]) -> bool:
     """Whether this role should be placed without claiming any GPU.
 

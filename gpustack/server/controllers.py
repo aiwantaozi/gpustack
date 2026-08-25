@@ -44,6 +44,7 @@ from gpustack.schemas.principals import (
     platform_principal_id,
 )
 from gpustack.schemas.models import (
+    servable_instances,
     BackendEnum,
     BackendSourceEnum,
     DegradationReasonEnum,
@@ -201,11 +202,7 @@ def _gateway_registrable_instances(
     back to its GPU members, for the same reason: there is no member that can
     correctly answer a whole request on its own.
     """
-    if not model.roles:
-        return instances
-    return [
-        instance for instance in instances if instance.role == RoleNameEnum.ROUTER.value
-    ]
+    return servable_instances(model, instances)
 
 
 # The bus speaks CREATED/UPDATED/DELETED and the work queue speaks

@@ -43,6 +43,7 @@ from gpustack.schemas.runner_source import (
 )
 from gpustack.schemas.models import (
     get_backend,
+    role_takes_no_accelerator,
     BackendEnum,
     ModelInstance,
     ModelInstanceUpdate,
@@ -843,6 +844,19 @@ class InferenceServer(ABC):
         """
         resources = ContainerResources()
         if getattr(self._model, "gpu_type_selector", None) is not None:
+            # A role that takes no accelerator must not claim a slice either,
+            # and `gpu_type_selector` is a Model-level field that every role
+            # inherits by projection. Measured on a live cluster: the scheduler
+            # correctly placed a managed router with no VRAM claim, the
+            # container asked for one anyway, and the device plugin handed it
+            # 40% of a card that its own prefill and decode were sharing.
+            # Nothing failed — the group ran — which is why this needs saying
+            # rather than catching.
+            if role_takes_no_accelerator(
+                self._model_spec or self._model,
+                getattr(self._model_instance, "role", None),
+            ):
+                return resources
             return self._get_vgpu_configured_resources(resources)
         gpu_devices = self._get_selected_gpu_devices()
         if gpu_devices:

@@ -282,3 +282,50 @@ def test_non_vgpu_workload_instance_type_untouched(passthrough_transform):
 
     assert plan.instance_type is None
     assert plan.labels is None
+
+
+def test_a_role_that_takes_no_accelerator_claims_no_slice():
+    """`gpu_type_selector` is a Model-level field every role inherits by
+    projection, so a managed router asked the device plugin for a slice of the
+    very card its own prefill and decode were sharing. Measured on a live
+    cluster: the scheduler had correctly placed it with no VRAM claim, the
+    container asked anyway, and nothing failed — the group ran, one card
+    carrying three 40% claims where two were intended."""
+    from types import SimpleNamespace
+
+    from gpustack.schemas.models import (
+        DisaggregationSpec,
+        GPUTypeSelector,
+        Model,
+        PDModeEnum,
+        RoleSpec,
+        SourceEnum,
+    )
+    from gpustack.worker.backends.base import InferenceServer
+
+    model = Model(
+        id=1,
+        name="m",
+        source=SourceEnum.HUGGING_FACE,
+        huggingface_repo_id="org/repo",
+        gpu_type_selector=GPUTypeSelector(
+            type="a-pool", accelerator_sliced_memory_percentage=40
+        ),
+        roles=[
+            RoleSpec(name="prefill", replicas=1),
+            RoleSpec(name="router", replicas=1),
+        ],
+        disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
+    )
+
+    def _resources(role):
+        fake = SimpleNamespace(
+            _model=model,
+            _model_spec=model,
+            _model_instance=SimpleNamespace(role=role),
+            _get_vgpu_configured_resources=lambda r: "asked-for-a-slice",
+        )
+        return InferenceServer._get_configured_resources(fake)
+
+    assert _resources("router") != "asked-for-a-slice"
+    assert _resources("prefill") == "asked-for-a-slice"

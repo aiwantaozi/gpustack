@@ -261,7 +261,7 @@ class PDGroupObservation(BaseModel):
 def sum_samples(
     families: Optional[Mapping[str, Any]],
     name: Optional[str],
-    label_filter: Optional[Tuple[str, str]] = None,
+    label_filter: Optional[Mapping[str, str]] = None,
 ) -> Optional[float]:
     """Total of every sample named `name` in a parsed exposition.
 
@@ -282,10 +282,10 @@ def sum_samples(
         for sample in getattr(family, "samples", []):
             if sample.name != name:
                 continue
-            if label_filter is not None:
-                key, value = label_filter
-                if sample.labels.get(key) != value:
-                    continue
+            if label_filter and any(
+                sample.labels.get(key) != value for key, value in label_filter.items()
+            ):
+                continue
             total = (total or 0.0) + sample.value
     return total
 
@@ -308,10 +308,15 @@ def read_engine(
         address=address,
     )
     if metrics is not None:
-        reading.transfers = sum_samples(families, metrics.xfer_count)
-        reading.seconds = sum_samples(families, metrics.xfer_seconds)
-        reading.transferred_bytes = sum_samples(families, metrics.xfer_bytes)
-        reading.failed_transfers = sum_samples(families, metrics.failed_transfers)
+        # The same selector for all four: they are suffixes of one family
+        # wherever a selector is needed at all.
+        labels = metrics.sample_labels
+        reading.transfers = sum_samples(families, metrics.xfer_count, labels)
+        reading.seconds = sum_samples(families, metrics.xfer_seconds, labels)
+        reading.transferred_bytes = sum_samples(families, metrics.xfer_bytes, labels)
+        reading.failed_transfers = sum_samples(
+            families, metrics.failed_transfers, labels
+        )
     # Scraped from both roles rather than from the side that "should" hold
     # the lease: whichever side does not export it simply has no sample, so
     # summing both is right either way and does not encode a guess.

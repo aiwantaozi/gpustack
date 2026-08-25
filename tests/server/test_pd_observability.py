@@ -359,14 +359,15 @@ def test_a_router_declaring_no_metrics_has_no_denominator():
     assert read_router_requests(parse(router_exposition(("w", 1.0))), ascend) is None
 
 
-def test_unverified_counter_names_are_left_undeclared():
-    """SGLang's gateway is the same codebase as vllm-router, but its counter
-    names were never measured here. Guessing them would give a denominator
-    that reads zero for the wrong reason."""
+def test_a_declared_counter_name_is_one_that_was_measured():
+    """The catalog left SGLang's undeclared until someone ran it, on the
+    grounds that a guessed name reads zero for the wrong reason. Running it
+    proved the caution right: despite the shared codebase the prefix is
+    `smg_`, not vllm-router's `vllm_router_`."""
     sglang = get_pd_mode(PDModeEnum.SGLANG_MOONCAKE.value)
     assert sglang.router.capabilities.metrics is True
-    assert sglang.router.request_metrics.available is False
-    assert read_router_requests(parse(router_exposition(("w", 1.0))), sglang) is None
+    assert sglang.router.request_metrics.available is True
+    assert sglang.router.request_metrics.total_requests == "smg_router_requests_total"
 
 
 def test_without_a_denominator_the_absolute_count_is_reported_as_such():
@@ -839,3 +840,58 @@ async def test_the_degradation_survives_the_database(db_session):
     assert "12%" in reloaded.state_message
     # Unchanged world, nothing to write: otherwise every pass churns watchers.
     assert await sync_model_status(db_session, reloaded) is False
+
+
+def test_one_family_many_stages_counts_only_the_transfer_stage():
+    """SGLang puts every stage of a request in one histogram and separates
+    them by label. Summed unselected, a single request contributes to
+    decode_prepare, decode_bootstrap, decode_waiting, decode_transferred and
+    fake_output alike — five times the transfers, which as a numerator reads
+    as an effectiveness well above 1 on a group that is merely working."""
+    from gpustack.server.pd_observability import sum_samples
+
+    stages = (
+        "decode_prepare",
+        "decode_bootstrap",
+        "decode_waiting",
+        "decode_transferred",
+        "fake_output",
+    )
+    exposition = (
+        "# TYPE sglang:per_stage_req_latency_seconds histogram\n"
+        + "\n".join(
+            f'sglang:per_stage_req_latency_seconds_count{{stage="{stage}"}} 12.0'
+            for stage in stages
+        )
+        + "\n"
+    )
+    families = parse(exposition)
+
+    unselected = sum_samples(families, "sglang:per_stage_req_latency_seconds_count")
+    selected = sum_samples(
+        families,
+        "sglang:per_stage_req_latency_seconds_count",
+        {"stage": "decode_transferred"},
+    )
+
+    assert unselected == 60.0
+    assert selected == 12.0
+
+
+def test_a_selector_that_matches_nothing_reads_absent_not_zero():
+    """The distinction the whole module rests on: absent means the counter is
+    not exported, zero means it is and nothing moved. A mistyped stage must
+    land on the first, or a working group reports the failure being hunted."""
+    from gpustack.server.pd_observability import sum_samples
+
+    families = parse(
+        "# TYPE sglang:per_stage_req_latency_seconds histogram\n"
+        'sglang:per_stage_req_latency_seconds_count{stage="decode_transferred"} 5.0\n'
+    )
+
+    assert (
+        sum_samples(
+            families, "sglang:per_stage_req_latency_seconds_count", {"stage": "typo"}
+        )
+        is None
+    )

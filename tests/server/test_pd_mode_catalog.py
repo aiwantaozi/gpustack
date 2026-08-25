@@ -614,11 +614,19 @@ def test_the_ratios_denominator_is_declared_per_router():
     # nothing but still answers whether anything was routed.
     assert nixl.total_requests == "vllm_router_pd_requests_total"
 
-    # SGLang's gateway is the same codebase, but its counter names were
-    # never measured here, and a guessed name gives a denominator that reads
-    # zero for the wrong reason.
+    # SGLang's gateway is the same codebase, and the names are still NOT the
+    # same — this one prefixes `smg_`, vllm-router `vllm_router_`. So the
+    # guess the catalog used to refuse to make would have read zero, which is
+    # exactly why it refused. Declared now because measured, not inferred.
     for name in (PDModeEnum.SGLANG_MOONCAKE.value, PDModeEnum.SGLANG_NIXL.value):
-        assert get_pd_mode(name).router.request_metrics.available is False
+        sglang = get_pd_mode(name).router.request_metrics
+        assert sglang.available is True
+        assert sglang.total_requests == "smg_router_requests_total"
+        assert not sglang.total_requests.startswith("vllm_router")
+        # Its exposition is a second listener on a band GPUStack allocates:
+        # measured, the router binds the hardcoded 29000 when left alone, so
+        # two groups on a host would collide and the serving port 404s.
+        assert sglang.port_band == "prometheus"
 
     # The Ascend proxy serves no /metrics at all, so it has no denominator
     # by capability rather than by omission.

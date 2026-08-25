@@ -231,6 +231,18 @@ class PDTransferMetrics(BaseModel):
 
     failed_transfers: Optional[str] = None
 
+    sample_labels: Optional[Dict[str, str]] = None
+    """Labels a sample must carry to be counted, for engines that put every
+    stage of a request in ONE family and separate them by label.
+
+    SGLang is why this exists. It exports a single
+    ``sglang:per_stage_req_latency_seconds`` histogram and distinguishes
+    ``stage="decode_bootstrap"`` from ``stage="decode_transferred"`` — so
+    summing the family without a selector counts every stage of every request
+    and yields a number several times the transfer count, which as a numerator
+    reads as an effectiveness ratio well above 1. Null for connectors like NIXL
+    that give each counter its own name."""
+
     min_expected_rate: Optional[float] = None
     """Coarse floor for the first-deployment case the baseline method
     cannot see (a group that was already degraded when its baseline was

@@ -160,19 +160,47 @@ kv_transfer_metrics:
     xfer_bytes: null
     failed_transfers: null
   - connector: sglang-mooncake
-    # SGLang's disaggregation counters were never verified here. Declaring
-    # guessed names would give a numerator that reads zero because the name
-    # was wrong — indistinguishable from the failure being detected — so the
-    # ratio degrades visibly to "not measurable" instead.
+    # 🟢 Measured 2026-08-25 on a live 1P1D (SGLang 0.5.15.post1,
+    # Qwen3-0.6B), replacing "never verified here". Both stage counters
+    # advanced by exactly the request count — 7 -> 12 over a burst of 5 — on
+    # prefill and decode alike. That BOTH sides count is the difference from
+    # NIXL, where a pull-based transfer is only ever counted on decode: here
+    # the bootstrap is a handshake both participate in. Decode stays the side
+    # read, so the reading remains comparable to the NIXL path's and
+    # `read_from_role` keeps one meaning across connectors.
+    #
+    # Every stage of a request lands in ONE family, told apart by label, which
+    # is what `sample_labels` is for: summed unselected this also counts
+    # decode_prepare, decode_bootstrap, decode_waiting and fake_output, and
+    # returns roughly five times the transfers — a numerator that yields an
+    # "effectiveness" well above 1.
     read_from_role: decode
-    xfer_count: null
-    xfer_seconds: null
+    xfer_count: "sglang:per_stage_req_latency_seconds_count"
+    xfer_seconds: "sglang:per_stage_req_latency_seconds_sum"
+    sample_labels:
+      stage: decode_transferred
     xfer_bytes: null
     failed_transfers: null
   - connector: sglang-nixl
+    # 🟢 Measured 2026-08-25 on a live 1P1D (SGLang 0.5.15.post1,
+    # Qwen3-0.6B), replacing "never verified here". Both stage counters
+    # advanced by exactly the request count — 7 -> 12 over a burst of 5 — on
+    # prefill and decode alike. That BOTH sides count is the difference from
+    # NIXL, where a pull-based transfer is only ever counted on decode: here
+    # the bootstrap is a handshake both participate in. Decode stays the side
+    # read, so the reading remains comparable to the NIXL path's and
+    # `read_from_role` keeps one meaning across connectors.
+    #
+    # Every stage of a request lands in ONE family, told apart by label, which
+    # is what `sample_labels` is for: summed unselected this also counts
+    # decode_prepare, decode_bootstrap, decode_waiting and fake_output, and
+    # returns roughly five times the transfers — a numerator that yields an
+    # "effectiveness" well above 1.
     read_from_role: decode
-    xfer_count: null
-    xfer_seconds: null
+    xfer_count: "sglang:per_stage_req_latency_seconds_count"
+    xfer_seconds: "sglang:per_stage_req_latency_seconds_sum"
+    sample_labels:
+      stage: decode_transferred
     xfer_bytes: null
     failed_transfers: null
 
@@ -378,6 +406,14 @@ modes:
     router:
       protocol: same_dispatch
       image: "{{runner_image}}"
+      ports:
+        # Measured: without --prometheus-port the router still binds, on the
+        # hardcoded 29000 — `sglang::router` was found listening on
+        # 0.0.0.0:29000 while its own port served /metrics as 404. So a second
+        # PD group's router on the same host collides, and anything scraping
+        # the router's serving port finds nothing. Same defect the vLLM recipe
+        # already fixed, never applied here because this path had never run.
+        - { name: prometheus, count: 1, inject_to: args }
       command:
         - python3
         - -m
@@ -387,6 +423,13 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+        # A bind address, not just an advertised one: left unset the exposition
+        # is reachable only from the router's own netns, which puts the
+        # PD-effectiveness denominator out of reach of the server.
+        - --prometheus-host
+        - "{{worker_ip}}"
+        - --prometheus-port
+        - "{{ports.prometheus}}"
         # The same two values as the vLLM recipe, and for the same reason.
         # `vllm-project/router` is a fork of this gateway, so its defaults
         # are this one's verbatim — `cb_failure_threshold = 10`,
@@ -413,11 +456,21 @@ modes:
         models_endpoint: true
         # SGLang's Mooncake path exports no KV-expiry counter.
         kv_expired_metric: false
-      # No request_metrics: vllm-router is a fork of this gateway and the
-      # counter names should be the same shape, but "should" was never
-      # measured on this side. An unverified name yields a denominator that
-      # reads zero for the wrong reason, so the ratio is reported as not
-      # measurable until someone runs it.
+      # 🟢 Measured 2026-08-25, replacing "never measured on this side". The
+      # names are NOT vllm-router's despite the shared ancestry — this gateway
+      # prefixes `smg_` and vllm-router `vllm_router_`, so the guess the
+      # comment refused to make would indeed have read zero.
+      #
+      # Per-worker is `smg_worker_cb_outcomes_total`, whose `worker` label
+      # carries the whole peer URL the router was launched with, which is the
+      # shape `worker_label` already expects. It counts circuit-breaker
+      # outcomes rather than dispatches — the closest per-worker series this
+      # router exports — so the group total below is the reliable denominator
+      # and the per-worker split is the hint.
+      request_metrics:
+        total_requests: "smg_router_requests_total"
+        worker_label: worker
+        port_band: prometheus
       health_path: /health
 
   - name: sglang-nixl
@@ -461,6 +514,14 @@ modes:
     router:
       protocol: same_dispatch
       image: "{{runner_image}}"
+      ports:
+        # Measured: without --prometheus-port the router still binds, on the
+        # hardcoded 29000 — `sglang::router` was found listening on
+        # 0.0.0.0:29000 while its own port served /metrics as 404. So a second
+        # PD group's router on the same host collides, and anything scraping
+        # the router's serving port finds nothing. Same defect the vLLM recipe
+        # already fixed, never applied here because this path had never run.
+        - { name: prometheus, count: 1, inject_to: args }
       command:
         - python3
         - -m
@@ -470,6 +531,13 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+        # A bind address, not just an advertised one: left unset the exposition
+        # is reachable only from the router's own netns, which puts the
+        # PD-effectiveness denominator out of reach of the server.
+        - --prometheus-host
+        - "{{worker_ip}}"
+        - --prometheus-port
+        - "{{ports.prometheus}}"
         # The same two values as the vLLM recipe, and for the same reason.
         # `vllm-project/router` is a fork of this gateway, so its defaults
         # are this one's verbatim — `cb_failure_threshold = 10`,
@@ -493,6 +561,21 @@ modes:
         metrics: true
         models_endpoint: true
         kv_expired_metric: false
+      # 🟢 Measured 2026-08-25, replacing "never measured on this side". The
+      # names are NOT vllm-router's despite the shared ancestry — this gateway
+      # prefixes `smg_` and vllm-router `vllm_router_`, so the guess the
+      # comment refused to make would indeed have read zero.
+      #
+      # Per-worker is `smg_worker_cb_outcomes_total`, whose `worker` label
+      # carries the whole peer URL the router was launched with, which is the
+      # shape `worker_label` already expects. It counts circuit-breaker
+      # outcomes rather than dispatches — the closest per-worker series this
+      # router exports — so the group total below is the reliable denominator
+      # and the per-worker split is the hint.
+      request_metrics:
+        total_requests: "smg_router_requests_total"
+        worker_label: worker
+        port_band: prometheus
       health_path: /health
 
   - name: vllm-ascend-mooncake

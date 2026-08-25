@@ -22,6 +22,7 @@ from gpustack.schemas.common import Pagination
 from gpustack.schemas.inference_backend import is_custom_backend
 from gpustack.schemas.models import (
     ModelInstance,
+    ModelInstanceStateEnum,
     ModelInstancesPublic,
     BackendEnum,
     ModelListParams,
@@ -503,6 +504,8 @@ def validate_roles(  # noqa: C901
             message="A disaggregated model has at most one router."
         )
 
+    _reject_cache_and_connector_on_one_flag(field, roles, disaggregation)
+
     # A recipe injects one engine's connector configuration into every role,
     # so a role on a different engine would receive settings it cannot read.
     permitted = PD_MODE_BACKENDS.get(disaggregation.mode.value, [])
@@ -519,6 +522,58 @@ def validate_roles(  # noqa: C901
                         f"connection parameters are yours to supply."
                     )
                 )
+
+
+def _reject_cache_and_connector_on_one_flag(field, roles, disaggregation) -> None:
+    """An extended KV cache and a PD connector cannot share one deployment.
+
+    Both are written into ``--kv-transfer-config``, and vLLM reads that flag
+    once, so the second one is silently dropped — the deployment starts and
+    serves with whichever won. The worker already refuses to build such a
+    command, but refusing there means two containers are scheduled, given
+    accelerators, and then fail; the constraint is knowable from the spec
+    alone, so it belongs at save time where the message can name the field to
+    change instead of appearing as a crashed member.
+
+    Mirrors the worker's condition rather than restating it: the conflict
+    exists only where the *catalog* gives that role a connector. SGLang's
+    recipes configure disaggregation through their own flags and never touch
+    `--kv-transfer-config`, and `custom` injects nothing at all — which is why
+    the message can offer it as the way out.
+    """
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    try:
+        mode = get_pd_mode(disaggregation.mode.value)
+    except Exception:
+        # An unknown mode is the previous check's to report, not this one's.
+        return
+
+    model_cache = field("extended_kv_cache")
+    for role in roles:
+        role_spec = (mode.roles or {}).get(role.name)
+        if role_spec is None or not role_spec.connector:
+            continue
+        # The role-effective value: a role that declares its own overrides the
+        # deployment's, including overriding it to "off".
+        cache = (
+            role.extended_kv_cache
+            if role.extended_kv_cache is not None
+            else model_cache
+        )
+        if cache is None or not getattr(cache, "enabled", False):
+            continue
+        raise BadRequestException(
+            message=(
+                f"Role '{role.name}' enables the extended KV cache while pd "
+                f"mode '{disaggregation.mode.value}' configures a KV connector. "
+                "Both are written into --kv-transfer-config and the engine "
+                "reads it once, so one would be silently dropped. Turn the "
+                "extended KV cache off for this deployment or for this role, "
+                "or use pd mode 'custom', which injects no connector and "
+                "leaves the flag to you."
+            )
+        )
 
 
 # Engine parameters that must agree between prefill and decode, with the
@@ -1465,7 +1520,22 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
             session, model.owner_principal_id, model.cluster_id
         ),
     )
-    if digests == {target} and not drifted:
+    # A member in ERROR is not running the current configuration; it is not
+    # running anything. Reporting "already run the current configuration" to
+    # someone whose group is half down is not merely unhelpful, it is untrue —
+    # and it leaves the operation they reached for with nothing to do. The
+    # group is torn down and rebuilt, which is what a restart of a group has
+    # always meant here.
+    #
+    # No thrash risk in making this a reason to act: this endpoint is only
+    # ever reached by an explicit request. Automatic recovery of a crashed
+    # member is the worker's, and it has its own crash-loop brake.
+    failed = [
+        instance.name
+        for instance in instances
+        if instance.state == ModelInstanceStateEnum.ERROR
+    ]
+    if digests == {target} and not drifted and not failed:
         return ModelRestartResult(
             spec_digest=target,
             restarted=False,
@@ -1485,14 +1555,28 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         spec_digest=target,
         restarted=True,
         deleted_instances=deleted,
-        message=(
+        message=_restart_message(drifted and digests == {target}, failed),
+    )
+
+
+def _restart_message(moved: bool, failed: List[str]) -> str:
+    """Say which of the three reasons to act applied, because they lead to
+    different next steps: a spec change is expected to fix itself, a placement
+    move needs nothing further, and a failed member usually means the reason
+    it failed is still there."""
+    if failed:
+        return (
+            f"Instances retired, including {len(failed)} in error "
+            f"({', '.join(sorted(failed))}); the group will re-form on the "
+            "current configuration. A member that failed for a reason still "
+            "present will fail again — check its log before retrying."
+        )
+    if moved:
+        return (
             "Instances retired; the group will re-form in its tenant's "
             "namespace on the current configuration."
-            if drifted and digests == {target}
-            else "Instances retired; the group will re-form on the current "
-            "configuration."
-        ),
-    )
+        )
+    return "Instances retired; the group will re-form on the current configuration."
 
 
 @router.delete(

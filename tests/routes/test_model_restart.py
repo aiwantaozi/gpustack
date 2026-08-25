@@ -232,3 +232,41 @@ async def test_a_docker_deployment_never_looks_drifted():
 
     assert result.restarted is False
     assert deleted == []
+
+
+# --- a member that is not running anything --------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_group_with_a_failed_member_is_restarted():
+    """Reporting "already run the current configuration" to someone whose
+    group is half down is not merely unhelpful, it is untrue: a member in
+    ERROR is not running that configuration, it is not running anything. And
+    it left the one operation they reached for with nothing to do."""
+    model = _model()
+    instances = [
+        _instance(1, spec_digest=TARGET),
+        _instance(2, spec_digest=TARGET),
+    ]
+    instances[1].state = ModelInstanceStateEnum.ERROR
+
+    result, deleted = await _restart(model, instances)
+
+    assert result.restarted is True
+    assert len(deleted) == 2
+    # Named, because the reason it failed is usually still there and a bare
+    # "restarted" invites an immediate retry of the same failure.
+    assert instances[1].name in result.message
+    assert "check its log" in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_converged_group_is_still_a_no_op():
+    """The failed-member reason must not cost the endpoint its idempotence."""
+    model = _model()
+    instances = [_instance(1, spec_digest=TARGET)]
+
+    result, deleted = await _restart(model, instances)
+
+    assert result.restarted is False
+    assert deleted == []

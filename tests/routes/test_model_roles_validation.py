@@ -381,3 +381,84 @@ def test_a_stored_plain_model_is_unaffected():
     )
 
     validate_roles(submitted, stored=stored)
+
+
+# --- one flag, two writers ------------------------------------------------- #
+
+
+def _cache(enabled=True):
+    from gpustack.schemas.models import ExtendedKVCacheConfig
+
+    return ExtendedKVCacheConfig(enabled=enabled)
+
+
+def test_an_extended_cache_and_a_connector_mode_are_rejected_together():
+    """Both are written into --kv-transfer-config and the engine reads it once,
+    so one is silently dropped and the deployment serves with whichever won.
+    The worker refuses to build the command, but by then two containers hold
+    accelerators — the constraint is knowable from the spec, so it is caught
+    here where the message can name the field."""
+    with rejects("--kv-transfer-config"):
+        validate_roles(
+            _model(
+                extended_kv_cache=_cache(),
+                roles=[RoleSpec(name="prefill"), RoleSpec(name="decode")],
+                disaggregation=_pd(),
+            )
+        )
+
+
+def test_a_role_may_turn_the_cache_off_and_be_accepted():
+    """A role that declares its own overrides the deployment's, including
+    overriding it to off — the same inherit-when-None rule as everything else,
+    so the rejection has to read the effective value and not the model's."""
+    validate_roles(
+        _model(
+            extended_kv_cache=_cache(),
+            roles=[
+                RoleSpec(name="prefill", extended_kv_cache=_cache(enabled=False)),
+                RoleSpec(name="decode", extended_kv_cache=_cache(enabled=False)),
+            ],
+            disaggregation=_pd(),
+        )
+    )
+
+
+def test_a_role_that_turns_it_on_is_rejected_even_when_the_model_has_none():
+    with rejects("--kv-transfer-config"):
+        validate_roles(
+            _model(
+                roles=[
+                    RoleSpec(name="prefill", extended_kv_cache=_cache()),
+                    RoleSpec(name="decode"),
+                ],
+                disaggregation=_pd(),
+            )
+        )
+
+
+def test_custom_mode_injects_no_connector_so_the_pair_is_allowed():
+    """`custom` is the escape hatch the message offers, so it has to actually
+    be one."""
+    validate_roles(
+        _model(
+            backend=None,
+            extended_kv_cache=_cache(),
+            roles=[RoleSpec(name="prefill"), RoleSpec(name="decode")],
+            disaggregation=_pd(mode=PDModeEnum.CUSTOM),
+        )
+    )
+
+
+def test_sglang_configures_disaggregation_without_that_flag_and_is_allowed():
+    """SGLang uses its own --disaggregation-* flags and never touches
+    --kv-transfer-config, so there is no conflict to reject. Mirroring the
+    worker's condition rather than restating it is what keeps this true."""
+    validate_roles(
+        _model(
+            backend="SGLang",
+            extended_kv_cache=_cache(),
+            roles=[RoleSpec(name="prefill"), RoleSpec(name="decode")],
+            disaggregation=_pd(mode=PDModeEnum.SGLANG_MOONCAKE),
+        )
+    )

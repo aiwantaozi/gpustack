@@ -260,6 +260,14 @@ def apply_managed_router(
     # custom backend reads, and it is a string there. The renderer produced
     # already-separated tokens, so nothing here has to guess at quoting.
     projected.run_command = " ".join(plan.command)
+    # The group's engine parameters are not the router's. They are inherited
+    # by projection like every other Model-level field, and the custom backend
+    # appends them to whatever command it is given — which put
+    # `--max-model-len=8192` on a vllm-router invocation that has no such flag.
+    # The catalog's command is complete by construction, so there is nothing
+    # for a user parameter to add here; a router that needs its own takes the
+    # user-provided branch, where the whole command is theirs.
+    projected.backend_parameters = []
     return projected
 
 

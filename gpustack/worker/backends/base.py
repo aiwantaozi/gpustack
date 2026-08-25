@@ -212,6 +212,21 @@ class InferenceServer(ABC):
 
             self.get_model()
             self.inference_backend = inference_backend
+
+            # A managed router's image and command come from the catalog and
+            # its peers' live addresses, so they are materialised rather than
+            # stored — the addresses change on every scale.
+            #
+            # Placed exactly here, between two things that both constrain it.
+            # It must come after `inference_backend` is assigned, because
+            # resolving the runner image reads it; doing this inside
+            # `get_model()` left the image as the literal `{{runner_image}}`,
+            # which Kubernetes rejected as an invalid reference. And it must
+            # come before the fallback below, because what that fallback needs
+            # in order to synthesise a custom backend — an image and a run
+            # command — is precisely what this produces.
+            self._model = self._apply_managed_router(self._model)
+
             if (
                 not inference_backend
                 and self._model.image_name
@@ -227,16 +242,6 @@ class InferenceServer(ABC):
                 raise KeyError(
                     f"Inference backend {self._model.backend} not specified or not found"
                 )
-
-            # A managed router's image and command come from the catalog and
-            # its peers' live addresses, so they are materialised rather than
-            # stored — the addresses change on every scale. Deliberately after
-            # `inference_backend` is assigned: resolving the runner image reads
-            # it, and doing this inside `get_model()` left the image as the
-            # literal `{{runner_image}}`, which Kubernetes rejected as an
-            # invalid reference. Everything below then reads an ordinary
-            # custom-backend deployment.
-            self._model = self._apply_managed_router(self._model)
 
             logger.info("Preparing model files...")
 
@@ -593,6 +598,15 @@ class InferenceServer(ABC):
 
         peers = group_peer_addresses(members, instance.group_id, worker_ips)
         variables = self._template_variables(**self._pd_template_variables())
+        # A router's own named bands. The engine roles get these from the
+        # injector, which builds its own context; the router does not go
+        # through the injector at all, so without this its
+        # `--prometheus-port {{ports.prometheus}}` reached the container
+        # verbatim — the band was allocated and declared as a host port, and
+        # the process was told to bind a string.
+        for name, band in (instance.named_ports or {}).items():
+            variables[f"ports.{name}"] = band.base
+            variables[f"ports.{name}.count"] = band.count
         return apply_managed_router(
             model, instance.role, peers=peers, variables=variables
         )

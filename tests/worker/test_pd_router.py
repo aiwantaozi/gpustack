@@ -431,6 +431,54 @@ def test_get_model_does_not_materialise_the_router():
     text = inspect.getsource(base)
     assigned = text.index("self.inference_backend = inference_backend")
     materialised = text.index("self._model = self._apply_managed_router(self._model)")
+    fallback = text.index("backend_name=BackendEnum.CUSTOM.value")
+    guard = text.index("not specified or not found")
+
+    # After the backend registry exists — resolving the runner image reads it.
     assert (
         assigned < materialised
     ), "the router must be materialised after the backend registry exists"
+    # And before the fallback that synthesises a custom backend out of an image
+    # and a run command, because those are exactly what it produces.
+    assert (
+        materialised < fallback < guard
+    ), "the router must be materialised before the custom-backend fallback"
+
+
+def test_the_groups_engine_parameters_do_not_reach_the_router():
+    """Observed on a live pod: `--max-model-len=8192` was appended to a
+    vllm-router invocation, which has no such flag. Model-level parameters are
+    inherited by projection like any other field, and the custom backend
+    appends them to whatever command it is handed. The catalog's command is
+    complete by construction, so there is nothing for them to add."""
+    from gpustack.worker.pd_router import apply_managed_router
+
+    model = _pd_model()
+    model.backend_parameters = ["--max-model-len=8192"]
+
+    projected = apply_managed_router(model, "router", peers=PEERS, variables=VARIABLES)
+
+    assert projected.backend_parameters == []
+    assert "--max-model-len" not in projected.run_command
+    # The stored spec is untouched — a router materialisation must not reach
+    # back into what the engine members read.
+    assert model.backend_parameters == ["--max-model-len=8192"]
+
+
+def test_a_routers_own_named_band_reaches_its_command():
+    """The engine roles get `{{ports.<name>}}` from the injector, which builds
+    its own context. The router never goes through the injector, so its
+    `--prometheus-port` reached the container as the literal placeholder — the
+    band was allocated and declared as a host port, and the process was told to
+    bind a string."""
+    from gpustack.worker.pd_router import apply_managed_router
+
+    variables = dict(VARIABLES)
+    variables["ports.prometheus"] = 40002
+
+    projected = apply_managed_router(
+        _pd_model(), "router", peers=PEERS, variables=variables
+    )
+
+    assert "--prometheus-port 40002" in projected.run_command
+    assert "{{" not in projected.run_command

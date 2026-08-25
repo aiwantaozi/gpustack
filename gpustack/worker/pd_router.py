@@ -179,6 +179,11 @@ def is_managed_router(model, role_name: Optional[str]) -> bool:
     a separate boolean could disagree with that — a role marked managed while
     carrying a hand-written command would have to resolve which one wins, and
     every answer to that is surprising to somebody.
+
+    Note that only *both* opt out. Supplying one of the two leaves this
+    managed, and `apply_managed_router` then fills in the half that was left
+    open — which is what lets a router run from an image of the user's choosing
+    without also making them write the invocation.
     """
     from gpustack.schemas.models import RoleNameEnum, find_role
 
@@ -229,7 +234,7 @@ def apply_managed_router(
     scale, so storing one would be storing a value that is wrong as soon as
     anything moves.
     """
-    from gpustack.schemas.models import BackendEnum, RoleEffectiveModel
+    from gpustack.schemas.models import BackendEnum, RoleEffectiveModel, find_role
 
     if not is_managed_router(model, role_name):
         return model
@@ -255,11 +260,26 @@ def apply_managed_router(
     if plan is None:
         return projected
 
-    projected.image_name = plan.image
-    # Joined rather than kept as a list because `run_command` is the field the
-    # custom backend reads, and it is a string there. The renderer produced
-    # already-separated tokens, so nothing here has to guess at quoting.
-    projected.run_command = " ".join(plan.command)
+    # Each half yields to the role independently, and that split is what makes
+    # "bring your own router image" possible without also making the user write
+    # the invocation. The three combinations mean three different things:
+    #
+    #   image only    the binary is somewhere else — today the runner image
+    #                 does not ship `vllm-router` at all — but the catalog
+    #                 still knows how to invoke it
+    #   command only  a hand-written invocation of something already in the
+    #                 engine's runner image
+    #   both          the router is entirely theirs, and `is_managed_router`
+    #                 has already returned False, so this is not reached
+    role = find_role(model, role_name)
+    if not (role and role.image_name):
+        projected.image_name = plan.image
+    if not (role and role.run_command):
+        # Joined rather than kept as a list because `run_command` is the field
+        # the custom backend reads, and it is a string there. The renderer
+        # produced already-separated tokens, so nothing here has to guess at
+        # quoting.
+        projected.run_command = " ".join(plan.command)
     # The group's engine parameters are not the router's. They are inherited
     # by projection like every other Model-level field, and the custom backend
     # appends them to whatever command it is given — which put

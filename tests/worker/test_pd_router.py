@@ -482,3 +482,55 @@ def test_a_routers_own_named_band_reaches_its_command():
 
     assert "--prometheus-port 40002" in projected.run_command
     assert "{{" not in projected.run_command
+
+
+def test_a_role_image_survives_the_catalogs():
+    """ "Bring your own router image" without also writing the invocation. The
+    runner image does not ship `vllm-router` today, so this is the only way to
+    run one at all until it does."""
+    from gpustack.schemas.models import RoleSpec
+    from gpustack.worker.pd_router import apply_managed_router, is_managed_router
+
+    from gpustack.schemas.models import role_effective_model
+
+    model = _pd_model(
+        RoleSpec(name="router", replicas=1, cpu_only=True, image_name="me/has-router:1")
+    )
+    assert is_managed_router(model, "router") is True
+
+    # The projection runs first in production, so the role's image is already
+    # on the model by the time the router is materialised.
+    projected = apply_managed_router(
+        role_effective_model(model, "router"),
+        "router",
+        peers=PEERS,
+        variables=VARIABLES,
+    )
+
+    assert projected.image_name == "me/has-router:1"
+    # The catalog still supplies the invocation, peers included.
+    assert projected.run_command.startswith("vllm-router ")
+    assert "--prefill http://10.0.0.1:40027" in projected.run_command
+
+
+def test_a_role_command_survives_the_catalogs():
+    """The mirror: a hand-written invocation of something already in the
+    engine's runner image."""
+    from gpustack.schemas.models import RoleSpec
+    from gpustack.worker.pd_router import apply_managed_router
+
+    from gpustack.schemas.models import role_effective_model
+
+    model = _pd_model(
+        RoleSpec(name="router", replicas=1, cpu_only=True, run_command="my-router --go")
+    )
+
+    projected = apply_managed_router(
+        role_effective_model(model, "router"),
+        "router",
+        peers=PEERS,
+        variables=VARIABLES,
+    )
+
+    assert projected.run_command == "my-router --go"
+    assert projected.image_name == "gpustack/runner:cuda12.9-vllm0.17.1"

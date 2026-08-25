@@ -98,6 +98,7 @@ from gpustack.schemas.metered_usage import MeteredUsage, MeteredUsageArchive
 from gpustack.schemas.resource_events import ResourceEvent, ResourceEventArchive
 from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
 from gpustack.server.cache_services import CacheServiceHealthChecker
+from gpustack.server.pd_observability import PDObserver
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.server.scaling_scheduler import ScalingScheduler
 from gpustack.utils.platform import is_inside_kubernetes
@@ -289,7 +290,6 @@ class Server:
         # otherwise surface as a table miss at deploy time, injecting
         # nothing and coming up looking healthy.
         load_pd_modes()
-
 
         # it's safe to determine server_role after migration
         if self._config.server_role() == Config.ServerRole.BOTH:
@@ -542,6 +542,19 @@ class Server:
         self._create_async_task(health_checker.start())
 
         logger.debug("Cache service health checker started.")
+
+    def _start_pd_observer(self):
+        """Leader-only, because it feeds `sync_model_status`.
+
+        The verdict is only ever consumed by the one writer of the Model
+        row's status fields, and that writer is a leader task. Running a
+        second observer on a follower would scrape every group twice to
+        produce a value nothing there reads.
+        """
+        observer = PDObserver()
+        self._create_async_task(observer.start())
+
+        logger.debug("PD observer started.")
 
     def _start_worker_status_flusher(self):
         self._create_async_task(flush_worker_status_to_db())
@@ -1537,3 +1550,6 @@ class Server:
 
         # Cache Service Health Checker (probes external cache services)
         self._start_cache_service_health_checker()
+
+        # PD Observer (is disaggregation actually happening, and still fast)
+        self._start_pd_observer()

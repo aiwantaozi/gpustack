@@ -27,6 +27,7 @@ from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.cache_provider_catalog import get_cache_provider
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep
+from gpustack.server.pd_observability import get_pd_observation
 from gpustack.utils.name import metric_name
 import logging
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -142,6 +143,66 @@ class MetricExporter(Collector):
             labels=model_instance_labels,
         )
 
+        # Disaggregation (X2 3.1 / 3.2 / 3.5). Under PD a replica count says
+        # nothing about whether the deployment works: a group can be fully
+        # staffed, answering every request, and quietly recomputing every
+        # prefill because no KV ever crosses. These are the series that make
+        # that visible.
+        model_role_desired = GaugeMetricFamily(
+            metric_name("model_role_desired_instances"),
+            "Desired instances of one role of the model",
+            labels=model_labels + ["role"],
+        )
+        model_role_ready = GaugeMetricFamily(
+            metric_name("model_role_ready_instances"),
+            "Ready instances of one role of the model. Compared against the "
+            "desired series this is the ready ratio versus the configured "
+            "ratio (a 3P1D running as 3P0D still reports three replicas up)",
+            labels=model_labels + ["role"],
+        )
+        model_pd_effectiveness = GaugeMetricFamily(
+            metric_name("model_pd_effectiveness"),
+            "Whether KV is actually being transferred between prefill and "
+            "decode. 'aggregated' means disaggregation has silently "
+            "collapsed; 'unmeasurable' means the mode exports no counter to "
+            "decide it with, which is not the same thing",
+            labels=model_labels + ["state"],
+        )
+        model_pd_ratio = GaugeMetricFamily(
+            metric_name("model_pd_disaggregation_ratio"),
+            "KV transfers per request routed, over the last observation "
+            "window. Read from the DECODE side: NIXL is pull-based, so a "
+            "healthy pair counts zero transfers on prefill",
+            labels=model_labels + ["denominator"],
+        )
+        model_pd_transfer_rate = GaugeMetricFamily(
+            metric_name("model_pd_transfer_rate"),
+            "KV transfer rate over the last window, in the unit the 'basis' "
+            "label names. Only comparable to the group's own baseline series "
+            "— nameplate link speed is not a valid denominator (measured: "
+            "94% of line rate on 2.5GbE, 9% on 910B2 RoCE)",
+            labels=model_labels + ["basis"],
+        )
+        model_pd_transfer_baseline = GaugeMetricFamily(
+            metric_name("model_pd_transfer_baseline_rate"),
+            "The rate this group was first observed at, which every later "
+            "window is judged against",
+            labels=model_labels + ["basis"],
+        )
+        model_pd_failed_transfers = GaugeMetricFamily(
+            metric_name("model_pd_failed_transfers"),
+            "Cumulative failed KV transfers reported by the group's engines",
+            labels=model_labels,
+        )
+        model_pd_kv_expired = GaugeMetricFamily(
+            metric_name("model_pd_kv_expired_requests"),
+            "Cumulative KV leases that expired unread. Persistently rising "
+            "means requests are being dropped between the two hops and their "
+            "prefill was computed for nothing. Absent for connectors that "
+            "export no such counter (Mooncake exports none)",
+            labels=model_labels,
+        )
+
         metrics = [
             cluster_info,
             cluster_status,
@@ -155,6 +216,14 @@ class MetricExporter(Collector):
             model_instance_latest_restart_time,
             cache_service_attached_model,
             model_instance_cache_attached,
+            model_role_desired,
+            model_role_ready,
+            model_pd_effectiveness,
+            model_pd_ratio,
+            model_pd_transfer_rate,
+            model_pd_transfer_baseline,
+            model_pd_failed_transfers,
+            model_pd_kv_expired,
         ]
 
         cache_service_names = {
@@ -282,6 +351,27 @@ class MetricExporter(Collector):
                     model.ready_replicas,
                 )
 
+                for role_name, status in (
+                    getattr(model, "role_status", None) or {}
+                ).items():
+                    model_role_desired.add_metric(
+                        model_label_values + [role_name], status.desired
+                    )
+                    model_role_ready.add_metric(
+                        model_label_values + [role_name], status.ready
+                    )
+
+                _add_pd_metrics(
+                    model,
+                    model_label_values,
+                    model_pd_effectiveness,
+                    model_pd_ratio,
+                    model_pd_transfer_rate,
+                    model_pd_transfer_baseline,
+                    model_pd_failed_transfers,
+                    model_pd_kv_expired,
+                )
+
                 kv_cache = model.extended_kv_cache
                 if (
                     kv_cache
@@ -381,6 +471,50 @@ class MetricExporter(Collector):
             await server.serve()
         except Exception as e:
             logger.error(f"Failed to start metric exporter: {e}")
+
+
+def _add_pd_metrics(
+    model,
+    model_label_values: list,
+    effectiveness,
+    ratio,
+    transfer_rate,
+    transfer_baseline,
+    failed_transfers,
+    kv_expired,
+):
+    """Publish the PD observer's latest verdict for one model.
+
+    Read from the in-process observer rather than from the Model row: the
+    row carries the *conclusion* (a degradation marker an operator acts on),
+    while the raw ratio and rate are a time series, and a time series belongs
+    in Prometheus rather than in a column that would be rewritten every
+    minute. Nothing is emitted at all when there is no observation, so a
+    non-PD model contributes no series and a leader that has not completed a
+    window yet does not publish a zero that reads as "no KV moved".
+    """
+    observation = get_pd_observation(model.id)
+    if observation is None:
+        return
+
+    effectiveness.add_metric(model_label_values + [observation.effectiveness.value], 1)
+    if observation.ratio is not None:
+        ratio.add_metric(
+            model_label_values + [observation.denominator.value], observation.ratio
+        )
+    if observation.rate is not None:
+        transfer_rate.add_metric(
+            model_label_values + [observation.rate_basis.value], observation.rate
+        )
+    if observation.baseline_rate is not None:
+        transfer_baseline.add_metric(
+            model_label_values + [observation.rate_basis.value],
+            observation.baseline_rate,
+        )
+    if observation.failed_transfers is not None:
+        failed_transfers.add_metric(model_label_values, observation.failed_transfers)
+    if observation.kv_expired is not None:
+        kv_expired.add_metric(model_label_values, observation.kv_expired)
 
 
 async def _metrics_targets(session: AsyncSession, is_proxy: bool):

@@ -630,6 +630,16 @@ class DegradationReasonEnum(str, Enum):
 
     CACHE_NOT_INJECTED = "cache_not_injected"
     BANDWIDTH_DEGRADED = "bandwidth_degraded"
+    PD_INEFFECTIVE = "pd_ineffective"
+    """The group is serving without transferring any KV — disaggregation has
+    silently collapsed into aggregated serving.
+
+    Kept apart from `bandwidth_degraded` because the two are different
+    failures with different fixes: slower-than-baseline transfer is a
+    transport problem, no transfer at all is a pairing that never formed. A
+    single marker would send an operator looking at the network for a
+    connector that was never wired up."""
+
     RATIO_UNMET = "ratio_unmet"
     NO_ATOMIC_ADMISSION = "no_atomic_admission"
 

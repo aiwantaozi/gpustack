@@ -14,19 +14,32 @@ from gpustack.server.pd_mode_catalog import (
     get_kv_lease,
     get_kv_leases,
     get_pd_mode,
+    get_transfer_metrics,
     load_pd_mode_catalog,
     load_pd_modes,
     parse_pd_mode_catalog,
 )
 
 
-def _document(modes, kv_leases=None):
+def _document(modes, kv_leases=None, kv_transfer_metrics=None):
     """A minimal catalog document whose mode names satisfy the enum
-    assertion, so a test can isolate the assertion it is after."""
+    assertion, so a test can isolate the assertion it is after.
+
+    Every declared connector gets an all-null transfer-metrics entry unless
+    the caller supplies one: the loader requires the two registries to cover
+    the same connectors, and a test about something else should not have to
+    restate that."""
     entries = {mode["name"]: mode for mode in modes}
     for name, backends in PD_MODE_BACKENDS.items():
         entries.setdefault(name, {"name": name, "backends": list(backends)})
-    return {"kv_leases": kv_leases or [], "modes": list(entries.values())}
+    leases = kv_leases or []
+    if kv_transfer_metrics is None:
+        kv_transfer_metrics = [{"connector": lease["connector"]} for lease in leases]
+    return {
+        "kv_leases": leases,
+        "kv_transfer_metrics": kv_transfer_metrics,
+        "modes": list(entries.values()),
+    }
 
 
 def test_catalog_asset_loads():
@@ -331,6 +344,15 @@ def test_router_peer_styles_and_prometheus_band():
     # managed band like any other.
     assert [band.name for band in nixl.router.ports] == ["prometheus"]
     assert "{{ports.prometheus}}" in nixl.router.command
+    # And the exposition has to be bound to the worker's address, not to
+    # the default loopback. Measured: worker_ip:40001/metrics was refused
+    # while 127.0.0.1:40001/metrics served 31 series, which puts the ratio's
+    # denominator out of reach of anything off-host. Same class of bug as
+    # VLLM_NIXL_SIDE_CHANNEL_HOST, same fix.
+    assert (
+        nixl.router.command[nixl.router.command.index("--prometheus-host") + 1]
+        == "{{worker_ip}}"
+    )
     # The five hardening flags are not tuning: with the router's own
     # defaults a dead prefill kept returning 500s for over a minute.
     for flag in (
@@ -496,6 +518,131 @@ def test_unsettable_window_must_not_claim_an_injection_target():
                         "engine_default": 3600,
                     }
                 ],
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Transfer counters (X2 3.1 / 3.2).
+# ---------------------------------------------------------------------------
+
+
+def test_the_read_side_is_declared_because_reading_the_wrong_one_inverts_it():
+    """NIXL is pull-based: a completed transfer is counted on decode. On a
+    working 1P1D, prefill's counter stayed 0.0 for the whole run and
+    decode's went to 1.0, so reading prefill reports a healthy pair as
+    having transferred nothing."""
+    nixl = get_transfer_metrics("nixl")
+    assert nixl.read_from_role == "decode"
+    assert nixl.xfer_count == "vllm:nixl_xfer_time_seconds_count"
+    assert nixl.xfer_seconds == "vllm:nixl_xfer_time_seconds_sum"
+    assert nixl.failed_transfers == "vllm:nixl_num_failed_transfers_total"
+    # No byte counter in the measured record, so the degradation check runs
+    # on a rate in transfers rather than on true bandwidth.
+    assert nixl.xfer_bytes is None
+    # And no floor: a threshold is a calibration on real hardware, and the
+    # measured spread (94% of line rate on 2.5GbE, 9% on 910B2 RoCE) is why
+    # an invented one is worse than none.
+    assert nixl.min_expected_rate is None
+
+
+def test_a_connector_that_exports_nothing_says_so():
+    """mooncake/stats.py exports zero Prometheus counters where NIXL exports
+    fifteen. That is a measured fact, not an omission."""
+    mooncake = get_transfer_metrics("mooncake")
+    assert mooncake is not None
+    assert mooncake.observable is False
+    assert get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value).transfer_metrics is (
+        mooncake
+    )
+
+
+def test_modes_resolve_their_connector_counters_through_one_reference():
+    """The connector id names the transport once; the lease window and the
+    counters both hang off it, so the two cannot come to disagree."""
+    for name in (PDModeEnum.VLLM_NIXL.value, PDModeEnum.SGLANG_NIXL.value):
+        mode = get_pd_mode(name)
+        assert mode.transfer_metrics is get_transfer_metrics(mode.kv_lease.connector)
+    assert get_pd_mode(PDModeEnum.CUSTOM.value).transfer_metrics is None
+
+
+def test_a_connector_missing_from_the_counter_registry_fails_the_load():
+    """An all-null entry declares "exports nothing"; a missing entry behaves
+    identically at runtime while meaning nobody looked."""
+    with pytest.raises(PDModeCatalogError, match="Missing: \\['nixl'\\]"):
+        parse_pd_mode_catalog(
+            _document(
+                [],
+                kv_leases=[
+                    {
+                        "connector": "nixl",
+                        "param": "kv_lease_duration",
+                        "inject_to": "connector_extra_config",
+                    }
+                ],
+                kv_transfer_metrics=[],
+            )
+        )
+
+
+def test_transfer_seconds_without_a_count_is_not_a_rate():
+    with pytest.raises(PDModeCatalogError, match="a rate needs both"):
+        parse_pd_mode_catalog(
+            _document(
+                [],
+                kv_leases=[
+                    {
+                        "connector": "nixl",
+                        "param": "kv_lease_duration",
+                        "inject_to": "connector_extra_config",
+                    }
+                ],
+                kv_transfer_metrics=[{"connector": "nixl", "xfer_seconds": "s"}],
+            )
+        )
+
+
+def test_the_ratios_denominator_is_declared_per_router():
+    """Per-worker, which is what localises the failure to one decode rather
+    than to "the group"."""
+    nixl = get_pd_mode(PDModeEnum.VLLM_NIXL.value).router.request_metrics
+    assert nixl.prefill_requests == "vllm_router_pd_prefill_requests_total"
+    assert nixl.decode_requests == "vllm_router_pd_decode_requests_total"
+    assert nixl.worker_label == "worker"
+    # Coarser and measured too: aggregated by route, so it localises
+    # nothing but still answers whether anything was routed.
+    assert nixl.total_requests == "vllm_router_pd_requests_total"
+
+    # SGLang's gateway is the same codebase, but its counter names were
+    # never measured here, and a guessed name gives a denominator that reads
+    # zero for the wrong reason.
+    for name in (PDModeEnum.SGLANG_MOONCAKE.value, PDModeEnum.SGLANG_NIXL.value):
+        assert get_pd_mode(name).router.request_metrics.available is False
+
+    # The Ascend proxy serves no /metrics at all, so it has no denominator
+    # by capability rather than by omission.
+    ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value).router
+    assert ascend.capabilities.metrics is False
+    assert ascend.request_metrics.available is False
+
+
+def test_request_metrics_behind_a_metrics_false_capability_fail_the_load():
+    with pytest.raises(PDModeCatalogError, match="nothing would ever scrape them"):
+        parse_pd_mode_catalog(
+            _document(
+                [
+                    {
+                        "name": PDModeEnum.VLLM_NIXL.value,
+                        "backends": PD_MODE_BACKENDS[PDModeEnum.VLLM_NIXL.value],
+                        "router": {
+                            "protocol": "two_hop",
+                            "command": ["router"],
+                            "peers": {"style": "repeated_flag"},
+                            "capabilities": {"metrics": False},
+                            "request_metrics": {"decode_requests": "x_total"},
+                        },
+                    }
+                ]
             )
         )
 

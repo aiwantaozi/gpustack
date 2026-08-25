@@ -33,7 +33,6 @@ import uuid
 from typing import Optional
 from gpustack.utils import version
 
-
 logger = logging.getLogger(__name__)
 
 METRICS_CONFIG_FETCH_TIMEOUT_SECONDS = 30
@@ -206,6 +205,11 @@ class RuntimeMetricsAggregator:
             "model_instance_id": str(mi.id),
             "model_instance_name": mi.name,
             "runtime": runtime,
+            # Empty for a single-role deployment. Carried because under
+            # disaggregation the engine-level latencies are not one
+            # population: prefill owns TTFT and decode owns TPOT, and a
+            # figure averaged over both roles describes neither (X2 3.5).
+            "role": mi.role or "",
         }
 
     def _process_endpoint_metrics(

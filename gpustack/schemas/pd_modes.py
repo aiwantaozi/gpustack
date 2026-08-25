@@ -184,6 +184,81 @@ class PDKVLease(BaseModel):
         return self
 
 
+class PDTransferMetrics(BaseModel):
+    """The engine-side counters one connector exports about KV transfer.
+
+    Declared per connector rather than hardcoded because the names, and
+    whether they exist at all, are the connector's business: NIXL exports
+    fifteen counters, Mooncake exports none, and SGLang's transfer backends
+    were never measured. A mode whose entry is all-null is a mode where PD
+    effectiveness is not observable from Prometheus, and saying that out
+    loud is the point — the alternative is a ratio that silently reads
+    zero because the metric was never there.
+    """
+
+    connector: str
+    """The key modes resolve through, the same id ``kv_leases`` uses."""
+
+    read_from_role: str = "decode"
+    """🔴 Which side of the pair owns these counters.
+
+    NIXL is *pull-based*: decode reads from prefill, so decode is where a
+    transfer is counted. Measured on a working 1P1D — prefill's
+    ``nixl_xfer_time_seconds_count`` stayed at 0.0 for the whole run while
+    decode's was 1.0. Reading the prefill side therefore reports a healthy
+    pair as "no KV ever moved", i.e. reports the exact failure this metric
+    exists to detect, on a deployment that is fine.
+
+    A declaration and not a constant because push-based connectors exist;
+    for one of those this reads ``prefill`` and no code changes."""
+
+    xfer_count: Optional[str] = None
+    """Cumulative count of completed KV transfers — the numerator of the
+    PD-effectiveness ratio. Spelled as it appears in the exposition
+    (a histogram's ``_count`` sample), not as the family name."""
+
+    xfer_seconds: Optional[str] = None
+    """Cumulative seconds spent transferring. Paired with ``xfer_count`` it
+    gives a per-window transfer rate, which is what the degradation check
+    compares against the group's own baseline."""
+
+    xfer_bytes: Optional[str] = None
+    """Cumulative bytes transferred, if the connector exports it. When it
+    does the rate is a true bandwidth; when it does not the check falls
+    back to transfers per second of transfer time, which is a rate in a
+    different unit and therefore only ever comparable to a baseline taken
+    in the same unit."""
+
+    failed_transfers: Optional[str] = None
+
+    min_expected_rate: Optional[float] = None
+    """Coarse floor for the first-deployment case the baseline method
+    cannot see (a group that was already degraded when its baseline was
+    taken). Null everywhere on purpose: a floor is a calibration against
+    real hardware, and the measured spread — 94% of line rate on 2.5GbE
+    versus 9% on 910B2 RoCE — is exactly why an invented number would
+    either alarm forever on one platform or never on the other."""
+
+    @model_validator(mode="after")
+    def check_rate_inputs(self) -> "PDTransferMetrics":
+        if self.xfer_seconds and not self.xfer_count:
+            raise ValueError(
+                f"transfer metrics for '{self.connector}' declare "
+                "xfer_seconds without xfer_count; a rate needs both"
+            )
+        if self.min_expected_rate is not None and not self.xfer_count:
+            raise ValueError(
+                f"transfer metrics for '{self.connector}' declare a floor but "
+                "no counter to measure against it"
+            )
+        return self
+
+    @property
+    def observable(self) -> bool:
+        """Whether anything at all can be read from this connector."""
+        return bool(self.xfer_count or self.xfer_bytes or self.failed_transfers)
+
+
 class PDPortSpec(BaseModel):
     """A named port band a role needs allocated.
 
@@ -301,6 +376,55 @@ class PDRouterCapabilities(BaseModel):
     Mirrors ``kv_lease.expired_metric``; the loader asserts they agree."""
 
 
+class PDRouterRequestMetrics(BaseModel):
+    """The router-side counters that give the PD-effectiveness ratio its
+    denominator.
+
+    The denominator is *not* counted by GPUStack. vllm-router already
+    exports per-worker request counters, and per-worker is the shape that
+    matters: a group-wide ratio says "something is wrong somewhere", a
+    per-worker one says which decode stopped pulling.
+
+    Left empty means no denominator, and that is a first-class outcome
+    rather than a gap to paper over — vllm-ascend's proxy serves no
+    /metrics at all, and SGLang's gateway is the same codebase as
+    vllm-router but its counter names were never verified here. Guessing
+    them would produce a ratio that reads zero because the name was wrong,
+    which is indistinguishable from the failure being measured.
+    """
+
+    prefill_requests: Optional[str] = None
+    decode_requests: Optional[str] = None
+
+    worker_label: str = "worker"
+    """Label carrying the peer the request was dispatched to. Measured, its
+    value is the whole peer URL the router was launched with
+    (``http://192.168.50.15:40005``) rather than a worker name or id, so a
+    member is matched on host:port and not on the whole string."""
+
+    port_band: Optional[str] = None
+    """Named port band the exposition is served on. None means the router's
+    own HTTP port.
+
+    Not the same port for vllm-router: its API and its Prometheus endpoint
+    are separate listeners, and the second one is a band GPUStack allocates
+    because upstream's default (29000) is fixed and two routers on a host
+    would collide. Scraping the API port instead returns 404, which reads as
+    "no denominator" — a check that silently stops working."""
+
+    total_requests: Optional[str] = None
+    """Group-level request counter, aggregated by route instead of by peer.
+    The fallback denominator: coarser, but it still answers "did the router
+    route anything at all", which is the question a ratio of zero is
+    meaningless without."""
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.prefill_requests or self.decode_requests or self.total_requests
+        )
+
+
 class PDRouter(BaseModel):
     """The router role of a mode. There is no universal router — the
     catalog format is what generalizes, not the binary."""
@@ -312,6 +436,7 @@ class PDRouter(BaseModel):
     command: List[str] = []
     peers: Optional[PDRouterPeers] = None
     capabilities: PDRouterCapabilities = PDRouterCapabilities()
+    request_metrics: PDRouterRequestMetrics = PDRouterRequestMetrics()
 
     health_path: Optional[str] = None
     """None means the router serves no health endpoint, so readiness falls
@@ -319,6 +444,14 @@ class PDRouter(BaseModel):
 
     @model_validator(mode="after")
     def check_user_provided(self) -> "PDRouter":
+        if self.request_metrics.available and not self.capabilities.metrics:
+            # Two spellings of one fact, the same trap `kv_expired_metric`
+            # guards: a name declared behind `metrics: false` would be
+            # scraped from an endpoint that does not exist.
+            raise ValueError(
+                "router declares request metric names but capabilities.metrics "
+                "is false, so nothing would ever scrape them"
+            )
         user_provided = self.protocol == PDRouterProtocolEnum.USER_PROVIDED
         if user_provided and (self.command or self.image or self.ports):
             raise ValueError(
@@ -391,6 +524,13 @@ class PDMode(BaseModel):
     kv_lease: Optional[PDKVLease] = None
     """Resolved by the loader from the catalog's per-connector registry.
     None means GPUStack configures no window (``custom``)."""
+
+    transfer_metrics: Optional[PDTransferMetrics] = None
+    """Resolved by the loader from the same connector id ``kv_lease``
+    names — the connector identifies the transport, and the transport is
+    what decides both the lease window and the counters. None means the
+    mode has no connector GPUStack knows (``custom``), so PD effectiveness
+    is not measurable for it."""
 
     def role(self, name: str) -> Optional[PDModeRole]:
         return self.roles.get(name)
@@ -483,6 +623,13 @@ class PDModeCatalog(BaseModel):
     """
 
     kv_leases: Dict[str, PDKVLease] = {}
+    kv_transfer_metrics: Dict[str, PDTransferMetrics] = {}
+    """Keyed by the same connector id as ``kv_leases``, and required to
+    cover every connector that appears there: an entry whose fields are all
+    null declares "this connector exports nothing", which is a measured
+    fact about Mooncake, while a *missing* entry would be an oversight that
+    reads identically at runtime."""
+
     modes: List[PDMode] = []
 
     def mode(self, name: str) -> Optional[PDMode]:

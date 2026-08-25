@@ -116,6 +116,66 @@ kv_leases:
       instance restarts — there is nothing to inject and nothing to
       scrape, which is the whole reason this field is declarable.
 
+# Per-connector KV-transfer counters (X2 §3.1 / §3.2), keyed by the same
+# connector id kv_leases uses — the transport decides both the lease window
+# and what it exports, so a mode names it once. Every connector above must
+# appear here, all-null if it exports nothing: "Mooncake has no Prometheus
+# counters" is a measured fact and reads very differently from a connector
+# somebody forgot to add.
+#
+# 🔴 read_from_role is the one field that has already caused a wrong answer
+# in the lab. NIXL is pull-based — decode reads from prefill — so a
+# completed transfer is counted on DECODE. On a working cross-host 1P1D,
+# prefill's nixl_xfer_time_seconds_count stayed 0.0 while decode's went to
+# 1.0. Read the prefill side and a perfectly healthy pair reports "no KV
+# ever moved", which is precisely the alarm this metric exists to raise.
+kv_transfer_metrics:
+  - connector: nixl
+    read_from_role: decode
+    # Spelled as they appear in the exposition: xfer_time_seconds is a
+    # histogram, so _count / _sum are its samples, and num_failed_transfers
+    # is a counter, so the exposition suffixes it _total.
+    xfer_count: "vllm:nixl_xfer_time_seconds_count"
+    xfer_seconds: "vllm:nixl_xfer_time_seconds_sum"
+    # No byte counter in the measured record, so the degradation check runs
+    # on transfers-per-second-of-transfer-time instead of true bandwidth.
+    # That is a rate in a different unit, which is exactly why it is only
+    # ever compared against the same group's own baseline.
+    xfer_bytes: null
+    failed_transfers: "vllm:nixl_num_failed_transfers_total"
+    min_expected_rate: null
+  - connector: mooncake
+    # vllm's mooncake/stats.py exports zero Prometheus counters where NIXL
+    # exports fifteen. Nothing to scrape; the diagnostic path for this
+    # connector is log scanning (X2 §3.3).
+    read_from_role: decode
+    xfer_count: null
+    xfer_seconds: null
+    xfer_bytes: null
+    failed_transfers: null
+  - connector: moriio
+    read_from_role: decode
+    xfer_count: null
+    xfer_seconds: null
+    xfer_bytes: null
+    failed_transfers: null
+  - connector: sglang-mooncake
+    # SGLang's disaggregation counters were never verified here. Declaring
+    # guessed names would give a numerator that reads zero because the name
+    # was wrong — indistinguishable from the failure being detected — so the
+    # ratio degrades visibly to "not measurable" instead.
+    read_from_role: decode
+    xfer_count: null
+    xfer_seconds: null
+    xfer_bytes: null
+    failed_transfers: null
+  - connector: sglang-nixl
+    read_from_role: decode
+    xfer_count: null
+    xfer_seconds: null
+    xfer_bytes: null
+    failed_transfers: null
+
 modes:
   - name: vllm-nixl
     display_name: vLLM + NIXL
@@ -182,6 +242,15 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+        # Same class of bug as VLLM_NIXL_SIDE_CHANNEL_HOST above, and the
+        # same fix: this is a bind address, and left unset the exposition
+        # listens on loopback only. Measured on a live 1P1D —
+        # `curl worker_ip:40001/metrics` was refused while
+        # `curl 127.0.0.1:40001/metrics` served 31 vllm_router series. The
+        # PD-effectiveness ratio is computed on the server, off-host, so
+        # without this its denominator is unreachable.
+        - --prometheus-host
+        - "{{worker_ip}}"
         - --prometheus-port
         - "{{ports.prometheus}}"
         - --prefill-policy
@@ -213,6 +282,27 @@ modes:
         # are per-worker, which is the shape the PD-effectiveness ratio
         # needs; the engine side exports the KV-expiry counter.
         kv_expired_metric: true
+      # The ratio's denominator, and the reason GPUStack counts nothing
+      # itself. Per-worker: a group-wide ratio only says something is
+      # wrong, this one says which decode stopped pulling. Verified to
+      # carry values on a 1P1D run.
+      request_metrics:
+        prefill_requests: vllm_router_pd_prefill_requests_total
+        decode_requests: vllm_router_pd_decode_requests_total
+        # Measured: the label's value is the whole peer URL the router was
+        # launched with — worker="http://192.168.50.15:40005" — not a worker
+        # name or id, so a member is matched on host:port.
+        worker_label: worker
+        # The exposition is a separate listener from the API: it lives on
+        # the band above, not on {{port}}. Scraping the API port returns
+        # 404, and a 404 reads as "no denominator" — the check would stop
+        # working without ever saying so.
+        port_band: prometheus
+        # Aggregated by route rather than by peer. Coarser, and the right
+        # denominator when no member matches its label: it still answers
+        # "did the router route anything at all", which is the question a
+        # ratio of zero has to be read against.
+        total_requests: vllm_router_pd_requests_total
       health_path: /health
 
   - name: sglang-mooncake
@@ -271,6 +361,11 @@ modes:
         models_endpoint: true
         # SGLang's Mooncake path exports no KV-expiry counter.
         kv_expired_metric: false
+      # No request_metrics: vllm-router is a fork of this gateway and the
+      # counter names should be the same shape, but "should" was never
+      # measured on this side. An unverified name yields a denominator that
+      # reads zero for the wrong reason, so the ratio is reported as not
+      # measurable until someone runs it.
       health_path: /health
 
   - name: sglang-nixl

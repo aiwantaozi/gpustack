@@ -5,7 +5,12 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from gpustack.schemas.models import PD_MODE_BACKENDS, PDModeEnum
-from gpustack.schemas.pd_modes import PDKVLease, PDMode, PDModeCatalog
+from gpustack.schemas.pd_modes import (
+    PDKVLease,
+    PDMode,
+    PDModeCatalog,
+    PDTransferMetrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,7 @@ def parse_pd_mode_catalog(raw: Any) -> PDModeCatalog:
         )
 
     leases = _parse_kv_leases(raw.get("kv_leases"))
+    transfer_metrics = _parse_transfer_metrics(raw.get("kv_transfer_metrics"), leases)
     modes: List[PDMode] = []
     for entry in raw.get("modes") or []:
         if not isinstance(entry, dict):
@@ -77,6 +83,10 @@ def parse_pd_mode_catalog(raw: Any) -> PDModeCatalog:
                     f"not declared. Declared: {sorted(leases)}"
                 )
             entry["kv_lease"] = lease
+            # One reference, two resolutions: the connector id decides both
+            # the lease window and which counters exist, so a mode never
+            # names the transport twice and the two can never disagree.
+            entry["transfer_metrics"] = transfer_metrics.get(reference)
         try:
             modes.append(PDMode(**entry))
         except Exception as e:
@@ -85,7 +95,9 @@ def parse_pd_mode_catalog(raw: Any) -> PDModeCatalog:
     _assert_names_match_enum(modes)
     _assert_backends_match_table(modes)
     _assert_expired_metric_agrees(modes)
-    return PDModeCatalog(kv_leases=leases, modes=modes)
+    return PDModeCatalog(
+        kv_leases=leases, kv_transfer_metrics=transfer_metrics, modes=modes
+    )
 
 
 def _parse_kv_leases(raw: Any) -> Dict[str, PDKVLease]:
@@ -103,6 +115,50 @@ def _parse_kv_leases(raw: Any) -> Dict[str, PDKVLease]:
             raise PDModeCatalogError(f"duplicate kv_lease for '{lease.connector}'")
         leases[lease.connector] = lease
     return leases
+
+
+def _parse_transfer_metrics(
+    raw: Any, leases: Dict[str, PDKVLease]
+) -> Dict[str, PDTransferMetrics]:
+    """Parse the per-connector transfer-counter registry.
+
+    Every connector with a lease must have an entry, even an all-null one.
+    "Mooncake exports no Prometheus counters" is a measured fact and has to
+    be written down; a connector simply missing from this table produces
+    the same runtime behaviour — no numerator — from an oversight, and the
+    two must not be indistinguishable.
+    """
+    metrics: Dict[str, PDTransferMetrics] = {}
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            raise PDModeCatalogError(
+                f"kv_transfer_metrics entries must be mappings, got {entry!r}"
+            )
+        try:
+            declared = PDTransferMetrics(**entry)
+        except Exception as e:
+            raise PDModeCatalogError(
+                f"invalid kv_transfer_metrics entry {entry!r}: {e}"
+            ) from e
+        if declared.connector in metrics:
+            raise PDModeCatalogError(
+                f"duplicate kv_transfer_metrics for '{declared.connector}'"
+            )
+        metrics[declared.connector] = declared
+
+    undeclared = sorted(set(leases) - set(metrics))
+    if undeclared:
+        raise PDModeCatalogError(
+            "every connector with a kv_lease must also declare its transfer "
+            "counters, all-null if it exports none, so an absence is a "
+            f"statement rather than an omission. Missing: {undeclared}"
+        )
+    unknown = sorted(set(metrics) - set(leases))
+    if unknown:
+        raise PDModeCatalogError(
+            f"kv_transfer_metrics names connectors no kv_lease declares: {unknown}"
+        )
+    return metrics
 
 
 def _assert_names_match_enum(modes: List[PDMode]) -> None:
@@ -193,3 +249,9 @@ def get_kv_leases() -> Dict[str, PDKVLease]:
 
 def get_kv_lease(connector: str) -> Optional[PDKVLease]:
     return load_pd_mode_catalog().kv_leases.get(connector)
+
+
+def get_transfer_metrics(connector: str) -> Optional[PDTransferMetrics]:
+    """One connector's KV-transfer counters. A mode's own are already
+    resolved onto the mode; this is for the connector-first callers."""
+    return load_pd_mode_catalog().kv_transfer_metrics.get(connector)

@@ -173,11 +173,11 @@ def render_pd_injection(
     args = [render(token, context, context=f"{where} args") for token in role.args]
     descriptor = _render_tree(role.connector, context, f"{where} connector")
     if descriptor:
-        # One flag, one writer. vLLM accepts a single --kv-transfer-config, so
-        # the descriptor is rendered whole here; merging it with a cache
-        # provider's into a MultiConnector is the unified assembler's job, and
-        # until that exists the two are mutually exclusive (rejected above)
-        # rather than concatenated into a flag the engine reads once.
+        # Rendered whole, as this role's own connector. If an extended KV cache
+        # also contributes one, `kv_transfer.compose_kv_transfer_config` folds
+        # the two into a MultiConnector once the whole argv exists — the two
+        # are complementary, and which of them a role should ask first is a
+        # property of the role, not of this render.
         args += [
             KV_TRANSFER_CONFIG_FLAG,
             json.dumps(descriptor, separators=(",", ":")),
@@ -419,19 +419,6 @@ def _reject_conflicting_kv_transfer_config(
             f"into the same flag, which vLLM reads only once. Remove the "
             f"parameter, or switch the deployment to PD mode 'custom', which "
             f"injects no connection state and leaves the flag to you."
-        )
-
-    extended = getattr(effective, "extended_kv_cache", None)
-    if extended is not None and getattr(extended, "enabled", False):
-        raise PDInjectionError(
-            f"Role '{role_name}' enables the extended KV cache and PD mode "
-            f"'{mode.name}', and GPUStack writes one connector into "
-            f"{KV_TRANSFER_CONFIG_FLAG}, so it cannot configure both. Detach "
-            f"the KV cache from this deployment (or from this role), or switch "
-            f"to PD mode 'custom' and write the combined connector "
-            f"configuration yourself — the engine composes connectors through "
-            f"MultiConnector, so the pair is assemblable by hand today and is "
-            f"a GPUStack gap rather than an engine limit."
         )
 
 

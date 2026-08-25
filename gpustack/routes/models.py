@@ -55,6 +55,7 @@ from gpustack.server.deps import (
 from gpustack.schemas.models import (
     PD_MODE_BACKENDS,
     LoraListEntry,
+    PDModeEnum,
     RoleSpec,
     Model,
     ModelCreate,
@@ -504,7 +505,7 @@ def validate_roles(  # noqa: C901
             message="A disaggregated model has at most one router."
         )
 
-    _reject_cache_and_connector_on_one_flag(field, roles, disaggregation)
+    _reject_cache_under_a_hand_written_mode(field, roles, disaggregation)
 
     # A recipe injects one engine's connector configuration into every role,
     # so a role on a different engine would receive settings it cannot read.
@@ -524,45 +525,26 @@ def validate_roles(  # noqa: C901
                 )
 
 
-def _reject_cache_and_connector_on_one_flag(field, roles, disaggregation) -> None:
-    """An extended KV cache and a PD connector cannot share one deployment.
+def _reject_cache_under_a_hand_written_mode(field, roles, disaggregation) -> None:
+    """`custom` mode and an extended KV cache cannot be asked for together.
 
-    GPUStack writes one connector into ``--kv-transfer-config``, so asking it
-    for both means one of them is not configured at all.
+    Everywhere else the two compose: GPUStack folds the mode's connector and
+    the cache's into one `MultiConnector`, which is what makes a disaggregated
+    deployment with a shared cache a supported combination rather than a
+    choice between them.
 
-    Not an engine limit, and the wording matters because a user told the first
-    would give up on a combination that is legitimate and valuable: vLLM ships
-    a ``MultiConnector`` that composes several connectors under one flag
-    (``kv_connector_extra_config.connectors``), so the pair runs today if the
-    configuration is written by hand. What is missing is GPUStack assembling
-    it, which is why ``custom`` mode is offered as the way out rather than
-    "pick one". The worker already refuses to build such a
-    command, but refusing there means two containers are scheduled, given
-    accelerators, and then fail; the constraint is knowable from the spec
-    alone, so it belongs at save time where the message can name the field to
-    change instead of appearing as a crashed member.
-
-    Mirrors the worker's condition rather than restating it: the conflict
-    exists only where the *catalog* gives that role a connector. SGLang's
-    recipes configure disaggregation through their own flags and never touch
-    `--kv-transfer-config`, and `custom` injects nothing at all — which is why
-    the message can offer it as the way out.
+    `custom` is the one mode that injects no connection state at all — its
+    whole contract is that the parameters are the user's. So there is nothing
+    to compose the cache with, and quietly injecting a connector under a mode
+    that promises not to would be the surprise this rejection exists to
+    prevent. Written by hand, both still fit in one flag; the engine composes
+    connectors and the user is the one holding the pen.
     """
-    from gpustack.server.pd_mode_catalog import get_pd_mode
-
-    try:
-        mode = get_pd_mode(disaggregation.mode.value)
-    except Exception:
-        # An unknown mode is the previous check's to report, not this one's.
+    if disaggregation.mode != PDModeEnum.CUSTOM:
         return
 
     model_cache = field("extended_kv_cache")
     for role in roles:
-        role_spec = (mode.roles or {}).get(role.name)
-        if role_spec is None or not role_spec.connector:
-            continue
-        # The role-effective value: a role that declares its own overrides the
-        # deployment's, including overriding it to "off".
         cache = (
             role.extended_kv_cache
             if role.extended_kv_cache is not None
@@ -572,14 +554,12 @@ def _reject_cache_and_connector_on_one_flag(field, roles, disaggregation) -> Non
             continue
         raise BadRequestException(
             message=(
-                f"Role '{role.name}' enables the extended KV cache while pd "
-                f"mode '{disaggregation.mode.value}' configures a KV connector, "
-                "and GPUStack writes one connector into --kv-transfer-config, "
-                "so it cannot configure both. Turn the extended KV cache off "
-                "for this deployment or for this role, or use pd mode "
-                "'custom', which injects no connector and leaves the flag to "
-                "you: the engine can compose connectors, so the pair is "
-                "assemblable by hand."
+                f"Role '{role.name}' enables the extended KV cache under pd "
+                "mode 'custom', which injects no connector configuration at "
+                "all — so there is nothing for GPUStack to compose the cache "
+                "into. Either choose a pd mode that configures a connector, "
+                "where the two are combined for you, or keep 'custom' and "
+                "write the combined configuration into backend_parameters."
             )
         )
 

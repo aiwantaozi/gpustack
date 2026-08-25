@@ -215,19 +215,25 @@ def test_spaced_placeholder_is_not_one():
         ),
     ],
 )
-def test_pd_and_extended_kv_cache_are_mutually_exclusive(extended):
-    """vLLM reads --kv-transfer-config once, and each source of it renders a
-    whole document. Two of them is a silent loss of one, so it is refused."""
+def test_pd_renders_its_own_connector_beside_an_extended_cache(extended):
+    """The injector's job is this role's connector, whole. A cache that also
+    contributes one is folded in later by `kv_transfer`, once the whole argv
+    exists — which is where the per-role ordering can be applied. Refusing
+    here is what used to make the two mutually exclusive."""
     model = _model(extended_kv_cache=extended)
 
-    with pytest.raises(PDInjectionError) as excinfo:
-        render_pd_injection(model, _instance(), _variables())
+    injection = render_pd_injection(model, _instance(), _variables())
 
-    assert KV_TRANSFER_CONFIG_FLAG in str(excinfo.value)
-    assert "custom" in str(excinfo.value)
+    assert KV_TRANSFER_CONFIG_FLAG in injection.args
+    # Its own descriptor, not a composite: composing is not this seam's call.
+    index = injection.args.index(KV_TRANSFER_CONFIG_FLAG)
+    assert "NixlConnector" in injection.args[index + 1]
 
 
-def test_per_role_extended_kv_cache_is_rejected_for_that_role_only():
+def test_a_per_role_cache_leaves_every_role_renderable():
+    """Which sides take a cache is per role, and none of them is a reason to
+    refuse the PD connector — the prefill side is exactly where a shared cache
+    pays."""
     model = _model(
         roles=[
             RoleSpec(
@@ -240,10 +246,7 @@ def test_per_role_extended_kv_cache_is_rejected_for_that_role_only():
         ]
     )
 
-    with pytest.raises(PDInjectionError):
-        render_pd_injection(model, _instance("prefill"), _variables())
-
-    # Decode attached nothing, so decode still renders.
+    assert render_pd_injection(model, _instance("prefill"), _variables()).args
     assert render_pd_injection(
         model, _instance("decode"), _variables(role="decode")
     ).args
@@ -391,11 +394,13 @@ def test_non_pd_deploy_takes_the_same_path_it_takes_today():
 def test_a_refused_injection_stays_refused_at_every_seam():
     """The refusal must not be cached as "nothing to inject": the seams run in
     sequence, and a seam that swallowed the first one would then start the
-    engine with neither connector."""
+    engine with neither connector.
+
+    Uses the one clash that is still a refusal — a hand-written
+    `--kv-transfer-config` under a mode that injects its own. The cache is no
+    longer one of these, because it is composed rather than refused."""
     model = _model(
-        extended_kv_cache=ExtendedKVCacheConfig(
-            enabled=True, mode=KVCacheModeEnum.SHARED, cache_service_id=7
-        )
+        backend_parameters=[KV_TRANSFER_CONFIG_FLAG, '{"kv_connector":"Mine"}']
     )
     backend = _backend(model, _instance())
 

@@ -109,6 +109,33 @@ above.
 Scaling a role is different and does **not** require a restart: adding a prefill
 adds a prefill.
 
+## Using a shared KV cache with it
+
+A disaggregated deployment and a shared KV cache are complementary rather than
+alternatives, and GPUStack combines them for you: attach a cache service as
+usual and the two connectors are folded into one configuration the engine
+accepts.
+
+The order differs per role, and it is the order that makes the pair worth
+having:
+
+- **Prefill asks the cache first.** A prefix the cache already holds is prefill
+  work that does not have to happen at all, and what remains is the part
+  disaggregation exists to speed up. The KV it does compute is written back to
+  the cache *and* handed to decode in the same step.
+- **Decode asks its own prefill first.** The request already carries the
+  handshake saying its KV is waiting there; the cache is the fallback behind
+  it.
+
+This also widens where disaggregation pays. Its usual objection is that a
+workload with a high prefix hit rate turns prefill memory-bound, which removes
+the asymmetry the split is built on — attaching a cache on the prefill side
+removes the hit part of that cost entirely, leaving the part the split actually
+helps with.
+
+Which roles take a cache is per role, so attaching one only to prefill is a
+supported and often sufficient configuration.
+
 ## Networking requirements
 
 ### The KV interface
@@ -176,11 +203,11 @@ save time rather than at run time:
 - **A role's engine must be one the chosen mode can configure.** Mixing engines
   across roles requires the `custom` mode, where the connection parameters are
   yours to supply.
-- **A disaggregated deployment cannot also use an extended KV cache** on a role
-  whose mode configures a KV connector. GPUStack writes one connector into the
-  engine's KV transfer setting, so it cannot configure both. The engine itself
-  can compose connectors, so the combination is not impossible — it is not
-  assembled for you. Use the `custom` mode if you want to write it yourself.
+- **A disaggregated deployment using the `custom` mode cannot also use an
+  extended KV cache.** Every other mode composes the two for you (see
+  [Using a shared KV cache with it](#using-a-shared-kv-cache-with-it));
+  `custom` injects no connector configuration at all, so there is nothing to
+  compose the cache into — write the combined configuration yourself.
 - **Scheduled scaling and disaggregation cannot be combined.**
 
 ## Limitations

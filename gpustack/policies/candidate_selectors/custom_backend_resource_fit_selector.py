@@ -44,7 +44,13 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
     - Supports both GPU and CPU-only deployments
     """
 
-    def __init__(self, cfg: Config, model: Model, model_instances: List[ModelInstance]):
+    def __init__(
+        self,
+        cfg: Config,
+        model: Model,
+        model_instances: List[ModelInstance],
+        cpu_only: bool = False,
+    ):
         super().__init__(cfg, model, model_instances)
         self._event_collector = EventCollector(model, logger)
         self._messages = []
@@ -52,6 +58,13 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
         # Estimated resource requirements
         self._vram_claim = 0
         self._ram_claim = 0
+
+        # Set for a member that takes no accelerator at all — today, a
+        # disaggregated group's router. Distinct from `cpu_offloading`, which
+        # means "GPU placement preferred, CPU acceptable": this one means the
+        # GPU paths must not be tried, because a candidate found on one would
+        # be a router holding a card it will never use.
+        self._cpu_only = cpu_only
 
         self._set_gpu_count()
 
@@ -101,15 +114,24 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
         """
         Get schedule candidates that fit the GPU resources requirement.
         """
-        # Estimate VRAM requirements using actual model weight
-        self._vram_claim = await estimate_model_vram(
-            self._model, self._config.huggingface_token, workers
-        )
+        if self._cpu_only:
+            # Deliberately not estimated. `estimate_model_vram` sizes the
+            # model's weights, and this member never loads them — a router
+            # proxies requests to the members that do. Estimating anyway is
+            # not merely wasted work: it is what made a router ask for the
+            # weights' worth of VRAM and sit unschedulable on a full host.
+            self._vram_claim = 0
+            self._ram_claim = 2 * 1024**3
+        else:
+            # Estimate VRAM requirements using actual model weight
+            self._vram_claim = await estimate_model_vram(
+                self._model, self._config.huggingface_token, workers
+            )
 
-        # Estimate RAM requirements (conservative estimate)
-        self._ram_claim = max(
-            int(self._vram_claim * 0.1), 2 * 1024**3
-        )  # At least 2GB RAM
+            # Estimate RAM requirements (conservative estimate)
+            self._ram_claim = max(
+                int(self._vram_claim * 0.1), 2 * 1024**3
+            )  # At least 2GB RAM
 
         logger.info(
             f"Calculated resource claim for model {self._model.readable_source}, "
@@ -128,15 +150,21 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
         )
 
         # Try different candidate selection strategies
-        candidate_functions = [
-            self.find_manual_gpu_selection_candidates,
-            self.find_single_worker_single_gpu_candidates,
-            self.find_single_worker_multi_gpu_candidates,
-        ]
+        if self._cpu_only:
+            # The only path. Listing the GPU ones first and relying on them
+            # finding nothing would place the router on a card whenever one
+            # happened to be free.
+            candidate_functions = [self._find_cpu_only_candidates]
+        else:
+            candidate_functions = [
+                self.find_manual_gpu_selection_candidates,
+                self.find_single_worker_single_gpu_candidates,
+                self.find_single_worker_multi_gpu_candidates,
+            ]
 
-        # Add CPU-only candidates if supported
-        if self._model.cpu_offloading:
-            candidate_functions.append(self._find_cpu_only_candidates)
+            # Add CPU-only candidates if supported
+            if self._model.cpu_offloading:
+                candidate_functions.append(self._find_cpu_only_candidates)
 
         for candidate_func in candidate_functions:
             if self.should_skip_candidate_func(candidate_func):

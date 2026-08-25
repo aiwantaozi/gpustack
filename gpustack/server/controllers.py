@@ -1391,6 +1391,27 @@ async def _sync_replicas_per_role(session: AsyncSession, model: Model):
 
     digest = await model_spec_digest(session, model)
 
+    # Turning disaggregation ON leaves the previous single-role deployment's
+    # instances behind, and they cannot join a generation: they carry no role,
+    # so nothing counts them toward any role's tally, and the gateway filter —
+    # which registers only a group's router — has already stopped routing to
+    # them. What is left is a member of nothing that still holds its GPUs, and
+    # holding them is not passive: it is what keeps the new group's decode
+    # from being schedulable. Observed exactly that way on a two-card host.
+    #
+    # Retired in the same pass rather than left for an explicit restart,
+    # because enabling disaggregation is the most complete generation change
+    # there is — the deployment's shape, not its parameters — and the new
+    # generation is already being formed below.
+    orphans = [i for i in instances if not i.group_id]
+    if orphans:
+        logger.info(
+            f"Model {model.name} now declares roles; retiring "
+            f"{len(orphans)} instance(s) that predate the group"
+        )
+        await _release_and_delete(session, orphans)
+        instances = [i for i in instances if i.group_id]
+
     # The live members define the current generation, not the model's present
     # digest. A spec edit makes the running members stale; it does not by
     # itself retire them — F7 3.3 requires the switch to be an explicit

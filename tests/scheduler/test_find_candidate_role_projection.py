@@ -41,6 +41,17 @@ def _worker():
     return SimpleNamespace(id=7, name="node-a")
 
 
+def _pd_model():
+    return _model(
+        roles=[
+            RoleSpec(name="prefill", replicas=1),
+            RoleSpec(name="decode", replicas=1),
+            RoleSpec(name="router", replicas=1, cpu_only=True),
+        ],
+        disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
+    )
+
+
 class _RecordingSelector:
     """Stands in for a ScheduleCandidatesSelector and records its model."""
 
@@ -50,6 +61,9 @@ class _RecordingSelector:
         # The selectors take either (config, model, instances) or
         # (model, instances, cache_dir); the model is the first Model-ish arg.
         self.model = next(a for a in args if hasattr(a, "backend_parameters"))
+        # Only the custom selector takes it; recorded so a test can tell "the
+        # custom selector was chosen" from "it was chosen for a router".
+        self.cpu_only = kwargs.get("cpu_only", False)
         type(self).seen.append(self)
 
     async def select_candidates(self, workers):
@@ -205,3 +219,45 @@ async def test_find_candidate_does_not_mutate_the_model(harness):
 
     assert model.backend_parameters == ["--model-level"]
     assert model.replicas == 1
+
+
+# --- a cpu_only role takes no accelerator ---------------------------------- #
+
+
+def test_cpu_only_is_a_role_own_field():
+    """It must not be pushed to the Model level: "this member takes no
+    accelerator" is true of one role, and a Model-level flag would say it of
+    all of them — which is why `find_candidate` reads it before projecting."""
+    from gpustack.schemas.models import _ROLE_OVERRIDE_FIELDS, _ROLE_OWN_FIELDS
+
+    assert "cpu_only" in _ROLE_OWN_FIELDS
+    assert "cpu_only" not in _ROLE_OVERRIDE_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_a_cpu_only_role_uses_the_cpu_only_selector(harness):
+    """Observed live: the router inherited the group's vLLM backend, so a vLLM
+    selector sized the model's weights for a process that never loads them —
+    and it sat unschedulable on a host whose cards its own peers had filled."""
+    await _run(_pd_model(), role="router")
+
+    custom = harness.selectors["CustomBackendResourceFitSelector"]
+    assert len(custom.seen) == 1
+    assert custom.seen[0].cpu_only is True
+    assert not harness.selectors["VLLMResourceFitSelector"].seen
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_role_keeps_its_engines_selector(harness):
+    await _run(_pd_model(), role="prefill")
+
+    assert len(harness.selectors["VLLMResourceFitSelector"].seen) == 1
+    assert not harness.selectors["CustomBackendResourceFitSelector"].seen
+
+
+@pytest.mark.asyncio
+async def test_a_role_less_model_never_takes_the_cpu_only_path(harness):
+    await _run(_model())
+
+    assert len(harness.selectors["VLLMResourceFitSelector"].seen) == 1
+    assert not harness.selectors["CustomBackendResourceFitSelector"].seen

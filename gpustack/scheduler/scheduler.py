@@ -58,6 +58,7 @@ from gpustack.schemas.models import (
     SourceEnum,
     is_omni_model,
     role_effective_model,
+    role_takes_no_accelerator,
 )
 from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.server.bus import EventType
@@ -447,6 +448,11 @@ async def find_candidate(
                 - A list of messages for the scheduling process.
     """
 
+    # Read before projecting: `cpu_only` is a role-OWN field, deliberately not
+    # pushed up to the Model level — "this member takes no accelerator" is true
+    # of one role, and a Model-level flag would say it of all of them.
+    cpu_only = role_takes_no_accelerator(model, role)
+
     # Apply the role's overrides once, here. Every filter, selector and scorer
     # below is constructed from `model` and reads Model-level fields directly;
     # none of them knows about roles. A role-less model comes back unchanged.
@@ -472,7 +478,16 @@ async def find_candidate(
 
     # Initialize candidate selector.
     try:
-        if model.gpu_type_selector:
+        if cpu_only:
+            # Ahead of every backend branch, because the backend a router
+            # inherits is the group's engine and every one of those selectors
+            # sizes the model's weights. The router never loads them; asking
+            # for their VRAM is what leaves it unschedulable on a host whose
+            # cards its own peers have just filled.
+            candidates_selector = CustomBackendResourceFitSelector(
+                config, model, model_instances, cpu_only=True
+            )
+        elif model.gpu_type_selector:
             candidates_selector = VGPUResourceFitSelector(
                 config, model, model_instances
             )

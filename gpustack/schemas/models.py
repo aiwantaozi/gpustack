@@ -931,6 +931,34 @@ def find_role(model, role_name: Optional[str]) -> Optional[RoleSpec]:
     return None
 
 
+def role_takes_no_accelerator(model, role_name: Optional[str]) -> bool:
+    """Whether this role should be placed without claiming any GPU.
+
+    `cpu_only` on the role is the explicit answer, but it cannot be the only
+    one. A router GPUStack assembles from the mode catalog is a proxy — it
+    forwards requests to the members that hold the weights and loads none
+    itself — so "takes no accelerator" is a property of what it *is*, not a
+    preference someone remembered to tick. Measured consequence of relying on
+    the flag alone: the router inherited the group's engine, a vLLM selector
+    sized the model's weights for it, and it sat unschedulable on a two-card
+    host whose cards its own prefill and decode had just filled. The deploy
+    form only registers the flag on the hand-written branch, so every group
+    the UI has produced carries `cpu_only: false` on its router.
+
+    A router the user brings themselves is the exception, and it identifies
+    itself by carrying an image *and* a command. That one may legitimately
+    want a GPU, so its own `cpu_only` governs.
+    """
+    role = find_role(model, role_name)
+    if role is None:
+        return False
+    if role.cpu_only:
+        return True
+    if role.name != RoleNameEnum.ROUTER.value:
+        return False
+    return not (role.image_name and role.run_command)
+
+
 def role_effective_model(model, role_name: Optional[str]):
     """Return `model` with the named role's overrides applied.
 

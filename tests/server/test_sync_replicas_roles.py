@@ -676,3 +676,44 @@ async def test_a_mix_of_leftover_and_plain_instances_only_retires_the_leftovers(
     recorder = await _run(_model(replicas=1, roles=None), members)
 
     assert [i.id for i in recorder.deleted] == [1]
+
+
+# --- turning disaggregation on --------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_enabling_roles_retires_the_instances_that_predate_the_group():
+    """Observed live on a two-card host: the pre-PD instance carried no role,
+    so nothing counted it toward any role and the gateway had already stopped
+    routing to it — but it still held a GPU, and holding it is what kept the
+    new group's decode from being schedulable."""
+    legacy = [_instance(1), _instance(2)]
+    recorder = await _run(_model(replicas=1, roles=_pd_roles()), legacy)
+
+    assert len(recorder.deleted) == 2
+    assert all(i.group_id is None for i in recorder.deleted)
+
+
+@pytest.mark.asyncio
+async def test_the_group_still_forms_in_the_same_pass():
+    """Retiring is not a reason to defer forming: the new generation is what
+    the retirement is making room for."""
+    recorder = await _run(_model(replicas=1, roles=_pd_roles()), [_instance(1)])
+
+    assert len(recorder.deleted) == 1
+    assert _by_role(recorder.created) == {"prefill": 1, "decode": 1}
+
+
+@pytest.mark.asyncio
+async def test_an_established_group_keeps_its_members():
+    """Only role-less instances are orphans. A member of the current
+    generation must not be swept up by the same rule."""
+    members = [
+        _instance(1, role="prefill", group_id="1-abc", spec_digest="sha1:abc"),
+        _instance(2, role="decode", group_id="1-abc", spec_digest="sha1:abc"),
+        _instance(3, role="router", group_id="1-abc", spec_digest="sha1:abc"),
+    ]
+    recorder = await _run(_model(replicas=1, roles=_pd_roles()), members)
+
+    assert not recorder.deleted
+    assert not recorder.created

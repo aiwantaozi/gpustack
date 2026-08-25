@@ -14,6 +14,7 @@ from datetime import datetime
 import pytest
 
 from gpustack.schemas.models import (
+    role_takes_no_accelerator,
     ExtendedKVCacheConfig,
     GPUSelector,
     KVCacheModeEnum,
@@ -263,3 +264,65 @@ def test_the_projection_is_unhashable_just_like_a_model():
         {projected}
     with pytest.raises(TypeError):
         {model}
+
+
+# --- which roles take no accelerator --------------------------------------- #
+
+
+def test_a_managed_router_takes_no_accelerator_without_being_told():
+    """It is a proxy: it forwards to the members holding the weights and loads
+    none itself. Relying on the `cpu_only` flag alone was measured to leave the
+    router unschedulable on a two-card host whose cards its own prefill and
+    decode had just filled — and the deploy form only registers that flag on
+    the hand-written branch, so it is False in every group the UI produces."""
+    model = _model(
+        roles=[
+            RoleSpec(name="prefill", replicas=1),
+            RoleSpec(name="router", replicas=1, cpu_only=False),
+        ]
+    )
+
+    assert role_takes_no_accelerator(model, "router") is True
+    assert role_takes_no_accelerator(model, "prefill") is False
+
+
+def test_a_user_supplied_router_governs_itself():
+    """It identifies itself by carrying an image AND a command, and it may
+    legitimately want a GPU. The model-level image does not count — that one
+    is the engine's, not this router's."""
+
+    def _with(cpu_only):
+        return _model(
+            roles=[
+                RoleSpec(
+                    name="router",
+                    replicas=1,
+                    cpu_only=cpu_only,
+                    image_name="me/router:1",
+                    run_command="my-router",
+                )
+            ]
+        )
+
+    assert role_takes_no_accelerator(_with(False), "router") is False
+    assert role_takes_no_accelerator(_with(True), "router") is True
+
+
+def test_a_half_specified_router_is_still_managed():
+    """An image with no command cannot be launched on its own, so it is not
+    the user bringing their own router."""
+    model = _model(
+        roles=[RoleSpec(name="router", replicas=1, image_name="me/router:1")]
+    )
+    assert role_takes_no_accelerator(model, "router") is True
+
+
+def test_an_explicit_flag_wins_for_any_role():
+    model = _model(roles=[RoleSpec(name="prefill", replicas=1, cpu_only=True)])
+    assert role_takes_no_accelerator(model, "prefill") is True
+
+
+def test_a_role_less_model_takes_accelerators():
+    model = _model()
+    assert role_takes_no_accelerator(model, None) is False
+    assert role_takes_no_accelerator(model, "router") is False

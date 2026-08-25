@@ -369,3 +369,68 @@ def test_materialisation_does_not_reach_the_stored_spec():
     assert router_role.run_command is None
     assert original.run_command is None
     assert original.backend == "vLLM"
+
+
+# --- resolving the router's image ------------------------------------------ #
+
+
+def test_the_runner_image_is_resolved_against_the_groups_engine():
+    """Measured on a live cluster: the image reached Kubernetes as the literal
+    `{{runner_image}}` and the pod was rejected with InvalidImageName.
+
+    Two causes compounded. The resolution ran inside `get_model()`, before
+    `inference_backend` was assigned, so it raised and the placeholder
+    survived; and a managed router has already been switched to the custom
+    backend by then, which resolves no image by definition. The router binary
+    ships inside the ENGINE's runner image, so that is the backend to ask
+    about.
+    """
+    from types import SimpleNamespace
+
+    from gpustack.schemas.models import BackendEnum
+    from gpustack.worker.backends.base import InferenceServer
+
+    asked = {}
+
+    def _resolve_image(backend=None):
+        asked["backend"] = backend
+        return "gpustack/runner:cuda12.9-vllm0.17.1", None
+
+    fake = SimpleNamespace(
+        _worker=SimpleNamespace(ifname="eno1", name="node-a"),
+        _config=SimpleNamespace(kv_ifname=None),
+        # The unprojected model still carries the group's engine; the projected
+        # one has been switched to Custom.
+        _model_spec=SimpleNamespace(backend=BackendEnum.VLLM.value),
+        _model=SimpleNamespace(backend=BackendEnum.CUSTOM.value),
+        _resolve_image=_resolve_image,
+    )
+
+    variables = InferenceServer._pd_template_variables(fake)
+
+    assert asked["backend"] == BackendEnum.VLLM.value, (
+        "asking the custom backend yields no image, which is how the "
+        "placeholder reached Kubernetes"
+    )
+    assert variables["runner_image"] == "gpustack/runner:cuda12.9-vllm0.17.1"
+
+
+def test_get_model_does_not_materialise_the_router():
+    """The materialisation needs `inference_backend`, which `__init__` assigns
+    after `get_model()` returns. Doing it inside `get_model()` is what made the
+    resolution fail silently."""
+    import inspect
+
+    from gpustack.worker.backends import base
+
+    source = inspect.getsource(base.InferenceServer.get_model)
+    assert "_apply_managed_router" not in source
+
+    # `__init__` is wrapped by a timing decorator, so its source has to come
+    # from the file rather than from the callable.
+    text = inspect.getsource(base)
+    assigned = text.index("self.inference_backend = inference_backend")
+    materialised = text.index("self._model = self._apply_managed_router(self._model)")
+    assert (
+        assigned < materialised
+    ), "the router must be materialised after the backend registry exists"

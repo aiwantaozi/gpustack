@@ -42,6 +42,7 @@ from gpustack.schemas.runner_source import (
     merged_backend_runners,
 )
 from gpustack.schemas.models import (
+    get_backend,
     BackendEnum,
     ModelInstance,
     ModelInstanceUpdate,
@@ -227,6 +228,16 @@ class InferenceServer(ABC):
                     f"Inference backend {self._model.backend} not specified or not found"
                 )
 
+            # A managed router's image and command come from the catalog and
+            # its peers' live addresses, so they are materialised rather than
+            # stored — the addresses change on every scale. Deliberately after
+            # `inference_backend` is assigned: resolving the runner image reads
+            # it, and doing this inside `get_model()` left the image as the
+            # literal `{{runner_image}}`, which Kubernetes rejected as an
+            # invalid reference. Everything below then reads an ordinary
+            # custom-backend deployment.
+            self._model = self._apply_managed_router(self._model)
+
             logger.info("Preparing model files...")
 
             self._until_model_instance_starting()
@@ -283,12 +294,6 @@ class InferenceServer(ABC):
         # `{data_dir}` substitution, which they would miss the other way
         # round.
         model = role_effective_model(model, self._model_instance.role)
-        # A managed router's image and command come from the catalog and its
-        # peers' live addresses, so they are materialised here rather than
-        # stored: the addresses change on every scale, and a persisted command
-        # would be wrong as soon as anything moved. Everything below this line
-        # then reads an ordinary custom-backend deployment.
-        model = self._apply_managed_router(model)
         data_dir = self._config.data_dir
         for i, param in enumerate(model.backend_parameters or []):
             model.backend_parameters[i] = param.replace("{data_dir}", data_dir)
@@ -618,9 +623,18 @@ class InferenceServer(ABC):
             variables["net_device"] = net_device
 
         try:
+            # Resolved against the GROUP's engine rather than this member's
+            # backend. A managed router has already been switched to the custom
+            # backend by the time this runs, and the custom backend resolves no
+            # image by definition — its image is supposed to come from the
+            # model. The router binary ships inside the engine's runner image,
+            # so that is the one to name.
+            #
             # The raw image: no registry override and no version write-back,
             # since this is a template value, not the image being deployed.
-            runner_image, _ = self._resolve_image()
+            runner_image, _ = self._resolve_image(
+                backend=get_backend(self._model_spec or self._model)
+            )
             if runner_image:
                 variables["runner_image"] = runner_image
         except Exception as e:

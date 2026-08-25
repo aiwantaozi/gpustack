@@ -104,8 +104,42 @@ def test_the_measured_failure_detection_values_are_carried():
     command = plan.command
 
     assert command[command.index("--health-check-interval-secs") + 1] == "5"
-    assert command[command.index("--health-failure-threshold") + 1] == "1"
     assert command[command.index("--retry-max-retries") + 1] == "3"
+
+
+def test_ejection_tolerates_a_blip_and_restores_on_one_success():
+    """A role with one replica has nothing to fail over to, so ejecting it is
+    not failover, it is an outage. The health check is the background sweep;
+    the circuit breaker is the fast path, and it runs on real traffic. Letting
+    the health check try to be fast too is what a threshold of 1 did."""
+    command = render_router(get_pd_mode("vllm-nixl"), VARIABLES, PEERS).command
+
+    assert command[command.index("--health-failure-threshold") + 1] == "3"
+    # Asymmetric in the other direction is the bug: slow to condemn AND slow
+    # to forgive leaves a recovered worker out for another whole interval.
+    assert command[command.index("--health-success-threshold") + 1] == "1"
+    # Must stay strictly under the interval or checks overlap.
+    timeout = int(command[command.index("--health-check-timeout-secs") + 1])
+    interval = int(command[command.index("--health-check-interval-secs") + 1])
+    assert timeout < interval
+
+
+@pytest.mark.parametrize("mode", ["sglang-mooncake", "sglang-nixl"])
+def test_the_sglang_routers_are_hardened_too(mode):
+    """`vllm-project/router` is a fork of this gateway and its resilience
+    defaults are these ones verbatim, so the >60s of 500s measured on the vLLM
+    side is this path's behaviour too — unmeasured only because nobody has
+    killed a prefill here yet."""
+    command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
+
+    for flag, value in (
+        ("--health-check-interval-secs", "5"),
+        ("--health-failure-threshold", "3"),
+        ("--health-success-threshold", "1"),
+        ("--cb-failure-threshold", "2"),
+        ("--retry-max-retries", "3"),
+    ):
+        assert command[command.index(flag) + 1] == value
 
 
 def test_capabilities_come_from_the_catalog_not_from_assumption():

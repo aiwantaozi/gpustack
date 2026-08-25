@@ -257,16 +257,44 @@ modes:
         - round_robin
         - --decode-policy
         - round_robin
-        # The five below are not tuning. Measured with the router's own
-        # defaults, killing one prefill left >50% of requests returning 500
-        # for more than a minute (the health check interval alone defaults
-        # to 60s); with these values the same run stayed at 8/8 200s.
+        # Not tuning. Measured with the router's own defaults, killing one
+        # prefill left >50% of requests returning 500 for more than a
+        # minute; with these the same run stayed at 8/8 200s.
+        #
+        # The two mechanisms have different jobs and the values follow that
+        # split. The circuit breaker runs on the *request* path, so it sees
+        # a dead worker at real traffic rate — under load it opens in well
+        # under a second. The health check is the background sweep that
+        # catches a worker nobody happens to be routing to. Asking the
+        # health check to also be the fast path is what produced the values
+        # this replaces.
+        #
+        # `interval` is the one that was actually broken: 60s meant a dead
+        # prefill kept being selected for over a minute. Everything else
+        # here is upstream's own tolerance, restored.
         - --health-check-interval-secs
         - "5"
+        # Upstream's default, and deliberately back to it. At 1, a single
+        # slow reply ejects the worker — and for a role with one replica
+        # ejection is not failover, it is an outage, because there is
+        # nothing to fail over to. Three consecutive misses at a 5s
+        # interval is 15s to condemn a genuinely dead worker, a window the
+        # circuit breaker already covers on the request path.
         - --health-failure-threshold
+        - "3"
+        # Upstream defaults this to 2, which with the above is asymmetric in
+        # the wrong direction: slow to condemn but also slow to forgive, so
+        # a worker that recovers stays out for another interval. Restore on
+        # the first success instead — a worker that flaps is the circuit
+        # breaker's problem, and it is already watching.
+        - --health-success-threshold
         - "1"
+        # Upstream's 5 is not available once the interval is 5: a timeout at
+        # or above the interval lets checks overlap. This is the largest
+        # value that stays strictly under it with headroom, which matters
+        # because /health on a loaded engine queues behind its event loop.
         - --health-check-timeout-secs
-        - "2"
+        - "3"
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries
@@ -350,6 +378,28 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+        # The same hardening as the vLLM recipe, for the same reason and
+        # from the same source: `vllm-project/router` is a fork of this
+        # gateway, and its resilience defaults are these ones verbatim
+        # (`health_check_interval_secs = 60`, `health_failure_threshold =
+        # 3`, `health_success_threshold = 2`, `cb_failure_threshold = 10`).
+        # The >60s of 500s measured after killing a prefill on the vLLM
+        # side is therefore this path's behaviour too, unmeasured only
+        # because nobody has killed a prefill here yet. Leaving it to be
+        # discovered in production would be a choice, not an omission.
+        # See the vllm-nixl recipe for why each value is what it is.
+        - --health-check-interval-secs
+        - "5"
+        - --health-failure-threshold
+        - "3"
+        - --health-success-threshold
+        - "1"
+        - --health-check-timeout-secs
+        - "3"
+        - --cb-failure-threshold
+        - "2"
+        - --retry-max-retries
+        - "3"
       peers:
         style: repeated_flag
         # A prefill peer is "URL BOOTSTRAP_PORT": the second positional
@@ -418,6 +468,28 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+        # The same hardening as the vLLM recipe, for the same reason and
+        # from the same source: `vllm-project/router` is a fork of this
+        # gateway, and its resilience defaults are these ones verbatim
+        # (`health_check_interval_secs = 60`, `health_failure_threshold =
+        # 3`, `health_success_threshold = 2`, `cb_failure_threshold = 10`).
+        # The >60s of 500s measured after killing a prefill on the vLLM
+        # side is therefore this path's behaviour too, unmeasured only
+        # because nobody has killed a prefill here yet. Leaving it to be
+        # discovered in production would be a choice, not an omission.
+        # See the vllm-nixl recipe for why each value is what it is.
+        - --health-check-interval-secs
+        - "5"
+        - --health-failure-threshold
+        - "3"
+        - --health-success-threshold
+        - "1"
+        - --health-check-timeout-secs
+        - "3"
+        - --cb-failure-threshold
+        - "2"
+        - --retry-max-retries
+        - "3"
       peers:
         style: repeated_flag
         prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}} {{ports.bootstrap}}" }

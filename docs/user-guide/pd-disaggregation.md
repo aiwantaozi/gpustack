@@ -184,6 +184,10 @@ save time rather than at run time:
 ## Limitations
 
 - The router runs as a single replica.
+- **A `custom` router is deployed exactly as written.** The built-in modes
+  override the upstream router's failure-detection defaults, which are slow
+  enough that a dead prefill keeps being selected for over a minute; a router
+  you supply keeps whatever defaults it ships with.
 - All members of a group must use the same GPU type; a group mixing card types
   cannot be admitted atomically.
 - Roles are limited to prefill, decode and router.

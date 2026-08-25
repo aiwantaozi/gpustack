@@ -1627,7 +1627,66 @@ exec "$@"
             # Hand the operator InstanceType name to the runtime; the
             # runtime's Kubernetes deployer owns queue admission from here.
             workload.instance_type = selector.type
+        self._apply_gang_markers(workload)
         return transform_workload_plan(self._config, workload, self._fallback_registry)
+
+    def _apply_gang_markers(self, workload: WorkloadPlan) -> None:
+        """Mark this member as part of a Kueue pod-group, so its group is
+        admitted all at once or not at all.
+
+        Without it each member queues on its own, and a group can sit half
+        admitted: two of four members holding cards while the other two wait
+        for cards the first two are occupying. That is not a slow start, it is
+        a deadlock that resolves only when someone deletes the deployment.
+
+        The queue name is already set by the runtime from the InstanceType.
+        What makes those pods a *group* is two more marks, and both are
+        required — a name without a total count leaves Kueue waiting for a
+        membership it can never confirm, which is worse than no gang at all.
+
+        The count is over the GPU roles only (D11): the router takes no
+        accelerator and is created after its peers are already running, so
+        counting it would declare a membership that cannot be reached.
+        """
+        instance = self._model_instance
+        group_id = getattr(instance, "group_id", None)
+        role = getattr(instance, "role", None)
+        if not group_id or not role:
+            return
+        if role_takes_no_accelerator(self._model_spec or self._model, role):
+            # Deliberately outside the gang. See the docstring.
+            return
+
+        spec = self._model_spec or self._model
+        total = sum(
+            r.replicas
+            for r in (getattr(spec, "roles", None) or [])
+            if not role_takes_no_accelerator(spec, r.name)
+        )
+        if total <= 0:
+            return
+
+        if not hasattr(workload, "annotations"):
+            # The total count is an annotation and the group name is a label.
+            # A runtime too old to carry annotations can only deliver half the
+            # pair, and half is the one outcome worse than none: Kueue would
+            # hold the group forever waiting to learn how big it is. So this
+            # skips entirely, and says so.
+            logger.warning(
+                "The installed gpustack-runtime cannot carry workload "
+                "annotations, so %s starts without gang admission: its group "
+                "may be admitted a member at a time.",
+                instance.name,
+            )
+            return
+
+        labels = dict(workload.labels or {})
+        labels["kueue.x-k8s.io/pod-group-name"] = group_id
+        workload.labels = labels
+
+        annotations = dict(workload.annotations or {})
+        annotations["kueue.x-k8s.io/pod-group-total-count"] = str(total)
+        workload.annotations = annotations
 
 
 def _get_service_version_from_versioned_runner(

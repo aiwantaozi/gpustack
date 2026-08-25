@@ -54,6 +54,13 @@ from gpustack.worker.model_meta import get_meta_from_running_instance
 from gpustack.client import ClientSet
 from gpustack.worker.pd_router import apply_managed_router
 from gpustack.worker.pd_diagnostics import RestartTracker, diagnose
+
+try:
+    from gpustack_runtime.deployer import ANNOTATION_KUEUE_RETRIABLE_IN_GROUP
+except ImportError:  # pragma: no cover - depends on the installed runtime
+    # A runtime that cannot annotate on delete simply does not get the D19
+    # marking. Deleting still works; the quota release waits for the bump.
+    ANNOTATION_KUEUE_RETRIABLE_IN_GROUP = None
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
@@ -1845,6 +1852,48 @@ class ServeManager:
                     range(band.base, band.base + max(band.count, 1))
                 )
 
+    def _gang_delete_annotations(self, mi: ModelInstance) -> Dict[str, dict]:
+        """Tell Kueue whether this member's group is finished, or whether the
+        member is merely being replaced.
+
+        That distinction is the whole of D19. Kueue holds an admitted
+        pod-group's quota while it waits for a replacement member, which is
+        exactly what a group wants when one member crashes. It is exactly wrong
+        when the group is being retired: the quota is never released, the Pod
+        sits in Terminating behind Kueue's own finalizer, and the cards stay
+        claimed by a deployment that no longer exists.
+
+        Told apart by asking whether any sibling of this generation survives.
+        The server retires a whole generation in one transaction, so by the
+        time a worker reacts to any member's removal the others are gone too —
+        while a scale-down of one member out of three leaves two behind. That
+        needs no new field, and leaves no way for the two sides to disagree
+        about what is being torn down.
+
+        Returns kwargs rather than a value so a runtime without the capability
+        takes today's path untouched.
+        """
+        group_id = getattr(mi, "group_id", None)
+        if not group_id or not ANNOTATION_KUEUE_RETRIABLE_IN_GROUP:
+            return {}
+        try:
+            siblings = self._clientset.model_instances.list(
+                params={"model_id": mi.model_id}
+            )
+            members = getattr(siblings, "items", siblings) or []
+        except Exception as e:
+            # Failing to look is not failing to delete. Leaving the annotation
+            # off risks a leaked quota; refusing to delete guarantees one.
+            logger.warning(f"Could not check whether {mi.name}'s group survives: {e}")
+            return {}
+
+        if any(
+            m.id != mi.id and getattr(m, "group_id", None) == group_id for m in members
+        ):
+            # A replacement, not a retirement. Kueue should keep the quota.
+            return {}
+        return {"annotations": {ANNOTATION_KUEUE_RETRIABLE_IN_GROUP: "false"}}
+
     def _mark_crash_loop(
         self, mi: ModelInstance, workload, is_main_worker: bool
     ) -> bool:
@@ -2182,7 +2231,9 @@ class ServeManager:
         # Delete workload.
         deployment_metadata = mi.get_deployment_metadata(self._worker_id)
         if deployment_metadata:
-            delete_workload(deployment_metadata.name)
+            delete_workload(
+                deployment_metadata.name, **self._gang_delete_annotations(mi)
+            )
 
         # Cleanup internal states.
         self._provisioning_processes.pop(mi.id, None)

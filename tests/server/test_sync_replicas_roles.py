@@ -544,6 +544,13 @@ async def _sync_status(model, instances, snapshot=None):
                 return_value=[SimpleNamespace(snapshot=snapshot)] if snapshot else []
             ),
         ),
+        # Placement drift reads the owner Principal and the Cluster; this
+        # harness runs against a mock session. Covered in
+        # tests/server/test_workload_namespace.py.
+        patch(
+            "gpustack.server.controllers.resolve_workload_namespace",
+            AsyncMock(return_value=None),
+        ),
         patch("gpustack.server.controllers.ModelService", service),
     ):
         await sync_model_status(MagicMock(), model)

@@ -22,6 +22,7 @@ from gpustack.schemas.models import ModelInstance
 from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.server.workload_namespace import (
     WorkloadNamespaceEnsurer,
+    placement_drifted,
     resolve_workload_namespace,
 )
 
@@ -115,6 +116,76 @@ def test_a_benchmark_hands_its_namespace_to_the_deployment():
         namespace="gpustack-acme",
     )
     assert benchmark.get_deployment_metadata().namespace == "gpustack-acme"
+
+
+# --- what an upgrade leaves behind ------------------------------------------
+
+
+def _mi(namespace):
+    return SimpleNamespace(namespace=namespace)
+
+
+def test_members_left_in_the_old_namespace_are_reported():
+    """An upgrade does not move running Pods, and should not. But those Pods
+    hold accelerators the tenant's queue has no record of, so the optimism has
+    to be stated rather than left for someone to discover as a stuck gang."""
+    assert placement_drifted([_mi(None), _mi(None)], "gpustack-acme") is True
+
+
+def test_a_half_converged_model_still_counts_as_drifted():
+    assert placement_drifted([_mi("gpustack-acme"), _mi(None)], "gpustack-acme") is True
+
+
+def test_members_where_they_belong_are_not_reported():
+    assert placement_drifted([_mi("gpustack-acme")], "gpustack-acme") is False
+
+
+def test_a_renamed_org_moves_the_target_and_that_is_drift_too():
+    # The Pods have not moved; the namespace they should be in has. Same fact,
+    # same cure, so it must not need a second concept.
+    assert placement_drifted([_mi("gpustack-old")], "gpustack-new") is True
+
+
+def test_nothing_drifts_when_there_is_nowhere_to_drift_to():
+    """A Docker cluster has no namespaces. Reporting every instance as
+    misplaced there would be a permanent warning with no action behind it."""
+    assert placement_drifted([_mi(None), _mi(None)], None) is False
+
+
+@pytest.mark.asyncio
+async def test_a_docker_cluster_is_given_no_namespace():
+    from gpustack.schemas.clusters import ClusterProvider
+
+    cluster = SimpleNamespace(id=1, provider=ClusterProvider.Docker)
+    with (
+        patch(
+            "gpustack.server.workload_namespace.Cluster.one_by_id",
+            AsyncMock(return_value=cluster),
+        ),
+        patch.object(Principal, "one_by_id", AsyncMock()) as principal,
+    ):
+        assert await resolve_workload_namespace(MagicMock(), 7, cluster_id=1) is None
+    # Short-circuited before the owner lookup: there is nothing to name.
+    principal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_kubernetes_cluster_is_given_one():
+    from gpustack.schemas.clusters import ClusterProvider
+
+    cluster = SimpleNamespace(id=1, provider=ClusterProvider.Kubernetes)
+    org = Principal(id=7, kind=PrincipalType.ORG, name="acme")
+    with (
+        patch(
+            "gpustack.server.workload_namespace.Cluster.one_by_id",
+            AsyncMock(return_value=cluster),
+        ),
+        patch.object(Principal, "one_by_id", AsyncMock(return_value=org)),
+    ):
+        assert (
+            await resolve_workload_namespace(MagicMock(), 7, cluster_id=1)
+            == "gpustack-acme"
+        )
 
 
 # --- ensuring it exists -----------------------------------------------------

@@ -93,6 +93,7 @@ from gpustack.server.cache_services import resolve_instance_cache_config_safe
 from gpustack.server.pd_observability import get_pd_observation
 from gpustack.server.workload_namespace import (
     WorkloadNamespaceEnsurer,
+    placement_drifted,
     resolve_workload_namespace,
 )
 from gpustack.schemas.workers import (
@@ -405,7 +406,9 @@ class ModelController:
                 await self._namespaces.ensure(
                     session,
                     model.cluster_id,
-                    await resolve_workload_namespace(session, model.owner_principal_id),
+                    await resolve_workload_namespace(
+                        session, model.owner_principal_id, model.cluster_id
+                    ),
                 )
                 await sync_replicas(session, model)
                 # The status owner has to run on the spec side too, not only on
@@ -874,7 +877,7 @@ class CacheServiceController:
                 existing_worker_ids.add(instance.worker_id)
 
         namespace = await resolve_workload_namespace(
-            session, service.owner_principal_id
+            session, service.owner_principal_id, service.cluster_id
         )
         if desired_worker_ids - existing_worker_ids:
             await self._namespaces.ensure(session, service.cluster_id, namespace)
@@ -1079,7 +1082,9 @@ async def sync_replicas(session: AsyncSession, model: Model):
 
     # Resolved once per pass rather than per row: it is the same answer for
     # every instance of a model, and the answer costs a query.
-    namespace = await resolve_workload_namespace(session, model.owner_principal_id)
+    namespace = await resolve_workload_namespace(
+        session, model.owner_principal_id, model.cluster_id
+    )
 
     if model.roles:
         return await _sync_replicas_per_role(session, model, namespace)
@@ -2291,6 +2296,14 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         state_message = "; ".join(m for m in (state_message, detail) if m) or None
 
     state_message = _apply_pd_observation(model, reasons, state_message)
+
+    if instances and placement_drifted(
+        instances,
+        await resolve_workload_namespace(
+            session, model.owner_principal_id, model.cluster_id
+        ),
+    ):
+        reasons.append(DegradationReasonEnum.PLACEMENT_DRIFTED.value)
 
     degradations = reasons or None
 

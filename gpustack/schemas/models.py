@@ -643,6 +643,20 @@ class DegradationReasonEnum(str, Enum):
     RATIO_UNMET = "ratio_unmet"
     NO_ATOMIC_ADMISSION = "no_atomic_admission"
 
+    PLACEMENT_DRIFTED = "placement_drifted"
+    """Members are deployed somewhere other than where one created now would
+    go — almost always an upgrade that introduced per-tenant namespaces, and
+    occasionally an Org rename that moved the target while the Pods stayed.
+
+    Deliberately a degradation and not a lifecycle value, and deliberately not
+    fixed automatically: the members serve normally and every operation still
+    finds them, so moving them would mean restarting healthy containers during
+    an upgrade — a worse outcome than the one it fixes. But it cannot be
+    silent either. Those Pods hold accelerators that the tenant's queue has no
+    record of, so gang admission is optimistic by exactly those cards until
+    they cycle. Restarting the model converges it, at a time of the operator's
+    choosing."""
+
     def __str__(self):
         return self.value
 

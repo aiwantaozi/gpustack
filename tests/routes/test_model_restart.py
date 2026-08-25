@@ -67,7 +67,7 @@ def _instance(id, role=None, spec_digest=TARGET) -> ModelInstance:
     )
 
 
-async def _restart(model, instances):
+async def _restart(model, instances, namespace=None):
     deleted = []
 
     async def _batch_delete(rows):
@@ -85,6 +85,13 @@ async def _restart(model, instances):
         patch(
             "gpustack.routes.models.ModelInstance.all_by_fields",
             AsyncMock(return_value=instances),
+        ),
+        # Placement drift reads the owner Principal and the Cluster; this
+        # harness runs against a mock session. Covered separately in
+        # tests/server/test_workload_namespace.py.
+        patch(
+            "gpustack.routes.models.resolve_workload_namespace",
+            AsyncMock(return_value=namespace),
         ),
         patch("gpustack.routes.models.ModelInstanceService", service),
     ):
@@ -177,3 +184,51 @@ def test_the_endpoint_takes_no_role_parameter():
 
     params = set(inspect.signature(restart_model).parameters)
     assert params == {"session", "ctx", "id"}
+
+
+# --- placement is something to converge too -------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_members_left_in_the_old_namespace_are_restarted():
+    """An upgrade leaves running members where they were, on purpose. This is
+    the cure for that, and without it `placement_drifted` would be a marker
+    whose only remedy is deleting the model."""
+    model = _model()
+    instances = [_instance(1, spec_digest=TARGET), _instance(2, spec_digest=TARGET)]
+    for instance in instances:
+        instance.namespace = None
+
+    result, deleted = await _restart(model, instances, namespace="gpustack-acme")
+
+    assert result.restarted is True
+    assert len(deleted) == 2
+    assert "tenant's namespace" in result.message
+
+
+@pytest.mark.asyncio
+async def test_members_already_where_they_belong_are_left_alone():
+    """Placement drift must not make the endpoint stop being idempotent: a
+    converged group still reports `restarted: false` rather than bouncing
+    healthy containers on every call."""
+    model = _model()
+    instances = [_instance(1, spec_digest=TARGET)]
+    instances[0].namespace = "gpustack-acme"
+
+    result, deleted = await _restart(model, instances, namespace="gpustack-acme")
+
+    assert result.restarted is False
+    assert deleted == []
+
+
+@pytest.mark.asyncio
+async def test_a_docker_deployment_never_looks_drifted():
+    """Its instances carry no namespace and there is none to move them to, so
+    a restart there must stay driven by the digest alone."""
+    model = _model()
+    instances = [_instance(1, spec_digest=TARGET)]
+
+    result, deleted = await _restart(model, instances, namespace=None)
+
+    assert result.restarted is False
+    assert deleted == []

@@ -41,6 +41,10 @@ from gpustack.api.tenant import (
     tenant_list_conditions,
 )
 from gpustack.server.db import async_session
+from gpustack.server.workload_namespace import (
+    placement_drifted,
+    resolve_workload_namespace,
+)
 from gpustack.server.deps import (
     CurrentUserDep,
     ListParamsDep,
@@ -1421,6 +1425,14 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     operation this endpoint names is "converge to the current spec", not
     "cycle the processes". A restart still in flight is a 409 — the members are
     mid-replacement and a second teardown would delete the replacements.
+
+    Placement counts as something to converge, even though it is not part of
+    the digest. It is not part of the digest because it is not user intent —
+    nobody asks for a namespace — but "where the members are" is still part of
+    what the current configuration would produce, and after an upgrade that
+    introduced per-tenant namespaces it is the only part that differs. Without
+    this, `placement_drifted` would be a marker with no cure but deleting the
+    model.
     """
     model = await Model.one_by_id(session, id)
     assert_resource_visible(ctx, model, not_found_message="Model not found")
@@ -1447,7 +1459,13 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
             "converged."
         )
 
-    if digests == {target}:
+    drifted = placement_drifted(
+        instances,
+        await resolve_workload_namespace(
+            session, model.owner_principal_id, model.cluster_id
+        ),
+    )
+    if digests == {target} and not drifted:
         return ModelRestartResult(
             spec_digest=target,
             restarted=False,
@@ -1467,8 +1485,13 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         spec_digest=target,
         restarted=True,
         deleted_instances=deleted,
-        message="Instances retired; the group will re-form on the current "
-        "configuration.",
+        message=(
+            "Instances retired; the group will re-form in its tenant's "
+            "namespace on the current configuration."
+            if drifted and digests == {target}
+            else "Instances retired; the group will re-form on the current "
+            "configuration."
+        ),
     )
 
 

@@ -24,6 +24,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from gpustack.schemas.principals import Principal
 from gpustack.schemas.models import (
     DegradationReasonEnum,
     DisaggregationSpec,
@@ -683,6 +684,9 @@ async def db_session():
     async with engine.begin() as conn:
         await conn.run_sync(Model.__table__.create)
         await conn.run_sync(ModelInstance.__table__.create)
+        # The status owner resolves the model's workload namespace from
+        # its owner Principal, so the round-trip needs that table too.
+        await conn.run_sync(Principal.__table__.create)
     async with AsyncSession(engine) as session:
         yield session
     await engine.dispose()
@@ -719,6 +723,13 @@ async def _sync(model, instances):
         patch(
             "gpustack.server.controllers.ModelInstance.all_by_field",
             AsyncMock(return_value=instances),
+        ),
+        # Placement drift reads the owner Principal and the Cluster; this
+        # harness runs against a mock session. Covered in
+        # tests/server/test_workload_namespace.py.
+        patch(
+            "gpustack.server.controllers.resolve_workload_namespace",
+            AsyncMock(return_value=None),
         ),
         patch("gpustack.server.controllers.ModelService", service),
     ):

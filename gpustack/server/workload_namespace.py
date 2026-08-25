@@ -14,7 +14,7 @@ namespace and therefore the same quota domain.
 """
 
 import logging
-from typing import Optional, Set, Tuple
+from typing import Any, Iterable, Optional, Set, Tuple
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -25,7 +25,7 @@ from gpustack.gpu_instances.cluster_apis_util import (
     parse_namespace_name,
     principal_namespace_identifier,
 )
-from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.clusters import Cluster, ClusterProvider
 from gpustack.schemas.principals import Principal
 
 logger = logging.getLogger(__name__)
@@ -34,18 +34,31 @@ logger = logging.getLogger(__name__)
 async def resolve_workload_namespace(
     session: AsyncSession,
     owner_principal_id: Optional[int],
+    cluster_id: Optional[int] = None,
 ) -> Optional[str]:
     """The namespace workloads owned by ``owner_principal_id`` are deployed in.
 
-    Returns None when the owner cannot be resolved, which is not an error the
-    caller has to handle: a workload declaring no namespace is deployed to the
-    deployer's configured default, exactly where every workload went before
-    namespaces were per-tenant. Losing tenant isolation is the lesser failure
-    against refusing to deploy at all — but it is worth a log line, because a
-    workload landing there is invisible to the tenant's LocalQueue.
+    Returns None when there is no namespace to name — either because the owner
+    cannot be resolved, or because the cluster has no such concept. None is not
+    an error the caller has to handle: a workload declaring no namespace is
+    deployed to the deployer's configured default, exactly where every workload
+    went before namespaces were per-tenant. Losing tenant isolation is the
+    lesser failure against refusing to deploy at all — but a *resolvable* owner
+    failing to resolve is worth a log line, because a workload landing there is
+    invisible to the tenant's LocalQueue.
+
+    A Docker cluster returns None because a namespace there is not merely
+    unused, it does not exist: recording one would put a fact in the row that
+    is false, and the placement-drift check downstream would then report every
+    Docker instance as misplaced with nowhere to move it to.
     """
     if owner_principal_id is None:
         return None
+
+    if cluster_id is not None:
+        cluster = await Cluster.one_by_id(session, cluster_id)
+        if cluster is None or cluster.provider != ClusterProvider.Kubernetes:
+            return None
 
     principal = await Principal.one_by_id(session, owner_principal_id)
     if principal is None:
@@ -58,6 +71,33 @@ async def resolve_workload_namespace(
         return None
 
     return get_namespace_name(principal_namespace_identifier(principal))
+
+
+def placement_drifted(
+    instances: Iterable[Any],
+    target_namespace: Optional[str],
+) -> bool:
+    """Whether any of these workloads sits somewhere other than where one
+    created now would go.
+
+    This is what an upgrade leaves behind, and leaving it behind is the right
+    default: the workloads keep serving, every operation still finds them, and
+    they move on the next restart. What is *not* acceptable is that being
+    silent, because a Pod in the old namespace holds real accelerators that
+    the tenant's queue has no record of — so quota accounting is optimistic by
+    exactly those cards until the instance cycles.
+
+    A target of None means there is nowhere to move to (a Docker cluster, or
+    an owner that cannot be resolved), so nothing can have drifted from it.
+    Reported for a namespace that merely *changed* too — an Org rename moves
+    the target while the Pods stay put, which is the same fact.
+    """
+    if target_namespace is None:
+        return False
+    return any(
+        getattr(instance, "namespace", None) != target_namespace
+        for instance in instances
+    )
 
 
 class WorkloadNamespaceEnsurer:

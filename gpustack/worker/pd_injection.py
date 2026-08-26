@@ -49,10 +49,13 @@ not the string "5600" — while a value with text around it stays a string."""
 # Parallelism is not a `RoleSpec` field: it is an engine parameter, and the
 # Ascend recipe needs each side's connector config to carry the other side's.
 # Read from the role's effective backend parameters under the spellings the
-# two engines accept. An absent one stays unresolved rather than defaulting to
-# the engine's 1 — GPUStack injects a tensor-parallel size of its own further
-# down the vLLM path, so "not written by the user" does not mean "1", and a
-# wrong tp_size in a Mooncake descriptor is a pairing that fails at handshake.
+# two engines accept. What an absent one means depends on the member: for one
+# on a single worker the engine derives tp from the cards it was given and runs
+# dp at 1, so `_implicit_parallelism` supplies exactly that rule. For a member
+# spanning workers the shape decides, that decision is made further down the
+# vLLM path, and a guess here would put a number in a Mooncake descriptor the
+# engine then contradicts — a pairing that fails at handshake. So there it
+# stays unresolved, and the launch refuses rather than starting wrong.
 _PARALLELISM_ALIASES: Dict[str, List[str]] = {
     "tensor_parallel_size": ["tensor-parallel-size", "tp", "tp-size"],
     "data_parallel_size": ["data-parallel-size", "dp", "dp-size"],
@@ -191,6 +194,7 @@ def render_pd_injection(
     }
 
     injection = PDInjection(env=env, args=args, files=files)
+    _refuse_unrendered(injection, where)
     logger.info(
         "PD injection for role '%s' of mode '%s': %d env, %d args, %d files.",
         role_name,
@@ -200,6 +204,53 @@ def render_pd_injection(
         len(injection.files),
     )
     return injection
+
+
+_ANY_PLACEHOLDER = re.compile(r"\{\{[A-Za-z_][A-Za-z0-9_.]*\}\}")
+
+
+def _refuse_unrendered(injection: "PDInjection", where: str) -> None:
+    """Stop a launch carrying a placeholder that never got a value.
+
+    The renderer deliberately leaves an unknown name in place rather than
+    blanking it, because a blank is a plausible-looking wrong value. That is
+    right for the render and wrong for the launch: the string then travels all
+    the way into the engine.
+
+    An *argument* survives that trip visibly — vLLM echoes its argv into the
+    log, and the log scanner recognises the shape. An *environment variable*
+    does not. `HCCL_SOCKET_IFNAME={{net_device}}` reaches HCCL as the literal
+    name of an interface that does not exist, and what comes back is a
+    transport that quietly never connects. Measured on 910B2, where the host
+    has six candidate NICs and `derive_net_device` correctly refuses to guess
+    between them — the refusal was right and its consequence was invisible.
+
+    So the check moves to where both halves are already in hand and neither
+    has left the process yet. Raising rather than warning, for the reason
+    `PDInjectionError` exists: a PD member that starts without its connection
+    state joins a group it cannot hand KV to and answers 200 to everything.
+    """
+    unrendered = []
+    for name, value in sorted(injection.env.items()):
+        for match in _ANY_PLACEHOLDER.finditer(str(value)):
+            unrendered.append(f"{name}={match.group(0)}")
+    for token in injection.args:
+        for match in _ANY_PLACEHOLDER.finditer(str(token)):
+            unrendered.append(match.group(0))
+
+    if not unrendered:
+        return
+
+    # Named individually rather than counted: the operator has to know which
+    # one to go and set, and `{{net_device}}` and `{{ports.kv_port}}` are
+    # fixed in entirely different places.
+    raise PDInjectionError(
+        f"{where}: {len(unrendered)} configuration value(s) would reach the "
+        f"engine unrendered — {', '.join(unrendered)}. A placeholder with no "
+        "value is a port band that was not allocated, a network interface "
+        "that could not be derived (set `kv_ifname` on the worker when the "
+        "host has several), or a parallelism the role never declared."
+    )
 
 
 def _pd_variables(
@@ -215,11 +266,11 @@ def _pd_variables(
     context.update(_port_variables(instance))
     context.update(_disaggregation_variables(getattr(model, "disaggregation", None)))
     context.update(_kv_lease_variables(mode))
-    context.update(_cross_role_variables(model))
+    context.update(_cross_role_variables(model, instance))
     # The running role's own fields, unprefixed: a declaration referring to
     # its own parallelism writes {{tensor_parallel_size}}, and only the
     # cross-role case needs the prefix.
-    context.update(_role_fields(effective, getattr(instance, "role", None)))
+    context.update(_role_fields(effective, getattr(instance, "role", None), instance))
     return context
 
 
@@ -302,7 +353,7 @@ def _apply_kv_lease_env(mode: PDMode, env: Dict[str, str], where: str) -> None:
     env[lease.param] = str(value)
 
 
-def _cross_role_variables(model) -> Dict[str, object]:
+def _cross_role_variables(model, instance=None) -> Dict[str, object]:
     """`{{roles.<role>.<field>}}` — the coupling Mooncake needs and NIXL does
     not: prefill's connector config carries decode's parallelism and vice
     versa. Each role is resolved through its own projection, so a role that
@@ -314,12 +365,14 @@ def _cross_role_variables(model) -> Dict[str, object]:
         if not name:
             continue
         projected = role_effective_model(model, name)
-        for field, value in _role_fields(projected, name).items():
+        for field, value in _role_fields(projected, name, instance).items():
             context[f"roles.{name}.{field}"] = value
     return context
 
 
-def _role_fields(effective, role_name: Optional[str]) -> Dict[str, object]:
+def _role_fields(
+    effective, role_name: Optional[str], instance=None
+) -> Dict[str, object]:
     """One role's referenceable fields, read off its effective Model."""
     fields: Dict[str, object] = {}
     role = None
@@ -342,7 +395,50 @@ def _role_fields(effective, role_name: Optional[str]) -> Dict[str, object]:
             value = None
         if value is not None:
             fields[field] = value
+
+    fields.update(_implicit_parallelism(fields, instance, role_name))
     return fields
+
+
+def _implicit_parallelism(
+    declared: Dict[str, object], instance, role_name: Optional[str]
+) -> Dict[str, object]:
+    """The parallelism a single-worker member has whether or not it says so.
+
+    A role that writes no `--tensor-parallel-size` is not a role with an
+    unknown one: for a member on a single worker the engine path derives it
+    from the cards the member was given, and a member with no data parallelism
+    runs at one. Both are the rule the engine will apply, read at a point that
+    already knows the inputs — not a default chosen here.
+
+    Why this is needed at all: the Ascend recipe's connector config carries
+    *both* sides' parallelism, so a 1P1D whose roles declare none left
+    `{{roles.prefill.data_parallel_size}}` in the launch. Measured on 910B2 —
+    every deployment failed until the user wrote out parameters that only
+    restated what the engine was going to do anyway.
+
+    Deliberately silent for a member spanning workers. There the shape decides
+    dp and dpl, that decision happens further down the vLLM path, and guessing
+    here would put a number in a Mooncake descriptor that the engine then
+    contradicts — a pairing that fails at handshake, which is worse than the
+    launch refusing.
+    """
+    if instance is None or _spans_workers(instance):
+        return {}
+
+    out: Dict[str, object] = {}
+    if "tensor_parallel_size" not in declared:
+        cards = len(getattr(instance, "gpu_indexes", None) or [])
+        if cards:
+            out["tensor_parallel_size"] = cards
+    if "data_parallel_size" not in declared:
+        out["data_parallel_size"] = 1
+    return out
+
+
+def _spans_workers(instance) -> bool:
+    servers = getattr(instance, "distributed_servers", None)
+    return bool(servers and getattr(servers, "subordinate_workers", None))
 
 
 def _render_tree(value: Any, variables: Dict[str, object], where: str) -> Any:

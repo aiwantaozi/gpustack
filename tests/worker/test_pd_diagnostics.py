@@ -298,3 +298,32 @@ def test_a_missing_transport_library_is_named_as_a_packaging_fault():
     assert diagnosis is not None
     assert diagnosis.signature == "kv transport library missing"
     assert "packaging" in diagnosis.summary
+
+
+def test_a_failed_kv_transfer_is_recognised():
+    """The worst failure this module exists for, because nothing else sees it.
+
+    Measured on 910B2 across two hosts: the transfer raised, decode generated
+    from blocks it never received, the engine reported an external prefix-cache
+    hit rate of 100%, and the caller got a 200 whose content was the token "ee"
+    repeated to the length limit. Mooncake exports no Prometheus counter, so
+    the transfer metrics cannot see it either — this log line is the only
+    evidence that exists."""
+    log = (
+        "(EngineCore pid=136) ERROR 08-27 01:01:36 [mooncake_hybrid_connector.py:463] "
+        "RuntimeError: Mooncake transfer failed, ret: -1"
+    )
+
+    diagnosis = diagnose(log)
+
+    assert diagnosis is not None
+    assert diagnosis.signature == "kv transfer failed"
+    assert "200" in diagnosis.summary
+
+
+def test_a_healthy_log_is_not_diagnosed_as_a_failed_transfer():
+    log = (
+        "(EngineCore) [mooncake_hybrid_connector.py:813] KV cache transfer took 2.02 ms"
+    )
+
+    assert diagnose(log) is None

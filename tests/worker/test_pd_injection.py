@@ -171,28 +171,36 @@ def test_custom_mode_injects_nothing():
     )
 
 
-def test_unallocated_port_band_survives_verbatim_and_warns(caplog):
+def test_an_unallocated_port_band_stops_the_launch(caplog):
+    """The renderer still leaves the placeholder rather than blanking it — a
+    blank port is a plausible-looking wrong value — but the launch no longer
+    proceeds with it. An argument carrying one is at least visible in the
+    engine's echoed argv; an env var is not, and the port band lands in a
+    variable."""
     with caplog.at_level(logging.WARNING):
-        injection = render_pd_injection(
-            _model(), _instance(named_ports={}), _variables()
-        )
+        with pytest.raises(PDInjectionError, match="ports.kv_side_channel"):
+            render_pd_injection(_model(), _instance(named_ports={}), _variables())
 
-    # Not blanked: a blank port is a plausible-looking wrong value, while the
-    # literal is the M0 failure that names itself
-    # (ZMQError: No such device (addr='tcp://{{worker_ip}}:5600')).
-    assert injection.env["VLLM_NIXL_SIDE_CHANNEL_PORT"] == "{{ports.kv_side_channel}}"
     assert "ports.kv_side_channel" in caplog.text
 
 
-def test_unresolved_net_device_survives_verbatim(caplog):
+def test_an_underivable_net_device_stops_the_launch(caplog):
+    """Measured on 910B2: the host has six candidate NICs, `derive_net_device`
+    correctly refuses to guess between them, and `HCCL_SOCKET_IFNAME` reached
+    HCCL as the literal string `{{net_device}}` — the name of an interface that
+    does not exist. Nothing failed loudly; the transport simply never
+    connected.
+
+    The message has to name the escape hatch, because the operator's next
+    question is where to put the answer."""
     variables = _variables()
     variables.pop("net_device")
 
     with caplog.at_level(logging.WARNING):
-        injection = render_pd_injection(_model(), _instance(), variables)
+        with pytest.raises(PDInjectionError, match="kv_ifname") as e:
+            render_pd_injection(_model(), _instance(), variables)
 
-    assert injection.env["UCX_NET_DEVICES"] == "{{net_device}}"
-    assert "net_device" in caplog.text
+    assert "net_device" in str(e.value)
 
 
 def test_spaced_placeholder_is_not_one():
@@ -313,12 +321,11 @@ def test_ascend_mooncake_carries_both_sides_parallelism_and_a_lease_env():
     assert descriptor["kv_connector_extra_config"]["decode"]["dp_size"] == 2
     # The port lives inside the descriptor for this connector, as a number.
     assert descriptor["kv_port"] == 41100
-    # A parallelism nobody wrote stays unresolved rather than defaulting to 1:
-    # GPUStack injects a tensor-parallel size of its own further down.
-    assert (
-        descriptor["kv_connector_extra_config"]["prefill"]["dp_size"]
-        == "{{roles.prefill.data_parallel_size}}"
-    )
+    # A data parallelism nobody wrote resolves to 1 for a single-worker member,
+    # because that is what the engine will run at — not a default chosen here.
+    # It used to stay unresolved, and every Ascend deployment failed until the
+    # user wrote out a parameter that only restated what the engine would do.
+    assert descriptor["kv_connector_extra_config"]["prefill"]["dp_size"] == 1
     # Mooncake's abort window is an env var, and its engine default is 8
     # minutes with no Prometheus counter to notice an expiry.
     assert injection.env["VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT"] == "60"
@@ -535,3 +542,97 @@ def test_the_escape_hatch_wins_and_says_nothing(caplog):
         assert backend._host_ipc_enabled() is False
 
     assert "/dev/shm" not in caplog.text
+
+
+# --- a placeholder must not reach the engine ------------------------------- #
+
+
+def test_an_unrendered_env_var_stops_the_launch():
+    """An argument that keeps its placeholder survives visibly — vLLM echoes
+    its argv into the log and the scanner recognises the shape. An environment
+    variable does not: `HCCL_SOCKET_IFNAME={{net_device}}` reaches HCCL as the
+    literal name of an interface that does not exist, and what comes back is a
+    transport that quietly never connects.
+
+    Measured on 910B2, where the host has six candidate NICs and
+    `derive_net_device` correctly refuses to guess between them. The refusal
+    was right; its consequence was invisible."""
+    from gpustack.worker.pd_injection import PDInjection, _refuse_unrendered
+
+    injection = PDInjection(
+        env={"HCCL_SOCKET_IFNAME": "{{net_device}}", "HCCL_IF_IP": "10.0.0.1"},
+        args=["--host", "10.0.0.1"],
+    )
+
+    with pytest.raises(
+        PDInjectionError, match="HCCL_SOCKET_IFNAME=\\{\\{net_device\\}\\}"
+    ):
+        _refuse_unrendered(injection, "mode 'm' role 'prefill'")
+
+
+def test_an_unrendered_argument_stops_the_launch_too():
+    from gpustack.worker.pd_injection import PDInjection, _refuse_unrendered
+
+    injection = PDInjection(args=["--port", "{{ports.kv_port}}"])
+
+    with pytest.raises(PDInjectionError, match="ports.kv_port"):
+        _refuse_unrendered(injection, "where")
+
+
+def test_every_unrendered_placeholder_is_named_not_counted():
+    """`{{net_device}}` and `{{ports.kv_port}}` are fixed in entirely different
+    places, so a count tells the operator nothing about where to go."""
+    from gpustack.worker.pd_injection import PDInjection, _refuse_unrendered
+
+    injection = PDInjection(env={"A": "{{net_device}}"}, args=["{{ports.kv_port}}"])
+
+    with pytest.raises(PDInjectionError) as e:
+        _refuse_unrendered(injection, "where")
+    assert "net_device" in str(e.value) and "ports.kv_port" in str(e.value)
+
+
+def test_a_fully_rendered_injection_passes():
+    from gpustack.worker.pd_injection import PDInjection, _refuse_unrendered
+
+    _refuse_unrendered(
+        PDInjection(env={"A": "eno1"}, args=["--port", "40001"]), "where"
+    )
+
+
+def test_a_multi_worker_member_leaves_its_parallelism_to_the_engine():
+    """The other half of the implicit rule, and the reason it is not a plain
+    default. For a member spanning workers the shape decides dp and dpl, that
+    decision is made further down the vLLM path, and a number guessed here
+    would go into a Mooncake descriptor the engine then contradicts — a pairing
+    that fails at handshake, which is worse than the launch refusing."""
+    from types import SimpleNamespace
+
+    from gpustack.worker.pd_injection import _implicit_parallelism
+
+    single = SimpleNamespace(gpu_indexes=[0, 1], distributed_servers=None)
+    spanning = SimpleNamespace(
+        gpu_indexes=[0, 1],
+        distributed_servers=SimpleNamespace(subordinate_workers=[object()]),
+    )
+
+    assert _implicit_parallelism({}, single, "prefill") == {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 1,
+    }
+    assert _implicit_parallelism({}, spanning, "prefill") == {}
+
+
+def test_a_declared_parallelism_is_never_overwritten():
+    """The implicit rule fills gaps; it does not have opinions."""
+    from types import SimpleNamespace
+
+    from gpustack.worker.pd_injection import _implicit_parallelism
+
+    instance = SimpleNamespace(gpu_indexes=[0, 1, 2, 3], distributed_servers=None)
+
+    assert (
+        _implicit_parallelism(
+            {"tensor_parallel_size": 2, "data_parallel_size": 4}, instance, "prefill"
+        )
+        == {}
+    )

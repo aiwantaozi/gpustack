@@ -49,6 +49,21 @@ class Diagnosis(BaseModel):
 # summary names the setting to look at rather than describing the error again.
 _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
     (
+        "kv transfer failed",
+        r"Mooncake transfer failed, ret: -?\d+",
+        "A KV transfer between prefill and decode failed. The request that "
+        "needed it did NOT fail with it: decode went on to generate from "
+        "blocks it never received, the engine still counted an external "
+        "prefix-cache hit, and the caller got a 200 carrying nonsense. "
+        "Measured on 910B2 across two hosts, where the reply was the token "
+        "'ee' repeated to the length limit. Mooncake exports no Prometheus "
+        "counter, so this log line is the only place the failure is visible "
+        "at all — which is why it is matched here rather than left to the "
+        "transfer metrics. The usual cause is a fabric the transport cannot "
+        "use between those two workers: check that RDMA is present and "
+        "reachable, or place the group's members on one host.",
+    ),
+    (
         "NIXL_ERR_BACKEND",
         r"NIXL_ERR_BACKEND",
         "The KV transport could not reach its peer. This is almost always the "

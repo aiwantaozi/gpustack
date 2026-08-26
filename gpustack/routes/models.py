@@ -578,6 +578,36 @@ _PAIRING_MUST_MATCH = {
     "KV cache layout": ["kv-cache-layout"],
 }
 
+# The hybrid KV cache manager is a boolean pair rather than a value, so it
+# cannot go in the table above. Both spellings are argparse's, and both appear
+# in practice: a cache provider's injection carries the disabling one, and an
+# Ascend PD recipe carries the enabling one.
+_HMA_DISABLE = "--disable-hybrid-kv-cache-manager"
+_HMA_ENABLE = "--no-disable-hybrid-kv-cache-manager"
+
+
+def _hybrid_cache_manager_enabled(parameters: List[str]) -> bool:
+    """Whether HMA ends up on for a role that also gets a KV connector.
+
+    Measured: setting `--kv-transfer-config` makes vLLM disable HMA on its own
+    (`vllm/config/vllm.py`), and every disaggregated role gets that flag — so
+    the two sides agree by default and the disabling flag is redundant rather
+    than meaningful. What is not redundant is the *enabling* spelling: a
+    connector that supports HMA can have it turned back on explicitly, and one
+    side doing that while the other does not is a real divergence.
+
+    Last spelling wins, matching argparse, so a role that carries both is read
+    the way the engine would read it rather than the way the list is ordered.
+    """
+    enabled = False
+    for token in parameters:
+        name = token.split("=", 1)[0]
+        if name == _HMA_ENABLE:
+            enabled = True
+        elif name == _HMA_DISABLE:
+            enabled = False
+    return enabled
+
 
 def _role_parameters(role: RoleSpec, model_parameters) -> List[str]:
     """A role's effective engine parameters.
@@ -667,6 +697,19 @@ def validate_role_pairing(  # noqa: C901
                 f"as an IndexError inside decode rather than as a "
                 f"configuration error. decode's tensor parallelism must be at "
                 f"least prefill's."
+            )
+        )
+
+    if _hybrid_cache_manager_enabled(prefill_params) != _hybrid_cache_manager_enabled(
+        decode_params
+    ):
+        raise BadRequestException(
+            message=(
+                "prefill and decode disagree on the hybrid KV cache manager. "
+                f"It is one of the factors the connector hashes, so the pair "
+                f"is rejected on contact and the group never serves. Note that "
+                f"a KV connector disables it on its own — the divergence comes "
+                f"from one role carrying {_HMA_ENABLE} and the other not."
             )
         )
 

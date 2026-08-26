@@ -462,3 +462,76 @@ def test_unknown_mode_returns_none_and_warns(caplog):
         assert render_pd_injection(model, _instance(), _variables()) is None
 
     assert "not-a-mode" in caplog.text
+
+
+# --- the host IPC trade-off ------------------------------------------------ #
+
+
+def test_a_disaggregated_member_with_a_cache_is_told_what_it_traded(caplog):
+    """A shared cache wants the host IPC namespace, for the CUDA-IPC path that
+    passes KV buffers instead of copying them. A KV connector wants a private
+    /dev/shm, and joining the host namespace replaces it with the host's,
+    dropping the shm_size the workload was given.
+
+    Both configurations run, so this does not refuse. What it must not do is
+    decide silently: the person who cares cannot otherwise see the question
+    was asked, and both directions are one env away."""
+    from gpustack.schemas.cache_services import CacheConfigSnapshot
+
+    instance = _instance()
+    instance.cache_config = CacheConfigSnapshot(cache_service_id=7, injected=True)
+    backend = _backend(_model(), instance)
+
+    with caplog.at_level(logging.WARNING):
+        assert backend._host_ipc_enabled() is True
+
+    assert "/dev/shm" in caplog.text
+    assert "GPUSTACK_HOST_IPC" in caplog.text
+
+
+def test_a_role_less_deployment_with_a_cache_is_not_warned(caplog):
+    """No connector, no tension — the derivation is just the cache's own
+    requirement and there is nothing being traded away."""
+    from gpustack.schemas.cache_services import CacheConfigSnapshot
+
+    instance = _instance()
+    instance.role = None
+    instance.cache_config = CacheConfigSnapshot(cache_service_id=7, injected=True)
+    model = _model()
+    model.disaggregation = None
+    backend = _backend(model, instance)
+
+    with caplog.at_level(logging.WARNING):
+        assert backend._host_ipc_enabled() is True
+
+    assert "/dev/shm" not in caplog.text
+
+
+def test_the_warning_is_said_once(caplog):
+    """It is derived on every workload build; repeating it per build would
+    bury the things that happen once."""
+    from gpustack.schemas.cache_services import CacheConfigSnapshot
+
+    instance = _instance()
+    instance.cache_config = CacheConfigSnapshot(cache_service_id=7, injected=True)
+    backend = _backend(_model(), instance)
+
+    with caplog.at_level(logging.WARNING):
+        backend._host_ipc_enabled()
+        backend._host_ipc_enabled()
+
+    assert caplog.text.count("GPUSTACK_HOST_IPC") == 1
+
+
+def test_the_escape_hatch_wins_and_says_nothing(caplog):
+    """An explicit answer is not a trade-off being made for anyone."""
+    from gpustack.schemas.cache_services import CacheConfigSnapshot
+
+    instance = _instance()
+    instance.cache_config = CacheConfigSnapshot(cache_service_id=7, injected=True)
+    backend = _backend(_model(env={"GPUSTACK_HOST_IPC": "false"}), instance)
+
+    with caplog.at_level(logging.WARNING):
+        assert backend._host_ipc_enabled() is False
+
+    assert "/dev/shm" not in caplog.text

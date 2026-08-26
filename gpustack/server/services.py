@@ -923,7 +923,7 @@ class ModelInstanceService:
             # resolution error — the instance starts without the shared
             # cache instead (same contract as the scheduler's re-resolve).
             model_instance.cache_config = await resolve_instance_cache_config_safe(
-                self.session, model
+                self.session, model, role=model_instance.role
             )
         result = await ModelInstance.create(self.session, model_instance)
         await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
@@ -959,7 +959,9 @@ class ModelInstanceService:
                 model = models.get(model_instance.model_id)
                 if model is not None:
                     model_instance.cache_config = (
-                        await resolve_instance_cache_config_safe(self.session, model)
+                        await resolve_instance_cache_config_safe(
+                            self.session, model, role=model_instance.role
+                        )
                     )
                 result = await ModelInstance.create(
                     self.session, model_instance, auto_commit=False

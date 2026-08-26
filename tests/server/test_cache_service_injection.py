@@ -779,3 +779,68 @@ async def test_resolve_strips_password_params_from_snapshot():
     assert snapshot.injected is True
     assert snapshot.endpoint.params.get("metadata_server") == "P2PHANDSHAKE"
     assert "auth_token" not in snapshot.endpoint.params
+
+
+# --- which sides of a disaggregated pair take a cache ---------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_role_that_takes_no_cache_resolves_to_nothing():
+    """Attaching a shared cache to prefill alone is a normal disaggregated
+    configuration — it is the side where it pays. Reading the deployment's own
+    value for every member would hand the whole group whatever the model said,
+    which is the opposite of what the per-role override asked for."""
+    from gpustack.schemas.models import (
+        DisaggregationSpec,
+        ExtendedKVCacheConfig,
+        KVCacheModeEnum,
+        PDModeEnum,
+        RoleSpec,
+    )
+
+    model = new_model(1, "m", huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    model.disaggregation = DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL)
+    model.roles = [
+        RoleSpec(
+            name="prefill",
+            extended_kv_cache=ExtendedKVCacheConfig(
+                enabled=True, mode=KVCacheModeEnum.SHARED, cache_service_id=7
+            ),
+        ),
+        RoleSpec(name="decode"),
+    ]
+
+    assert (
+        await resolve_instance_cache_config(MagicMock(), model, role="decode") is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_role_only_cache_is_resolved_for_that_role():
+    """The mirror of the above: the Model declares none, so a resolver reading
+    the Model would find nothing for the role that asked for one."""
+    from gpustack.schemas.models import (
+        DisaggregationSpec,
+        ExtendedKVCacheConfig,
+        KVCacheModeEnum,
+        PDModeEnum,
+        RoleSpec,
+    )
+
+    model = new_model(1, "m", huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    model.disaggregation = DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL)
+    model.roles = [
+        RoleSpec(
+            name="prefill",
+            extended_kv_cache=ExtendedKVCacheConfig(
+                enabled=True, mode=KVCacheModeEnum.SHARED, cache_service_id=None
+            ),
+        ),
+        RoleSpec(name="decode"),
+    ]
+
+    snapshot = await resolve_instance_cache_config(MagicMock(), model, role="prefill")
+
+    assert snapshot is not None
+    # No service id on the role, so it degrades rather than silently skipping.
+    assert snapshot.injected is False

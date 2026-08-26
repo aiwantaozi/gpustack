@@ -16,7 +16,7 @@ from gpustack.schemas.cache_services import (
     CacheServiceModeEnum,
     CacheServiceStateEnum,
 )
-from gpustack.schemas.models import Model, get_backend
+from gpustack.schemas.models import Model, get_backend, role_effective_model
 from gpustack.schemas.workers import Worker
 from gpustack.utils.command import flatten_to_argv
 from gpustack.utils.version import version_in_range
@@ -209,6 +209,7 @@ async def resolve_instance_cache_config(
     model: Model,
     worker: Optional[Worker] = None,
     spans_workers: bool = False,
+    role: Optional[str] = None,
 ) -> Optional[CacheConfigSnapshot]:
     """
     Resolve the shared-cache connection snapshot for an instance of the
@@ -226,8 +227,16 @@ async def resolve_instance_cache_config(
     permission — most single-node placements carry it — so the
     node-local incompatibility is decided here, where the real
     placement is known, not at model validation.
+    ``role`` is the member's PD role, and it is projected here rather than by
+    the caller so that "which sides take a cache" has one answer. Under
+    disaggregation the two sides genuinely differ: attaching a cache to
+    prefill is where it pays, and a decode that does not take one is a normal
+    configuration rather than an oversight. Reading the Model's own value for
+    every member would silently give the whole group whatever the deployment
+    said, which is the opposite of what a per-role override asked for.
     """
-    ext = model.extended_kv_cache
+    effective = role_effective_model(model, role) if role else model
+    ext = effective.extended_kv_cache
     if not ext or not ext.is_shared():
         return None
 
@@ -336,7 +345,7 @@ async def resolve_instance_cache_config(
             }
         )
 
-    backend = get_backend(model)
+    backend = get_backend(effective)
     render_params: Dict[str, Any] = {
         "host": endpoint.host,
         "port": endpoint.port,
@@ -392,15 +401,15 @@ async def resolve_instance_cache_config(
     if (
         integration is not None
         and integration.versions
-        and model.backend_version
-        and version_in_range(model.backend_version, integration.versions) is False
+        and effective.backend_version
+        and version_in_range(effective.backend_version, integration.versions) is False
     ):
         return CacheConfigSnapshot(
             **snapshot_base,
             endpoint=snapshot_endpoint,
             injected=False,
             reason=(
-                f"Backend version {model.backend_version} is outside the "
+                f"Backend version {effective.backend_version} is outside the "
                 f"cache provider's supported '{backend}' range "
                 f"({integration.versions}); "
                 "instance starts without shared KV cache"
@@ -411,7 +420,7 @@ async def resolve_instance_cache_config(
     # may be one token, a "--key value" pair, or a whole pasted command
     # line) — flatten exactly like the worker does before matching, or
     # the pasted forms slip through and take the slot over silently.
-    user_argv = flatten_to_argv(model.backend_parameters or [])
+    user_argv = flatten_to_argv(effective.backend_parameters or [])
     if slot and any(
         token == slot.flag or token.startswith(f"{slot.flag}=") for token in user_argv
     ):
@@ -454,6 +463,7 @@ async def resolve_instance_cache_config_safe(
     model: Model,
     worker: Optional[Worker] = None,
     spans_workers: bool = False,
+    role: Optional[str] = None,
 ) -> Optional[CacheConfigSnapshot]:
     """
     resolve_instance_cache_config that degrades instead of raising: an
@@ -462,13 +472,14 @@ async def resolve_instance_cache_config_safe(
     """
     try:
         return await resolve_instance_cache_config(
-            session, model, worker=worker, spans_workers=spans_workers
+            session, model, worker=worker, spans_workers=spans_workers, role=role
         )
     except Exception as e:
         logger.error(
             f"Failed to resolve shared cache config for model {model.name}: {e}"
         )
-        ext = model.extended_kv_cache
+        effective = role_effective_model(model, role) if role else model
+        ext = effective.extended_kv_cache
         if not ext or not ext.is_shared():
             return None
         return CacheConfigSnapshot(

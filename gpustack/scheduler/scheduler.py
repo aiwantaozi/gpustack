@@ -406,7 +406,14 @@ class Scheduler:
                         DistributedServerCoordinateModeEnum.INITIALIZE_LATER
                     )
 
-                if model.extended_kv_cache and model.extended_kv_cache.is_shared():
+                # Role-effective, not the Model's: attaching a cache to
+                # prefill alone is a normal disaggregated configuration, and
+                # reading the deployment's value would skip the re-resolve for
+                # exactly the member that asked for one.
+                scheduled_cache = role_effective_model(
+                    model, model_instance.role
+                ).extended_kv_cache
+                if scheduled_cache and scheduled_cache.is_shared():
                     # The assigned worker is known now; re-resolve the
                     # shared-cache snapshot so worker-dependent injection
                     # (e.g. the client's own local_hostname) binds to this
@@ -417,6 +424,7 @@ class Scheduler:
                             model,
                             worker=candidate.worker,
                             spans_workers=model_instance.spans_workers,
+                            role=model_instance.role,
                         )
                     )
 

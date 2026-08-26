@@ -745,6 +745,7 @@ class CacheServiceController:
                     model,
                     workers_by_id.get(mi.worker_id),
                     spans_workers=mi.spans_workers,
+                    role=mi.role,
                 )
                 if snapshot is None:
                     continue

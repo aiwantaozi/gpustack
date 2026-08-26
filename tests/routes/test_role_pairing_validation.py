@@ -242,3 +242,65 @@ def test_a_sparse_update_is_judged_against_the_stored_roles():
 
     with rejects("context lengths"):
         validate_role_pairing(update, stored=stored)
+
+
+# --- the hybrid KV cache manager ------------------------------------------- #
+
+_HMA_ENABLE = "--no-disable-hybrid-kv-cache-manager"
+_HMA_DISABLE = "--disable-hybrid-kv-cache-manager"
+
+
+def test_one_role_re_enabling_hma_is_rejected():
+    """A KV connector disables it on its own, so both sides agree by default.
+    Turning it back on for one of them is a real divergence, and it is one of
+    the factors the connector hashes — so the pair is refused on contact and
+    the group never serves."""
+    with rejects("hybrid KV cache manager"):
+        validate_role_pairing(
+            _model_in(
+                roles=[
+                    RoleSpec(name="prefill", backend_parameters=[_HMA_ENABLE]),
+                    RoleSpec(name="decode"),
+                ],
+            )
+        )
+
+
+def test_both_roles_re_enabling_it_is_allowed():
+    validate_role_pairing(
+        _model_in(
+            roles=[
+                RoleSpec(name="prefill", backend_parameters=[_HMA_ENABLE]),
+                RoleSpec(name="decode", backend_parameters=[_HMA_ENABLE]),
+            ],
+        )
+    )
+
+
+def test_the_disabling_spelling_on_one_side_only_is_not_a_divergence():
+    """It restates what the connector already does, so the effective values
+    still match — rejecting it would refuse a configuration that works, which
+    is exactly what a value-equality check would have done here."""
+    validate_role_pairing(
+        _model_in(
+            roles=[
+                RoleSpec(name="prefill", backend_parameters=[_HMA_DISABLE]),
+                RoleSpec(name="decode"),
+            ],
+        )
+    )
+
+
+def test_the_last_spelling_wins_as_argparse_reads_it():
+    """A role carrying both is read the way the engine reads it, not the way
+    the list happens to be ordered."""
+    validate_role_pairing(
+        _model_in(
+            roles=[
+                RoleSpec(
+                    name="prefill", backend_parameters=[_HMA_ENABLE, _HMA_DISABLE]
+                ),
+                RoleSpec(name="decode"),
+            ],
+        )
+    )

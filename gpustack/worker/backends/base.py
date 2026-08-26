@@ -792,7 +792,49 @@ class InferenceServer(ABC):
         if envs.HOST_IPC is not None:
             return to_bool(envs.HOST_IPC)
         cache_config = getattr(self._model_instance, "cache_config", None)
-        return bool(cache_config and cache_config.injected)
+        derived = bool(cache_config and cache_config.injected)
+        if derived:
+            self._warn_host_ipc_trade_off()
+        return derived
+
+    def _warn_host_ipc_trade_off(self) -> None:
+        """Say out loud that a disaggregated member with a shared cache is a
+        choice, not a default.
+
+        The two want opposite things and only one can be had. A shared cache
+        wants the host IPC namespace, because that is what lets the engine and
+        the cache container pass KV buffers by CUDA-IPC handle instead of
+        copying. A KV connector wants a private /dev/shm, and joining the host
+        namespace replaces the container's with the host's — which drops the
+        `shm_size` the workload was given.
+
+        Neither is wrong, and both run, so this does not refuse: measured, the
+        connector's actual /dev/shm use was two orders of magnitude under the
+        allotment, so the lost guarantee is a risk rather than a failure. What
+        would be wrong is deciding it silently, because the person who cares
+        about the answer cannot see that the question was asked. Both
+        directions are reachable per model with GPUSTACK_HOST_IPC.
+        """
+        if getattr(self, "_host_ipc_trade_off_warned", False):
+            return
+        instance = getattr(self, "_model_instance", None)
+        model = self._model_spec or getattr(self, "_model", None)
+        if not getattr(instance, "role", None) or not getattr(
+            model, "disaggregation", None
+        ):
+            return
+        self._host_ipc_trade_off_warned = True
+        logger.warning(
+            "Role '%s' of %s attaches a shared KV cache, so its workload joins "
+            "the host IPC namespace for the cache's zero-copy path — which "
+            "replaces its private /dev/shm with the host's and drops the "
+            "shm_size it was allocated. The KV connector uses /dev/shm too. "
+            "Set %s=false in the model's env to keep the private /dev/shm "
+            "instead, at the cost of the cache falling back to host copies.",
+            getattr(instance, "role", "?"),
+            getattr(model, "name", "?"),
+            envs.HOST_IPC_ENV,
+        )
 
     def _cuda_minor_version_compatibility_enabled(self) -> bool:
         """Resolve the switch: a per-model

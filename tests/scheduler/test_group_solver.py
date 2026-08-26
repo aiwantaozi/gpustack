@@ -413,3 +413,79 @@ async def test_the_plan_is_stable_across_re_solves():
     second = await solve_group_placement(root, pd(2, 2), flat_capacity(2), layers)
 
     assert first.assignments == second.assignments
+
+
+# --- what the refusal is allowed to claim ---------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_could_not_be_measured_is_not_reported_as_full():
+    """A plain misconfiguration once produced zero on every worker and a
+    refusal that named capacity — the one answer that stops an operator looking
+    for a mistake. Absent from the mapping means unknown; present-and-zero
+    means measured and full."""
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-a")])
+
+    async def nothing_measurable(_role, _worker_ids, _placed):
+        return {}
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        nothing_measurable,
+        layers,
+        GatherRequest(layer="RackLayer", must=True),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.unmeasured == 2
+    assert "could not be measured" in got.reason
+    assert "holds 0" not in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_full_cluster_still_says_so():
+    """The other side of the same rule: measured and zero is a capacity
+    verdict, and must keep reading like one."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        flat_capacity(0),
+        layers,
+        GatherRequest(layer="RackLayer", must=True),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.unmeasured == 0
+    assert "holds 0" in got.reason
+
+
+@pytest.mark.asyncio
+async def test_domains_are_sized_with_one_capacity_pass_not_one_each():
+    """Sizing asks the same question of the same workers at every layer, and
+    each ask is a full selector sweep in production. One pass for the tree."""
+    # Counted in total, not by shape: sizing per domain would *add* calls
+    # rather than change the one the tree-wide pass makes, so a predicate that
+    # only recognises the tree-wide call cannot see the difference.
+    calls = []
+
+    async def counting(role, worker_ids, placed):
+        calls.append((role, tuple(sorted(worker_ids)), len(placed)))
+        return {w: 4 for w in worker_ids}
+
+    workers = [
+        zoned(1, "w1", "z1", "rack-a"),
+        zoned(2, "w2", "z1", "rack-b"),
+        zoned(3, "w3", "z2", "rack-c"),
+    ]
+    root, layers = tree(workers, zone_rack_layers())
+
+    await solve_group_placement(root, pd(1, 1), counting, layers)
+
+    # One tree-wide sizing pass, then one call per role placing into the
+    # winning leaf. Sizing each of the three leaf domains separately would add
+    # three more.
+    assert calls[0] == ("prefill", (1, 2, 3), 0), "the sizing pass comes first"
+    assert len(calls) == 3, f"expected 1 sizing + 2 placements, got {calls}"

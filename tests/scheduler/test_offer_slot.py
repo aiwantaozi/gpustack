@@ -266,3 +266,36 @@ async def test_the_stand_in_is_readable_by_the_real_allocation_function():
     stand_ins = [_stand_in_for(c, worker()) for c in result.placements]
 
     assert compute_worker_allocated(stand_ins, worker_id=1).vram == {0: 10, 1: 10}
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_count_says_it_was_stopped():
+    """`slots` alone cannot tell "this worker is full" from "the selector broke
+    before it could say", and the two reach the operator as the same refusal.
+    A plain misconfiguration then reads as "the cluster is full", which is the
+    one message that stops someone looking for a mistake."""
+
+    class Broken(FakeSelector):
+        async def select_candidates(self, workers):
+            raise RuntimeError("no global config")
+
+    result = await count_offer_slots(
+        lambda instances: Broken(instances, free_gpus=[0, 1]), worker(), [], limit=4
+    )
+
+    assert result.slots == 0
+    assert result.counted_to_exhaustion is False
+    assert "no global config" in result.unavailable
+
+
+@pytest.mark.asyncio
+async def test_a_worker_that_is_genuinely_full_counted_to_exhaustion():
+    """The other side of the same rule: a real zero must stay distinguishable
+    from an unknown one."""
+    result = await count_offer_slots(
+        selector_factory(free_gpus=[]), worker(), [], limit=4
+    )
+
+    assert result.slots == 0
+    assert result.counted_to_exhaustion is True
+    assert result.unavailable is None

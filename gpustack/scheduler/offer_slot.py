@@ -65,6 +65,19 @@ class OfferSlot:
     # GPU indexes to write onto the members it decides to place here, and
     # re-deriving them later would be a second, divergent placement.
     placements: List[Any] = field(default_factory=list)
+    # Why counting stopped. `slots` alone cannot tell "this worker is full"
+    # from "the selector broke before it could say", and the two look identical
+    # to whoever reads the refusal: a plain misconfiguration then presents as
+    # "the cluster is full", which is the one message that makes an operator
+    # stop looking for a mistake. Measured on a live host — a forgotten
+    # `set_global_config` produced zeros on every worker and a group refusal
+    # that named capacity.
+    unavailable: Optional[str] = None
+
+    @property
+    def counted_to_exhaustion(self) -> bool:
+        """Whether ``slots`` is this worker's real capacity or only a floor."""
+        return self.unavailable is None
 
 
 async def count_offer_slots(
@@ -107,6 +120,7 @@ async def count_offer_slots(
                 result.slots,
                 e,
             )
+            result.unavailable = f"{type(e).__name__}: {e}"
             return result
 
         candidate = _usable(candidates)

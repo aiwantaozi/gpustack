@@ -79,9 +79,28 @@ class GroupInfeasible:
     best_domain: Optional[str] = None
     needed: int = 0
     available: int = 0
+    # Workers whose capacity could not be measured at all. `available` counts
+    # only what was actually established, so without this a cluster nobody
+    # could measure and a cluster that is genuinely full produce the same
+    # refusal — and "full" is the one answer that stops an operator looking
+    # for a mistake. Measured on a live host: one missing global config, and
+    # every worker reported zero.
+    unmeasured: int = 0
 
 
 # async capacity(role, worker_ids, already_placed) -> {worker_id: slots}
+#
+# A worker whose capacity could not be determined is left OUT of the mapping.
+# Absent means unknown; present-and-zero means measured and full. Collapsing
+# the two would make an unmeasurable cluster indistinguishable from a full
+# one.
+#
+# Required to be decomposable per worker: the answer for a set of workers is
+# the union of the answers for its members. The real implementation asks each
+# worker separately anyway, and the property is what lets the domain-sizing
+# pass below run once for the whole tree instead of once per domain per layer
+# — measured at 12-18 calls for a two-worker group before, which is a full
+# selector sweep each time.
 #
 # `already_placed` is what this solve has committed so far, in the shape the
 # allocation accounting reads. Passing it back is what keeps the capacity of
@@ -122,25 +141,33 @@ async def solve_group_placement(
     ceiling = layers.index(enforced.layer) if enforced.layer else 0
     best: Optional[GroupInfeasible] = None
 
+    # Every domain is sized by the hungriest role with nothing placed, which
+    # makes it one question asked once for the whole tree rather than once per
+    # domain per layer. The hungriest role is the honest yardstick: a domain
+    # with room for eight slices and no whole card is not eight units of room
+    # to a group whose first role needs whole cards.
+    sizing = await capacity(ordered_roles[0].role, root.descendant_worker_ids(), [])
+
     # Leaf-to-root. Stopping at `ceiling` is the whole of MustGather: without
     # it the walk continues widening until the cluster root, which always fits
     # and is exactly the outcome the operator asked not to get.
     for index in range(len(layers) - 1, ceiling - 1, -1):
         layer = layers[index]
         domains = _gatherable_domains(root, layer)
-        # Tightest fitting domain first. Sized by the hungriest role, which is
-        # the most constrained measure of a domain and therefore the honest
-        # one — a domain with room for eight slices and no whole card is not
-        # eight units of room to a group whose first role needs whole cards.
+        # Tightest fitting domain first, off the one sizing pass above.
         sized = []
         for d in domains:
-            room = await capacity(ordered_roles[0].role, d.descendant_worker_ids(), [])
-            sized.append((sum(room.values()), d.name, d))
+            members = d.descendant_worker_ids()
+            sized.append((sum(sizing.get(w, 0) for w in members), d.name, d))
         for _size, _name, domain in sorted(sized, key=lambda t: (t[0], t[1])):
             placement = await _fit_in_domain(domain, layer, ordered_roles, capacity)
             if isinstance(placement, GroupPlacement):
                 return placement
-            if best is None or placement.available > best.available:
+            # `>=` so a tie is won by the later, wider layer. With `>` the
+            # refusal for a rack-level requirement could name a single host,
+            # since the leaf layer is examined first and its domains are just
+            # as short of room — a message that contradicts itself.
+            if best is None or placement.available >= best.available:
                 best = placement
 
     # The cluster root, last. It is not in `layers` — `layer_names` returns the
@@ -161,10 +188,18 @@ async def solve_group_placement(
             reason="No topology domain has any capacity for this group.",
             needed=total,
         )
-    if enforced.must:
+    if enforced.must and not best.unmeasured:
         best.reason = (
             f"The group needs {best.needed} placements in one "
             f"{enforced.layer!r}, and the roomiest one holds {best.available}."
+        )
+    elif enforced.must:
+        # Deliberately not phrased as a capacity verdict: the number behind it
+        # is a floor, not a measurement.
+        best.reason = (
+            f"The group needs {best.needed} placements in one "
+            f"{enforced.layer!r}, but capacity could not be measured on "
+            f"{best.unmeasured} worker(s), so whether it fits is unknown."
         )
     return best
 
@@ -229,13 +264,20 @@ async def _fit_in_domain(
         slots = await capacity(role.role, worker_ids, placed)
         share = _share_out(slots, role.replicas, placed)
         if share is None:
-            available = placed_total + sum(slots.values())
+            unmeasured = len([w for w in worker_ids if w not in slots])
             return GroupInfeasible(
-                reason="not enough room",
+                reason=(
+                    "not enough room"
+                    if not unmeasured
+                    else f"capacity could not be measured on {unmeasured} of "
+                    f"{len(worker_ids)} workers, and what could be measured is "
+                    "not enough"
+                ),
                 layer=layer,
                 best_domain=domain.name,
                 needed=total,
-                available=available,
+                available=placed_total + sum(slots.values()),
+                unmeasured=unmeasured,
             )
         assigned: List[int] = []
         for worker_id, count in share:

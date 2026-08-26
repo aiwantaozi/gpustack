@@ -107,6 +107,19 @@ class CacheServiceConfig(BaseModel):
     image: Optional[str] = None
     """Container image for the custom provider version; ignored otherwise."""
 
+    run_command: Optional[str] = None
+    """Argument-vector template for the custom provider version, taking the
+    image's ENTRYPOINT slot; ignored otherwise. Same `{{placeholder}}`
+    substitution as a catalog version's own `run_command`.
+
+    Without it a custom image has to be command-compatible with the provider's
+    default, which a custom image is exactly the case where it may not be.
+    Measured: the Ascend LMCache build ships the `lmcache` package but no
+    `lmcache` executable, and its server takes positional arguments where the
+    catalogued one takes flags, so the container died on
+    `exec: "lmcache": executable file not found` with nowhere to say otherwise.
+    """
+
     env: Optional[Dict[str, str]] = None
     """Extra environment variables for the managed cache server container."""
 

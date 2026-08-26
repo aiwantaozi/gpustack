@@ -1843,3 +1843,78 @@ def test_probe_targets_metrics_port_for_http_health_check(monkeypatch):
         assert manager._probe_ready(instance, "mooncake") is True
 
     assert http_get.call_args[0][0] == "http://127.0.0.1:40011/healthcheck"
+
+
+def test_a_custom_version_may_bring_its_own_run_command():
+    """A custom image is exactly the case where command-compatibility with the
+    catalogued default may not hold.
+
+    Measured: the Ascend LMCache build ships the `lmcache` package but no
+    `lmcache` executable, and its server takes positional arguments where the
+    catalogued one takes flags. Without this the container died on
+    `exec: "lmcache": executable file not found` and there was nowhere to say
+    otherwise."""
+    manager, clientset = _build_manager(worker_id=1)
+    cache_service = _new_cache_service(
+        provider_version="custom",
+        config=CacheServiceConfig(
+            ram_size=8,
+            chunk_size=256,
+            image="myteam/cache-server:dev",
+            run_command="python -m thing.server {{host}} {{port}} cpu",
+        ),
+    )
+
+    create, _ = _run_start(
+        manager, clientset, cache_service, _new_provider(custom_version=True)
+    )
+
+    container = create.call_args[0][0].containers[0]
+    assert container.execution.command == [
+        "python",
+        "-m",
+        "thing.server",
+        "0.0.0.0",
+        "40001",
+        "cpu",
+    ]
+
+
+def test_a_custom_run_command_does_not_leak_into_the_shared_version_config():
+    """The version config is the provider's own object. Writing the command
+    through it would hand this one service's command to every other service
+    templating off the same default."""
+    manager, clientset = _build_manager(worker_id=1)
+    provider = _new_provider(custom_version=True)
+    before = provider.get_version_config(None)[0].run_command
+
+    _run_start(
+        manager,
+        clientset,
+        _new_cache_service(
+            provider_version="custom",
+            config=CacheServiceConfig(
+                ram_size=8,
+                chunk_size=256,
+                image="i:1",
+                run_command="python -m other {{host}}",
+            ),
+        ),
+        provider,
+    )
+
+    assert provider.get_version_config(None)[0].run_command == before
+
+
+def test_a_custom_version_without_a_run_command_still_uses_the_default():
+    manager, clientset = _build_manager(worker_id=1)
+    cache_service = _new_cache_service(
+        provider_version="custom",
+        config=CacheServiceConfig(ram_size=8, chunk_size=256, image="i:1"),
+    )
+
+    create, _ = _run_start(
+        manager, clientset, cache_service, _new_provider(custom_version=True)
+    )
+
+    assert create.call_args[0][0].containers[0].execution.command[0] == "cache-server"

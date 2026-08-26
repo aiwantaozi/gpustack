@@ -462,6 +462,15 @@ class CacheServiceManager:
                     f"config.image is required when provider_version is "
                     f"'{CUSTOM_VERSION}'"
                 )
+            command = cache_service.config.run_command if cache_service.config else None
+            if command:
+                # A copy, not a mutation of the catalogued default: the version
+                # config is the provider's shared object, and writing through
+                # it would give this one service's command to every other
+                # service templating off the same default.
+                version_config = version_config.model_copy(
+                    update={"run_command": command, "run_args": None}
+                )
             return version_config, CUSTOM_VERSION, image
 
         version_config, resolved_version = provider.get_version_config(

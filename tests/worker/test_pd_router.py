@@ -626,18 +626,24 @@ def test_a_decode_peer_needs_no_band_and_renders_without_one():
 
 
 def test_a_router_that_needs_env_to_boot_gets_it_from_the_catalog():
-    """Measured on 910B2: vllm-ascend's proxy imports vllm.logger, which pulls
-    in torch_npu, which refuses to load with no accelerator visible -- landing
-    on the one role that is cpu_only by design. The escape hatch is an
-    environment variable, so the catalog has to be able to say so."""
-    from gpustack.schemas.models import PDModeEnum
-    from gpustack.server.pd_mode_catalog import get_pd_mode
+    """Some routers cannot start without an environment variable. Measured on
+    910B2: vllm-ascend's proxy imported vllm.logger, which pulled in torch_npu,
+    which refuses to load with no accelerator visible -- landing on the one
+    role that is cpu_only by design.
+
+    Synthetic now that the Ascend recipe runs vllm-router instead, which is a
+    Rust binary and imports no torch at all. No shipped mode needs the escape
+    hatch today, and the catalog should not lose the ability to express it for
+    that reason."""
+    from copy import deepcopy
+
     from gpustack.worker.pd_router import render_router
 
-    mode = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+    mode = deepcopy(get_pd_mode("vllm-nixl"))
+    mode.router.env = {"NEEDS_THIS_TO_BOOT": "0"}
     plan = render_router(mode, VARIABLES, PEERS)
 
-    assert plan.env["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+    assert plan.env["NEEDS_THIS_TO_BOOT"] == "0"
 
 
 def test_catalog_env_is_a_default_the_deployment_can_override():

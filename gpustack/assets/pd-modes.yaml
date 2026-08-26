@@ -689,42 +689,73 @@ modes:
       protocol: two_hop
       image: "{{runner_image}}"
       command:
-        - python
-        - /vllm-workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+        - vllm-router
+        - --vllm-pd-disaggregation
+        # 🔴 `nixl`, on a mode whose transport backend is Mooncake, and that is
+        # not a mistake: this flag names the *wire protocol shape*, not the
+        # transport. vllm-ascend's Mooncake connector speaks vLLM's
+        # NixlConnector protocol — the same six-field
+        # `{do_remote_decode, do_remote_prefill, remote_engine_id,
+        # remote_block_ids, remote_host, remote_port}` that this router's Nixl
+        # branch sends, byte for byte.
+        #
+        # Choosing `mooncake` here instead is not a degraded pairing, it is a
+        # hang: that branch sends a `transfer_id` and first queries a Mooncake
+        # bootstrap server on :8998, which vllm-ascend does not run. Measured
+        # on 910B2 — the router retried the query 30 times at 10s intervals
+        # and no request ever completed.
+        - --kv-connector
+        - nixl
         - --host
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
-      env:
-        # The proxy's first import reaches vllm.logger, which pulls in torch
-        # and then torch_npu, and torch_npu refuses to load without an
-        # accelerator visible:
-        #
-        #   RuntimeError: Failed to load the backend extension: torch_npu
-        #
-        # A router is cpu_only by design, so this lands on exactly the role
-        # that must not hold a card. Measured: the proxy container would not
-        # start at all until this was set, and started immediately with it.
-        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        - --prometheus-host
+        - "{{worker_ip}}"
+        - --prometheus-port
+        - "{{ports.prometheus}}"
+        # The same two values as the vLLM recipe, and for the same reason: an
+        # engine that needs ten failed requests to be taken out of rotation
+        # costs ten users what two would have taught it. Everything else is
+        # left to the router's own defaults, the health check above all — see
+        # the vllm-nixl recipe for why.
+        - --cb-failure-threshold
+        - "2"
+        - --retry-max-retries
+        - "3"
+      ports:
+        # --prometheus-port defaults to 29000 and always binds, so a second PD
+        # group's router on the same host dies in a Rust panic on the
+        # collision. Same flag, same band, same reason as the vLLM recipe.
+        - { name: prometheus, count: 1, inject_to: args }
       peers:
-        # Hosts and ports arrive as two parallel flags.
-        style: parallel_lists
-        prefill: { host_flag: "--prefiller-hosts", port_flag: "--prefiller-ports" }
-        decode: { host_flag: "--decoder-hosts", port_flag: "--decoder-ports" }
+        style: repeated_flag
+        prefill: { flag: "--prefill", value: "http://{{peer.ip}}:{{peer.port}}" }
+        decode: { flag: "--decode", value: "http://{{peer.ip}}:{{peer.port}}" }
       capabilities:
-        # Measured on the shipped runner (vllm_ascend 0.20.2rc1): GET /metrics
-        # and GET /v1/models both 404. Polling them filled the router log with
-        # 404s roughly once a second and reported a permanent false failure.
-        # Declaring the absence is what stops that.
-        metrics: false
-        models_endpoint: false
+        # The first two flip from false, which is the whole point of the swap:
+        # the example proxy this replaced served neither, so a disaggregated
+        # group on Ascend had no way to answer "is PD doing anything at all".
+        metrics: true
+        models_endpoint: true
+        # 🔴 Stays false, and the catalog's own tripwire is what caught the
+        # first draft setting it true. This one is a property of the
+        # *connector*, not the router: `kv_leases` records that Mooncake
+        # exports zero Prometheus counters, so an expired lease is visible
+        # only in the engine log. A router with metrics does not conjure an
+        # engine-side counter that was never written.
         kv_expired_metric: false
-      # Measured on the same image: GET /healthcheck returns 200 with the
-      # in-flight request count and both instance lists. Read as absent
-      # earlier from a v0.23.0 example, where it is — this proxy's endpoint
-      # set differs between vllm-ascend versions, so what is declared here is
-      # the version we ship, not the one upstream happens to have.
-      health_path: /healthcheck
+      request_metrics:
+        # The same binary as the vLLM recipe, so the same counter names — and
+        # measured here too, on 910B2 through a real prefill-decode pair:
+        # pd_prefill_requests_total and pd_decode_requests_total both went 0
+        # to 1 to 2 across two requests, and pd_requests_total tracked them.
+        prefill_requests: vllm_router_pd_prefill_requests_total
+        decode_requests: vllm_router_pd_decode_requests_total
+        worker_label: worker
+        port_band: prometheus
+        total_requests: vllm_router_pd_requests_total
+      health_path: /health
 
   - name: custom
     display_name: Custom

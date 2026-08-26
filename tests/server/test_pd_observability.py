@@ -351,12 +351,34 @@ def test_a_member_matches_its_label_by_host_and_port():
     assert requests_for_address(counts, "10.0.0.9:8000") is None
 
 
+def _mode_with_router_metrics(serves_metrics: bool):
+    """A mode whose router does or does not serve /metrics.
+
+    Synthetic on purpose. Borrowing a shipped mode to stand for "a router with
+    no metrics" ties a platform rule to a catalog entry, and the rule outlives
+    the entry: the day the last such mode is replaced, the test starts passing
+    for the wrong reason instead of failing.
+    """
+    from copy import deepcopy
+
+    mode = deepcopy(get_pd_mode(PDModeEnum.VLLM_NIXL.value))
+    mode.router.capabilities.metrics = serves_metrics
+    if not serves_metrics:
+        mode.router.request_metrics = None
+    return mode
+
+
 def test_a_router_declaring_no_metrics_has_no_denominator():
-    """vllm-ascend's proxy example serves no /metrics at all — measured, and
-    the reason the capability is declared rather than probed."""
-    ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
-    assert ascend.router.capabilities.metrics is False
-    assert read_router_requests(parse(router_exposition(("w", 1.0))), ascend) is None
+    """Some routers serve no /metrics at all — vllm-ascend's proxy example was
+    the measured case, and the reason the capability is declared rather than
+    probed.
+
+    Built here rather than borrowed from a shipped mode: every mode we ship now
+    runs a router that does serve metrics, and a rule about routers that do not
+    should not quietly stop being tested the day the last such mode is
+    replaced."""
+    silent = _mode_with_router_metrics(False)
+    assert read_router_requests(parse(router_exposition(("w", 1.0))), silent) is None
 
 
 def test_a_declared_counter_name_is_one_that_was_measured():
@@ -647,11 +669,16 @@ async def _scraped_endpoints(mode: str, router_bands=None):
 async def test_a_router_that_serves_no_metrics_is_never_polled():
     """Measured on vllm-ascend's proxy: polling an endpoint that is not there
     filled its log with 404s about once a second and reported a permanent
-    false failure. Declaring the absence is what stops that."""
-    assert await _scraped_endpoints(PDModeEnum.VLLM_ASCEND_MOONCAKE.value) == {
-        "10.0.0.1:8001",
-        "10.0.0.1:8002",
-    }
+    false failure. Declaring the absence is what stops that.
+
+    The mode is synthetic because every shipped one now runs a router that
+    does serve metrics. The rule outlives the entry that prompted it, so it
+    should not be tested through one."""
+    silent = _mode_with_router_metrics(False)
+    with patch("gpustack.server.pd_mode_catalog.get_pd_mode", return_value=silent):
+        polled = await _scraped_endpoints(PDModeEnum.VLLM_NIXL.value)
+
+    assert polled == {"10.0.0.1:8001", "10.0.0.1:8002"}
 
 
 @pytest.mark.asyncio

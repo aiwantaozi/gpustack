@@ -309,11 +309,15 @@ def test_router_capabilities_are_declared_per_mode():
     # permanent false failure -- while GET /healthcheck returns 200. The
     # endpoint set differs between vllm-ascend versions (a v0.23.0 example has
     # no health path at all), so what is asserted is the version we ship.
+    # Ascend now runs the same router as the vLLM recipe, verified on 910B2
+    # through a real prefill-decode pair. What stays false is the connector's
+    # KV-expiry counter: Mooncake exports none, and a router with metrics does
+    # not conjure an engine-side counter that was never written.
     ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
-    assert ascend.router.capabilities.metrics is False
-    assert ascend.router.capabilities.models_endpoint is False
+    assert ascend.router.capabilities.metrics is True
+    assert ascend.router.capabilities.models_endpoint is True
     assert ascend.router.capabilities.kv_expired_metric is False
-    assert ascend.router.health_path == "/healthcheck"
+    assert ascend.router.health_path == "/health"
 
 
 def test_router_capabilities_default_to_absent():
@@ -367,12 +371,23 @@ def test_router_peer_styles_and_prometheus_band():
     assert not [c for c in nixl.router.command if str(c).startswith("--health")]
 
     # Hosts and ports as two parallel flags.
-    assert ascend.router.peers.style == PDPeerStyleEnum.PARALLEL_LISTS
+    # `repeated_flag` since the router swap. The `parallel_lists` renderer is
+    # still supported and still tested, through a synthetic mode in
+    # tests/worker/test_pd_router.py — no shipped mode needs it now, and the
+    # renderer should not lose coverage for that.
+    assert ascend.router.peers.style == PDPeerStyleEnum.REPEATED_FLAG
     assert ascend.router.peers.prefill == {
-        "host_flag": "--prefiller-hosts",
-        "port_flag": "--prefiller-ports",
+        "flag": "--prefill",
+        "value": "http://{{peer.ip}}:{{peer.port}}",
     }
-    assert ascend.router.ports == []
+    # 🔴 `nixl` on a Mooncake-transport mode is deliberate: the flag names the
+    # wire protocol shape, not the transport. Choosing `mooncake` makes the
+    # router wait forever on a bootstrap server vllm-ascend does not run —
+    # measured on 910B2, 30 retries and no request ever completed.
+    assert ascend.router.command[ascend.router.command.index("--kv-connector") + 1] == (
+        "nixl"
+    )
+    assert [band.name for band in ascend.router.ports] == ["prometheus"]
 
     # A prefill peer carries THAT PEER'S bootstrap band as a second positional
     # value. `peer.ports.` and not `ports.`: the latter is the deployment scope
@@ -632,11 +647,22 @@ def test_the_ratios_denominator_is_declared_per_router():
         # two groups on a host would collide and the serving port 404s.
         assert sglang.port_band == "prometheus"
 
-    # The Ascend proxy serves no /metrics at all, so it has no denominator
-    # by capability rather than by omission.
-    ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value).router
-    assert ascend.capabilities.metrics is False
-    assert ascend.request_metrics.available is False
+    # A router that declares no metrics has no denominator by capability
+    # rather than by omission. Synthetic since the router swap: every shipped
+    # mode serves metrics now, and the rule is about the capability, not about
+    # whichever entry happened to lack it.
+    from copy import deepcopy
+
+    silent = deepcopy(get_pd_mode(PDModeEnum.VLLM_NIXL.value).router)
+    silent.capabilities.metrics = False
+    # `available` is derived from the counter names, so clearing them is what
+    # makes the denominator absent — the object stays, which is why callers can
+    # ask without a None check.
+    silent.request_metrics.prefill_requests = None
+    silent.request_metrics.decode_requests = None
+    silent.request_metrics.total_requests = None
+    assert silent.capabilities.metrics is False
+    assert silent.request_metrics.available is False
 
 
 def test_request_metrics_behind_a_metrics_false_capability_fail_the_load():
@@ -716,8 +742,11 @@ def test_all_five_capabilities_round_trip_through_serialization():
         == "{{roles.decode.tensor_parallel_size}}"
     )
     assert ascend["router"]["capabilities"] == {
-        "metrics": False,
-        "models_endpoint": False,
+        "metrics": True,
+        "models_endpoint": True,
+        # The connector's, not the router's: Mooncake exports no counter for an
+        # expired lease, so there is nothing for a metrics-serving router to
+        # forward.
         "kv_expired_metric": False,
     }
     assert nixl["kv_lease"]["inject_to"] == "connector_extra_config"

@@ -46,7 +46,9 @@ async def test_list_serves_the_connection_state_the_ui_never_asks_for():
 
     ascend = modes[PDModeEnum.VLLM_ASCEND_MOONCAKE.value]
     assert ascend.runtime == "ascend"
-    assert ascend.router.capabilities.metrics is False
+    # True since the Ascend recipe swapped its example-proxy router for
+    # vllm-router, verified on 910B2 through a real prefill-decode pair.
+    assert ascend.router.capabilities.metrics is True
     assert ascend.kv_lease.engine_default == 480
 
 

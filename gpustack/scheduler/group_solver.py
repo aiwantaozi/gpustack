@@ -113,7 +113,13 @@ async def solve_group_placement(
         return GroupPlacement(layer=NODE_LAYER, domain="", assignments={})
 
     ordered_roles = sorted(roles, key=lambda r: (-r.weight, r.role))
-    ceiling = _ceiling_index(layers, gather)
+    # Decided once, and used for both the ceiling and the root fallback below.
+    # Deriving them separately is how the first version came to log "ignoring
+    # this requirement" and then refuse the deployment in its name: the ceiling
+    # honoured the unknown layer by standing down, while the fallback still saw
+    # `must` set and stayed switched off.
+    enforced = _enforced_gather(layers, gather)
+    ceiling = layers.index(enforced.layer) if enforced.layer else 0
     best: Optional[GroupInfeasible] = None
 
     # Leaf-to-root. Stopping at `ceiling` is the whole of MustGather: without
@@ -143,7 +149,7 @@ async def solve_group_placement(
     # at all, `must` or not. It is a real fallback rather than a domain anyone
     # gathers into: everything is under it, so reaching here means only that
     # the members are somewhere in this cluster.
-    if not gather.must:
+    if not enforced.must:
         placement = await _fit_in_domain(root, root.layer, ordered_roles, capacity)
         if isinstance(placement, GroupPlacement):
             return placement
@@ -155,35 +161,37 @@ async def solve_group_placement(
             reason="No topology domain has any capacity for this group.",
             needed=total,
         )
-    if gather.must:
+    if enforced.must:
         best.reason = (
             f"The group needs {best.needed} placements in one "
-            f"{gather.layer!r}, and the roomiest one holds {best.available}."
+            f"{enforced.layer!r}, and the roomiest one holds {best.available}."
         )
     return best
 
 
-def _ceiling_index(layers: Sequence[str], gather: GatherRequest) -> int:
-    """The highest layer the search may widen to.
+def _enforced_gather(layers: Sequence[str], gather: GatherRequest) -> GatherRequest:
+    """The requirement as it will actually be applied.
 
-    Only ``must`` stops the walk. A preference that blocked the deployment
-    would be a requirement wearing a different word, and the tightest-first
-    walk already delivers the preference for free.
+    A `must` naming a layer this cluster no longer declares is dropped
+    *entirely* — not just from the ceiling. Half-dropping it is the bug this
+    function exists to make impossible: the walk would stand down for the
+    unknown layer while the root fallback stayed disabled, so a group that fits
+    only at the cluster root would be refused in the name of a layer the code
+    had just announced it was ignoring.
+
+    A stale name means someone renamed or removed a layer somewhere else. That
+    must not take a running deployment down.
     """
     if not gather.must or not gather.layer:
-        return 0
-    try:
-        return layers.index(gather.layer)
-    except ValueError:
-        # A layer that no longer exists — renamed or removed since the model
-        # was saved. Treated as no constraint rather than as an impossible one:
-        # refusing to schedule because of a stale name would take a running
-        # deployment down for an edit made somewhere else entirely.
+        return GatherRequest(layer=None, must=False)
+    if gather.layer not in layers:
         logger.warning(
-            "Ignoring a gather requirement on unknown topology layer %r.",
+            "Ignoring a gather requirement on unknown topology layer %r; "
+            "the group will be placed as if none had been asked for.",
             gather.layer,
         )
-        return 0
+        return GatherRequest(layer=None, must=False)
+    return gather
 
 
 def _gatherable_domains(root: TopologyNode, layer: str) -> List[TopologyNode]:

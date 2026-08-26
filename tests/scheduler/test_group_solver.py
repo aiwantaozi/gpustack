@@ -9,6 +9,7 @@ from gpustack.scheduler.group_solver import (
 )
 from gpustack.scheduler.topology import (
     NODE_LAYER,
+    ROOT_LAYER,
     TopologyLayerSpec,
     build_topology,
     layer_names,
@@ -272,6 +273,34 @@ async def test_a_gather_layer_that_no_longer_exists_does_not_block_scheduling():
     )
 
     assert isinstance(got, GroupPlacement)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_gather_layer_does_not_disable_the_root_fallback():
+    """Found on a live cluster, not here — the version above passes either way,
+    because its group fits at the rack layer and never reaches the fallback.
+
+    The workers sit in different zones *and* different racks, so the cluster
+    root is the only domain holding both. Dropping the unknown requirement from
+    the ceiling but not from the fallback leaves the group refused in the name
+    of a layer the code has just logged that it is ignoring."""
+    workers = [zoned(1, "w1", "z1", "rack-a"), zoned(2, "w2", "z2", "rack-b")]
+    root, layers = tree(workers, zone_rack_layers())
+
+    loose = await solve_group_placement(root, pd(2, 2), flat_capacity(2), layers)
+    assert isinstance(loose, GroupPlacement)
+    assert loose.layer == ROOT_LAYER, "the fixture must force the root fallback"
+
+    got = await solve_group_placement(
+        root,
+        pd(2, 2),
+        flat_capacity(2),
+        layers,
+        GatherRequest(layer="SuperPodLayer", must=True),
+    )
+
+    assert isinstance(got, GroupPlacement)
+    assert got.layer == ROOT_LAYER
 
 
 # --- the unclassified bucket ----------------------------------------------- #

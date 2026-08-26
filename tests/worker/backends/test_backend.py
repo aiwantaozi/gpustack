@@ -1599,3 +1599,104 @@ def test_is_ascend_310p(name, devices, expected):
 def test_is_ascend(name, devices, expected):
     actual = is_ascend(devices)
     assert actual == expected, f"case {name} expected {expected}, but got {actual}"
+
+
+# --- the two writers of --kv-transfer-config meet in the built command ------ #
+
+
+def _vllm_backend_for_composition(role, cache_args, pd_args):
+    """A vLLM server whose two connector producers both contribute.
+
+    Built around `_build_command_args` rather than the composer, because the
+    bug this guards was in neither of them: the composition ran at a point
+    where only one producer had contributed, so it was a no-op and both flags
+    reached the container. Testing the composer alone cannot see that.
+    """
+    backend = VLLMServer.__new__(VLLMServer)
+    backend.inference_backend = None
+    backend._model_path = "/models/llm"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        model_name="llm",
+        gpu_indexes=[],
+        ports=[4000],
+        computed_resource_claim=None,
+        mounted_loras=None,
+        cache_config=None,
+        role=role,
+    )
+    backend._model = types.SimpleNamespace(
+        name="llm",
+        backend=BackendEnum.VLLM,
+        backend_parameters=[],
+        backend_version=None,
+        categories=[],
+        extended_kv_cache=None,
+        speculative_config=None,
+    )
+    backend._derive_max_model_len = lambda: None
+    backend._get_speculative_arguments = lambda: []
+    backend._get_selected_gpu_devices = lambda: [
+        types.SimpleNamespace(vendor="NVIDIA", arch_family=None)
+    ]
+    # The cache contributes with the engine arguments; the PD connector
+    # arrives much later, with the user's parameters. That gap is the point.
+    backend._build_extended_kv_cache_arguments = lambda ctx: list(cache_args)
+    backend._flatten_backend_param = lambda: list(pd_args)
+    return backend
+
+
+_CACHE_JSON = '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+_PD_JSON = '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+
+
+def _composed(arguments):
+    assert arguments.count("--kv-transfer-config") == 1, "one flag, one value"
+    value = json.loads(arguments[arguments.index("--kv-transfer-config") + 1])
+    assert value["kv_connector"] == "MultiConnector"
+    return [c["kv_connector"] for c in value["kv_connector_extra_config"]["connectors"]]
+
+
+def test_a_prefill_command_asks_the_cache_before_its_own_connector():
+    backend = _vllm_backend_for_composition(
+        "prefill",
+        ["--kv-transfer-config", _CACHE_JSON],
+        ["--kv-transfer-config", _PD_JSON],
+    )
+
+    arguments, _ = backend._build_command_args(port=4000, is_distributed=False)
+
+    assert _composed(arguments) == ["LMCacheMPConnector", "NixlConnector"]
+
+
+def test_a_decode_command_asks_its_own_connector_first():
+    backend = _vllm_backend_for_composition(
+        "decode",
+        ["--kv-transfer-config", _CACHE_JSON],
+        ["--kv-transfer-config", _PD_JSON],
+    )
+
+    arguments, _ = backend._build_command_args(port=4000, is_distributed=False)
+
+    assert _composed(arguments) == ["NixlConnector", "LMCacheMPConnector"]
+
+
+@pytest.mark.parametrize(
+    "cache_args,pd_args",
+    [
+        (["--kv-transfer-config", _CACHE_JSON], []),
+        ([], ["--kv-transfer-config", _PD_JSON]),
+        ([], []),
+    ],
+)
+def test_a_single_writer_leaves_the_command_alone(cache_args, pd_args):
+    """This runs on every vLLM launch, so the un-composed cases must not move."""
+    backend = _vllm_backend_for_composition("prefill", cache_args, pd_args)
+
+    arguments, _ = backend._build_command_args(port=4000, is_distributed=False)
+
+    assert (
+        arguments.count("--kv-transfer-config")
+        == len(cache_args) // 2 + len(pd_args) // 2
+    )
+    assert "MultiConnector" not in " ".join(arguments)

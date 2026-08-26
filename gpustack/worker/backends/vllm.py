@@ -665,19 +665,6 @@ class VLLMServer(InferenceServer):
         cache_args = self._build_extended_kv_cache_arguments(ctx)
         arguments.extend(cache_args)
         arguments.extend(self._build_ascend_310p_arguments(ctx))
-        # Both the PD connector and the KV cache want --kv-transfer-config, and
-        # the engine reads it once. They are complementary rather than
-        # conflicting, so they are composed here instead of one being refused:
-        # a prefill asks the shared cache first (a prefix it already holds is
-        # prefill work that need not happen at all), a decode asks its own
-        # prefill first (the request already says the KV is waiting there).
-        # The cache's own descriptor is handed over so the order follows
-        # origin rather than whichever branch happened to append last.
-        arguments = compose_kv_transfer_config(
-            arguments,
-            getattr(self._model_instance, "role", None),
-            cache_first=descriptor_in(cache_args),
-        )
 
         extend_vllm_mounted_lora_arguments(
             arguments,
@@ -695,6 +682,26 @@ class VLLMServer(InferenceServer):
             ("--host", self._worker.ip),
             ("--port", str(ctx.port)),
             ("--served-model-name", self._model_instance.model_name),
+        )
+
+        # Last, because it is the only point where every writer of
+        # --kv-transfer-config has contributed: the cache's arrives with the
+        # engine arguments far above, the PD connector's with the user's
+        # parameters just now. Placing it any earlier composes whatever has
+        # been assembled so far and lets the rest through un-merged, which is
+        # a duplicate flag rather than a composition — measured, and it
+        # reached a container.
+        #
+        # They are complementary rather than conflicting: a prefill asks the
+        # shared cache first (a prefix it already holds is prefill work that
+        # need not happen at all), a decode asks its own prefill first (the
+        # request already says the KV is waiting there). The cache's own
+        # descriptor is handed over so the order follows origin rather than
+        # whichever branch happened to append last.
+        arguments = compose_kv_transfer_config(
+            arguments,
+            getattr(self._model_instance, "role", None),
+            cache_first=descriptor_in(cache_args),
         )
 
         injected = self._get_injected_backend_parameters(

@@ -332,6 +332,23 @@ modes:
         #
         # ⇒ Do not re-add health-check overrides without a single-variable
         # measurement that isolates them from the breaker.
+        #
+        # 🟢 Verified after reverting, on the same 1P1D group that produced
+        # the outage. The router boots `Started health checker for workers
+        # with 60s interval`, and over 124 minutes and ~124 ticks its log
+        # holds nothing but the startup block and the traces of the seven
+        # requests below — no warning, no error, no ejection. The first
+        # request after 85 minutes idle: 200 in 0.25s. After a second,
+        # deliberately uncontaminated 35-minute idle window (the request
+        # counter was read before and after and had not moved): 200 in 0.12s.
+        # That is 0 for 2 where the short interval was 1 for 2 at 25-30
+        # minutes.
+        #
+        # The accounting that exposed the fault is what closes it. The
+        # failure signature was `pd_prefill_requests_total` (24) below
+        # `policy_decisions_total` (32) — eight requests decided upon and
+        # never dispatched, because the worker had been ejected. Now every
+        # one of the seven matches: policy decisions 7, prefill 7, decode 7.
         - --cb-failure-threshold
         - "2"
         - --retry-max-retries

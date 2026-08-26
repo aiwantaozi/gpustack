@@ -225,6 +225,11 @@ save time rather than at run time:
   narrow the upstream router's circuit breaker so a dead role member is taken
   out of rotation after two failed requests rather than ten; a router you
   supply keeps whatever defaults it ships with.
+- **A member that dies while the group is idle is noticed on the next request,
+  not before it.** Detection rides the request path, so with no traffic there
+  is nothing to detect on; the router's background sweep runs once a minute.
+  The first requests after an idle period are retried and then routed around
+  the dead member.
 - All members of a group must use the same GPU type; a group mixing card types
   cannot be admitted atomically.
 - Roles are limited to prefill, decode and router.

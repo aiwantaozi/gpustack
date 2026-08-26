@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from gpustack.scheduler.topology import NODE_LAYER, TopologyNode, nodes_at_layer
 
@@ -81,12 +81,18 @@ class GroupInfeasible:
     available: int = 0
 
 
-# capacity(role, worker_ids, already_placed) -> {worker_id: slots}
+# async capacity(role, worker_ids, already_placed) -> {worker_id: slots}
 #
 # `already_placed` is what this solve has committed so far, in the shape the
 # allocation accounting reads. Passing it back is what keeps the capacity of
 # the second role honest about what the first role took.
-CapacityFn = Callable[[str, Sequence[int], Sequence[object]], Dict[int, int]]
+#
+# Async because the only real implementation is `count_offer_slots`, which
+# drives the resource-fit selectors, which are async all the way down. The
+# first draft typed this synchronous and every test passed — the mismatch
+# surfaced only when wiring it to a live Ascend host, which is the argument
+# for doing that early rather than at the end.
+CapacityFn = Callable[[str, Sequence[int], Sequence[object]], Awaitable[Dict[int, int]]]
 
 
 async def solve_group_placement(
@@ -120,18 +126,10 @@ async def solve_group_placement(
         # the most constrained measure of a domain and therefore the honest
         # one — a domain with room for eight slices and no whole card is not
         # eight units of room to a group whose first role needs whole cards.
-        sized = [
-            (
-                sum(
-                    capacity(
-                        ordered_roles[0].role, d.descendant_worker_ids(), []
-                    ).values()
-                ),
-                d.name,
-                d,
-            )
-            for d in domains
-        ]
+        sized = []
+        for d in domains:
+            room = await capacity(ordered_roles[0].role, d.descendant_worker_ids(), [])
+            sized.append((sum(room.values()), d.name, d))
         for _size, _name, domain in sorted(sized, key=lambda t: (t[0], t[1])):
             placement = await _fit_in_domain(domain, layer, ordered_roles, capacity)
             if isinstance(placement, GroupPlacement):
@@ -220,7 +218,7 @@ async def _fit_in_domain(
     placed_total = 0
 
     for role in roles:
-        slots = capacity(role.role, worker_ids, placed)
+        slots = await capacity(role.role, worker_ids, placed)
         share = _share_out(slots, role.replicas, placed)
         if share is None:
             available = placed_total + sum(slots.values())

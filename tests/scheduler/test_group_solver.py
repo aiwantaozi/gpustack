@@ -35,7 +35,7 @@ def tree(workers, specs=None):
 def flat_capacity(per_worker):
     """Every worker has the same room for every role, minus what is committed."""
 
-    def capacity(_role, worker_ids, placed):
+    async def capacity(_role, worker_ids, placed):
         used = {}
         for entry in placed:
             used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
@@ -130,7 +130,7 @@ async def test_a_group_that_fits_the_roomiest_host_goes_there_whole():
     never reaches the rack-level distribution at all — compactness comes from
     the layer walk, not from how a domain's workers are filled."""
 
-    def capacity(_role, worker_ids, placed):
+    async def capacity(_role, worker_ids, placed):
         used = {}
         for entry in placed:
             used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
@@ -155,7 +155,7 @@ async def test_inside_a_domain_the_roomiest_worker_gets_the_larger_share():
     round decides who carries the spare. Roomiest-first gives 3/2; starting
     from the tightest gives 2/3, which is the mutation this has to catch."""
 
-    def capacity(_role, worker_ids, placed):
+    async def capacity(_role, worker_ids, placed):
         used = {}
         for entry in placed:
             used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
@@ -316,7 +316,7 @@ async def test_the_hungriest_role_is_placed_first():
     taking slices left behind; the reverse usually works."""
     seen = []
 
-    def capacity(role, worker_ids, placed):
+    async def capacity(role, worker_ids, placed):
         seen.append(role)
         used = {}
         for entry in placed:

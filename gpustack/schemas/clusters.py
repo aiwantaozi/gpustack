@@ -250,6 +250,97 @@ class OperatorOptions(BaseModel):
     )
 
 
+class GatherStrategyEnum(str, Enum):
+    """What to do when a group does not fit inside one domain of a layer.
+
+    Read as a *failure* policy, not a placement one: the group scheduler
+    already places into the tightest domain that fits. ``PreferGather`` lets it
+    keep widening until the cluster root; ``MustGather`` stops it at a declared
+    layer and refuses the deployment instead of quietly delivering a slower
+    one.
+    """
+
+    MUST_GATHER = "MustGather"
+    PREFER_GATHER = "PreferGather"
+
+
+class TopologyLayer(BaseModel):
+    """One declared layer between the cluster and the worker.
+
+    ``label_keys`` is any-of rather than a single key because the same physical
+    layer is spelled differently by every vendor and cloud, and a fleet that
+    mixes them should not have to be relabelled before topology works at all.
+    The first key present wins.
+
+    The layer's ``name`` reaches the deployment form's "at least in the same
+    ___" choices verbatim, so it is the operator-facing label as well as the
+    identifier — which is why there is no separate display field.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    name: str = PydanticField(
+        description=(
+            "Operator-chosen layer name, shown verbatim in the deployment form."
+        )
+    )
+    label_keys: List[str] = PydanticField(
+        default_factory=list,
+        alias="labelKeys",
+        description=(
+            "Worker label keys for this layer, tried in order; the first one "
+            "present wins. A worker matching none of them is unclassified, "
+            "which costs placement resolution but never schedulability."
+        ),
+    )
+    parent_layer: Optional[str] = PydanticField(
+        default=None,
+        alias="parentLayer",
+        description=(
+            "The layer above this one. Left unset on the topmost layer, which "
+            "hangs off the implicit cluster root. Stored as a chain rather "
+            "than an ordered list so inserting a layer does not renumber the "
+            "layers below it — these names are referenced from saved model "
+            "configurations."
+        ),
+    )
+
+
+class ClusterTopology(BaseModel):
+    """How far apart this cluster's workers are, for the group scheduler.
+
+    Only the root and the leaf are built in. The leaf takes the worker's name
+    rather than a label, so a cluster that declares nothing still gets a usable
+    tree and still offers the tightest gather choice — every failure in this
+    structure costs resolution, never schedulability.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    layers: List[TopologyLayer] = PydanticField(
+        default_factory=list,
+        description=(
+            "Layers between the cluster root and the worker, as a parent "
+            "chain. May be empty."
+        ),
+    )
+    default_gather_strategy: Optional[GatherStrategyEnum] = PydanticField(
+        default=None,
+        alias="defaultGatherStrategy",
+        description=(
+            "Inherited by models deployed into this cluster that do not "
+            "declare their own. An operator who knows the fabric can make the "
+            "strict choice the default here rather than on every model."
+        ),
+    )
+    default_gather_layer: Optional[str] = PydanticField(
+        default=None,
+        alias="defaultGatherLayer",
+        description=(
+            "The layer `default_gather_strategy` applies to. Must name a "
+            "declared layer, or the built-in node layer."
+        ),
+    )
+
+
 class K8sOptions(BaseModel):
     """
     All Kubernetes-side deployment knobs for a cluster's worker DaemonSets:
@@ -570,6 +661,66 @@ class ClusterUpdate(SQLModel):
             )
         ),
     )
+    # Per-cluster, because "how far apart are two workers" is a property of the
+    # fleet and a worker belongs to exactly one cluster. Stored alongside
+    # `k8s_options` and handled identically.
+    topology: Optional[ClusterTopology] = Field(
+        default=None,
+        sa_column=Column(
+            pydantic_column_type(
+                ClusterTopology,
+                exclude_none=True,
+                exclude_unset=True,
+                exclude_defaults=True,
+            )
+        ),
+    )
+
+    @field_validator("topology")
+    def validate_topology(cls, v: Optional[ClusterTopology]):
+        """Refuse a declaration that cannot become a tree.
+
+        Only the declaration is validated, never the data: a cycle or a
+        dangling parent means the operator's intent is unknowable, while a
+        worker missing a label is a normal state the tree already has a place
+        for. Rejecting the second would make labelling a precondition for
+        saving, which is exactly backwards — the labels are edited *after*
+        the layers exist, using the tree to see who is still missing.
+        """
+        if v is None:
+            return v
+
+        from gpustack.scheduler.topology import (
+            NODE_LAYER,
+            TopologyError,
+            TopologyLayerSpec,
+            layer_names,
+        )
+
+        specs = [
+            TopologyLayerSpec(
+                layer=layer.name,
+                label_keys=tuple(layer.label_keys or ()),
+                parent_layer=layer.parent_layer,
+            )
+            for layer in v.layers or []
+        ]
+        try:
+            names = layer_names(specs)
+        except TopologyError as e:
+            raise ValueError(str(e)) from e
+
+        if v.default_gather_layer and v.default_gather_layer not in names:
+            raise ValueError(
+                f"default_gather_layer {v.default_gather_layer!r} is not a "
+                f"declared layer. Available: {', '.join(names)}."
+            )
+        if v.default_gather_strategy and not v.default_gather_layer:
+            raise ValueError(
+                "default_gather_strategy needs default_gather_layer to say "
+                f"which layer it applies to (e.g. {NODE_LAYER!r})."
+            )
+        return v
 
     @field_validator("server_url")
     def validate_server_url(cls, v: Optional[str]) -> Optional[str]:

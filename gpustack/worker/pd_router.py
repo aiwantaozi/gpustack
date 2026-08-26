@@ -58,6 +58,9 @@ class RouterPlan(BaseModel):
 
     image: Optional[str] = None
     command: List[str] = []
+    env: Dict[str, str] = {}
+    """Environment the router binary needs to come up, from the catalog. Not
+    KV-transfer configuration — see `PDRouter.env`."""
     health_path: Optional[str] = None
     metrics: bool = False
     """Whether the router serves a Prometheus exposition. False is not a
@@ -195,6 +198,10 @@ def render_router(
     return RouterPlan(
         image=render(router.image, variables, context="router image"),
         command=command + peer_args,
+        env={
+            key: render(value, variables, context=f"router env '{key}'")
+            for key, value in router.env.items()
+        },
         health_path=router.health_path,
         metrics=router.capabilities.metrics,
         models_endpoint=router.capabilities.models_endpoint,
@@ -319,6 +326,15 @@ def apply_managed_router(
     # for a user parameter to add here; a router that needs its own takes the
     # user-provided branch, where the whole command is theirs.
     projected.backend_parameters = []
+
+    # Environment goes the other way round from image and command: the
+    # catalog's entries are what the binary needs in order to come up at all,
+    # so they are defaults the deployment may override rather than values that
+    # yield wholesale to the role. Merged under, not over — a user who sets
+    # one of these names has said something specific and keeps it, while the
+    # rest still arrive.
+    if plan.env:
+        projected.env = {**plan.env, **(projected.env or {})}
     return projected
 
 

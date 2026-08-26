@@ -180,10 +180,18 @@ consumes nine of them. If you run several such members per host, widen
 
     For these, the value written in a configuration file is **not** the port
     actually bound, so GPUStack can neither reserve them nor declare them as
-    host ports. In practice they have been observed to land well outside the
-    default service and Ray ranges, so collisions are unlikely rather than
-    prevented. If a member restarts repeatedly and never reaches `Running`,
-    check its engine log for `Address already in use`.
+    host ports. They have been observed around 15000–17000 and 20000–20800,
+    which is why the default service range (40000–40063) does not meet them —
+    the separation is what keeps them apart, not any reservation.
+
+    🔴 **So do not move `--service-port-range` into those bands.** Measured:
+    with a connector port band placed at 20001, a member's own second rank
+    tried to bind 20003 and found it already taken by a transfer-engine port
+    the engine had chosen for itself moments earlier. The same deployment
+    started first try with the band in the default range.
+
+    If a member restarts repeatedly and never reaches `Running`, check its
+    engine log for `Address already in use`.
 
     Port deduplication also only covers one worker process. A second GPUStack
     worker on the same host, or a container you started by hand, is outside it.

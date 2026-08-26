@@ -623,3 +623,87 @@ def test_a_decode_peer_needs_no_band_and_renders_without_one():
 
     i = command.index("--decode")
     assert command[i : i + 2] == ["--decode", "http://10.0.0.3:40102"]
+
+
+def test_a_router_that_needs_env_to_boot_gets_it_from_the_catalog():
+    """Measured on 910B2: vllm-ascend's proxy imports vllm.logger, which pulls
+    in torch_npu, which refuses to load with no accelerator visible -- landing
+    on the one role that is cpu_only by design. The escape hatch is an
+    environment variable, so the catalog has to be able to say so."""
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+    from gpustack.worker.pd_router import render_router
+
+    mode = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+    plan = render_router(mode, VARIABLES, PEERS)
+
+    assert plan.env["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+
+
+def test_catalog_env_is_a_default_the_deployment_can_override():
+    """The other way round from image and command, which yield wholesale to
+    the role: these are boot requirements, so the ones a user did not speak to
+    still arrive."""
+    from gpustack.schemas.models import PDModeEnum, RoleSpec, role_effective_model
+    from gpustack.worker.pd_router import apply_managed_router
+
+    model = _pd_model(
+        RoleSpec(
+            name="router",
+            replicas=1,
+            cpu_only=True,
+            env={"TORCH_DEVICE_BACKEND_AUTOLOAD": "1", "MY_OWN": "x"},
+        )
+    )
+    model.disaggregation.mode = PDModeEnum.VLLM_ASCEND_MOONCAKE
+
+    # The worker projects the role before it materialises the router, so the
+    # role's env is already on the model by the time the catalog's is merged.
+    projected = apply_managed_router(
+        role_effective_model(model, "router"),
+        "router",
+        peers=PEERS,
+        variables=VARIABLES,
+    )
+
+    assert projected.env["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "1"
+    assert projected.env["MY_OWN"] == "x"
+
+
+def test_a_router_env_placeholder_is_rendered_not_passed_through():
+    """Same failure the whole template layer exists for: an unrendered
+    {{worker_ip}} reached a container once and became `ZMQError: No such
+    device`."""
+    from gpustack.schemas.pd_modes import (
+        PDMode,
+        PDPeerStyleEnum,
+        PDRouter,
+        PDRouterPeers,
+        PDRouterProtocolEnum,
+    )
+    from gpustack.worker.pd_router import render_router
+
+    mode = PDMode(
+        name="test-router-env",
+        router=PDRouter(
+            protocol=PDRouterProtocolEnum.TWO_HOP,
+            image="img",
+            command=["run"],
+            env={"ADVERTISE": "{{worker_ip}}"},
+            peers=PDRouterPeers(
+                style=PDPeerStyleEnum.REPEATED_FLAG,
+                prefill={
+                    "flag": "--prefill",
+                    "value": "http://{{peer.ip}}:{{peer.port}}",
+                },
+                decode={
+                    "flag": "--decode",
+                    "value": "http://{{peer.ip}}:{{peer.port}}",
+                },
+            ),
+        ),
+    )
+
+    plan = render_router(mode, VARIABLES, PEERS)
+
+    assert plan.env["ADVERTISE"] == "192.168.50.15"

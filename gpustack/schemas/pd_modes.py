@@ -447,6 +447,26 @@ class PDRouter(BaseModel):
     image: Optional[str] = None
     ports: List[PDPortSpec] = []
     command: List[str] = []
+    env: Dict[str, str] = {}
+    """Environment a router needs in order to start at all.
+
+    Not an injection channel like a role's — see ``channel`` — but part of the
+    invocation, in the same sense the command is: values that decide whether
+    the binary comes up, not values that configure KV transfer. vllm-ascend's
+    proxy is the case that forced it. Its first import reaches
+    ``vllm.logger``, which pulls in torch and then torch_npu, and torch_npu
+    raises without an accelerator visible:
+
+        RuntimeError: Failed to load the backend extension: torch_npu
+
+    A router is ``cpu_only`` by design, so this lands on exactly the role that
+    must not hold a card. ``TORCH_DEVICE_BACKEND_AUTOLOAD=0`` is the upstream
+    escape hatch and was measured to fix it. Declaring it here keeps
+    "which router needs what to boot" in the same file as the rest of that
+    router's contract; the alternative was a user typing it on a role whose
+    other fields GPUStack fills in.
+    """
+
     peers: Optional[PDRouterPeers] = None
     capabilities: PDRouterCapabilities = PDRouterCapabilities()
     request_metrics: PDRouterRequestMetrics = PDRouterRequestMetrics()
@@ -484,9 +504,15 @@ class PDRouter(BaseModel):
         return self
 
     def channel(self, target: PDInjectTargetEnum) -> Any:
-        """A router is a command line: env and files are not injection
-        channels for it, and the peer templates are part of the args."""
-        if target in (PDInjectTargetEnum.ENV, PDInjectTargetEnum.FILES):
+        """A router is mostly a command line: the peer templates are part of
+        the args, and it writes no files. Its ``env`` is answered here so that
+        a router port band declared ``inject_to: env`` is cross-checked like
+        any other — the env reaches the container through the router's
+        workload rather than through the injector, but a band that names
+        itself there is still consumed there."""
+        if target == PDInjectTargetEnum.ENV:
+            return self.env
+        if target == PDInjectTargetEnum.FILES:
             return {}
         return [self.command, self.peers]
 

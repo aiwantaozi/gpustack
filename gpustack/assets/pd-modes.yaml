@@ -678,21 +678,36 @@ modes:
         - "{{worker_ip}}"
         - --port
         - "{{port}}"
+      env:
+        # The proxy's first import reaches vllm.logger, which pulls in torch
+        # and then torch_npu, and torch_npu refuses to load without an
+        # accelerator visible:
+        #
+        #   RuntimeError: Failed to load the backend extension: torch_npu
+        #
+        # A router is cpu_only by design, so this lands on exactly the role
+        # that must not hold a card. Measured: the proxy container would not
+        # start at all until this was set, and started immediately with it.
+        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       peers:
         # Hosts and ports arrive as two parallel flags.
         style: parallel_lists
         prefill: { host_flag: "--prefiller-hosts", port_flag: "--prefiller-ports" }
         decode: { host_flag: "--decoder-hosts", port_flag: "--decoder-ports" }
       capabilities:
-        # Measured: no /metrics, and not even /v1/models — polling them
-        # filled the router log with 404s roughly once a second and
-        # reported a permanent false failure. Declaring the absence is what
-        # stops that.
+        # Measured on the shipped runner (vllm_ascend 0.20.2rc1): GET /metrics
+        # and GET /v1/models both 404. Polling them filled the router log with
+        # 404s roughly once a second and reported a permanent false failure.
+        # Declaring the absence is what stops that.
         metrics: false
         models_endpoint: false
         kv_expired_metric: false
-      # No health endpoint either, so readiness is process liveness only.
-      health_path: null
+      # Measured on the same image: GET /healthcheck returns 200 with the
+      # in-flight request count and both instance lists. Read as absent
+      # earlier from a v0.23.0 example, where it is — this proxy's endpoint
+      # set differs between vllm-ascend versions, so what is declared here is
+      # the version we ship, not the one upstream happens to have.
+      health_path: /healthcheck
 
   - name: custom
     display_name: Custom

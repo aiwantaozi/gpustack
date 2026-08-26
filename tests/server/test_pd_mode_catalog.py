@@ -304,14 +304,16 @@ def test_router_capabilities_are_declared_per_mode():
     assert nixl.router.capabilities.kv_expired_metric is True
     assert nixl.router.health_path == "/health"
 
-    # Measured: vllm-ascend's proxy example serves neither /metrics nor
-    # /v1/models nor a health path — polling them produced a ~1/s 404 storm
-    # and a permanent false failure.
+    # Measured on the shipped runner (vllm_ascend 0.20.2rc1): GET /metrics and
+    # GET /v1/models both 404 -- polling them produced a ~1/s 404 storm and a
+    # permanent false failure -- while GET /healthcheck returns 200. The
+    # endpoint set differs between vllm-ascend versions (a v0.23.0 example has
+    # no health path at all), so what is asserted is the version we ship.
     ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
     assert ascend.router.capabilities.metrics is False
     assert ascend.router.capabilities.models_endpoint is False
     assert ascend.router.capabilities.kv_expired_metric is False
-    assert ascend.router.health_path is None
+    assert ascend.router.health_path == "/healthcheck"
 
 
 def test_router_capabilities_default_to_absent():

@@ -41,6 +41,7 @@ from gpustack.routes import (
     cloud_credentials,
     worker_pools,
     clusters,
+    cluster_topology,
     kv_transfer_budget,
     token,
     benchmarks,
@@ -145,6 +146,12 @@ v1_base_router.include_router(
 # and friends, so platform-only operations (e.g. set-default) still
 # require is_admin inside the handler.
 v1_base_router.include_router(clusters.router, prefix="/clusters", tags=["Clusters"])
+# Same prefix, separate module: the topology preview is read-only and answers a
+# question about a declaration that has not been saved, which shares nothing
+# with cluster CRUD beyond the id in the path.
+v1_base_router.include_router(
+    cluster_topology.router, prefix="/clusters", tags=["Clusters"]
+)
 v1_base_router.include_router(
     cloud_credentials.router,
     prefix="/cloud-credentials",

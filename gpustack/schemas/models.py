@@ -54,6 +54,11 @@ from gpustack.schemas.model_routes import (
 from gpustack.schemas.principals import _platform_principal_id
 from gpustack.schemas.cache_services import CacheConfigSnapshot
 
+# The enum lives with the cluster because the cluster is where the default is
+# set; a model only overrides it. Runtime import is safe in this direction —
+# `clusters` imports `models` under TYPE_CHECKING only.
+from gpustack.schemas.clusters import GatherStrategyEnum
+
 if TYPE_CHECKING:
     from gpustack.schemas.model_files import ModelFile
     from gpustack.schemas.clusters import Cluster
@@ -521,6 +526,29 @@ class RoleSpec(BaseModel):
     """The only entry point for a heterogeneous group, and the precondition
     for gang admission."""
     extended_kv_cache: Optional[ExtendedKVCacheConfig] = None
+    speculative_config: Optional[SpeculativeConfig] = None
+    """🔴 Overridable per role because prefill and decode need *different*
+    values, not because one of them should switch it off.
+
+    The first reading of this was backwards: prefill does not decode, so a
+    draft model looked like pure waste there. What the NIXL handshake actually
+    hashes is the model — `model`, `num_hidden_layers`, `num_kv_heads`,
+    `head_size` — and for MTP-style speculation the draft head is *part of the
+    model*. A prefill that does not load it therefore produces a different
+    structure and fails the compatibility check. Upstream's own recipes
+    (vllm-ascend's DeepSeek-V4-Flash and GLM5 tutorials) say the same thing in
+    numbers: prefill runs `num_speculative_tokens: 1` and decode runs 3 or
+    more. The 1 is not prefill speculating; it is prefill loading the same
+    shape.
+
+    So the model-level value cannot serve both, and neither can switching it
+    off on one side. Absent still inherits the model's, which is right for a
+    non-MTP draft model where prefill genuinely gains nothing — the field
+    makes the split possible, it does not force it.
+
+    No migration: `roles` is already a JSON column, so a new field on this
+    model is a schema change only.
+    """
 
     dependencies: Optional[List[str]] = None
     """Roles that must be ready before this one starts. Must not cycle."""
@@ -568,6 +596,52 @@ PD_MODE_BACKENDS: Dict[str, List[str]] = {
     # engine mix is theirs to get right.
     PDModeEnum.CUSTOM.value: [],
 }
+
+
+class GatherSpec(BaseModel):
+    """How tightly this deployment's members must sit together.
+
+    The model-level override of `Cluster.topology.default_gather_*`: an
+    operator who knows the fabric sets the cluster default once, and a
+    deployment that cares more (or less) says so here. Absent means inherit.
+
+    Read as a *failure* policy, not a placement one. The group solver already
+    places into the tightest domain that fits, so `MustGather` adds exactly
+    one behaviour: refuse rather than quietly deliver a slower deployment.
+    That is why the form asks "below what would you rather not deploy" instead
+    of "which layer do you want" — the layer is the operator's own string and
+    a deployer may not know what it means, while "does it fit" is universal.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    strategy: Optional[GatherStrategyEnum] = None
+    """None inherits the cluster's `default_gather_strategy`. `PreferGather`
+    keeps widening to the cluster root; `MustGather` stops at `layer` and
+    refuses the deployment instead."""
+
+    layer: Optional[str] = None
+    """The layer `strategy` applies to: a declared layer's name, or the
+    built-in node layer. Only meaningful with `MustGather`."""
+
+    @model_validator(mode="after")
+    def check_layer_accompanies_must(self) -> "GatherSpec":
+        """`MustGather` without a layer has nothing to stop at.
+
+        Left unchecked it reads as "refuse if it does not fit" with no
+        definition of "fit", and the solver's `_enforced_gather` would stand
+        the requirement down — so the deployment would be accepted under a
+        promise that was never in force. Refusing at the edge is the whole
+        difference between a constraint and a decoration.
+        """
+        if self.strategy == GatherStrategyEnum.MUST_GATHER and not self.layer:
+            raise ValueError("gather strategy 'MustGather' requires a layer")
+        if self.layer and self.strategy is None:
+            raise ValueError(
+                "gather layer is set without a strategy; there is nothing to "
+                "apply it to"
+            )
+        return self
 
 
 class DisaggregationSpec(BaseModel):
@@ -749,6 +823,15 @@ class ModelSpecBase(SQLModel, ModelSource):
     )
     disaggregation: Optional[DisaggregationSpec] = Field(
         sa_type=pydantic_column_type(DisaggregationSpec), default=None
+    )
+    # Beside `roles` rather than inside `disaggregation`: gather describes how
+    # far apart the group's *members* may sit, and members come from `roles`.
+    # A role-bearing model without disaggregation is a valid shape (plain
+    # multi-role orchestration), and it wants this just as much. The
+    # deployment form still shows the control in the PD block, which is a
+    # placement decision about the form, not about the field.
+    gather: Optional[GatherSpec] = Field(
+        sa_type=pydantic_column_type(GatherSpec), default=None
     )
 
     @model_validator(mode="after")
@@ -1275,6 +1358,7 @@ class ModelInstanceBase(SQLModel, ModelSource):
         distributed_inference_across_workers permission flag."""
         dservers = self.distributed_servers
         return bool(dservers and dservers.subordinate_workers)
+
     role: Optional[str] = None
     """Which role of the parent Model this instance serves. None for a plain
     single-role deployment."""

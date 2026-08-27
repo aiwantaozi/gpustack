@@ -1199,6 +1199,14 @@ _DIGEST_EXCLUDED_SPEC_FIELDS = frozenset(
         "generic_proxy",
         # Mounted at run time against a running engine.
         "lora_list",
+        # Placement preference for the *next* scheduling decision, not
+        # container shape. Folding it in would make tightening gather a
+        # full-group restart that relocates nothing — the members already
+        # hold their workers, and nothing re-places a running group. The
+        # deployment form says so in as many words ("only affects later
+        # scheduling; running groups are not moved"), and a digest bump would
+        # make that sentence a lie.
+        "gather",
     }
 )
 

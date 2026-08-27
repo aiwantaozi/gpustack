@@ -200,17 +200,23 @@ class PDTransferMetrics(BaseModel):
     """The key modes resolve through, the same id ``kv_leases`` uses."""
 
     read_from_role: str = "decode"
-    """🔴 Which side of the pair owns these counters.
+    """🔴 Which side of the pair owns these counters. **Both values are in
+    use — this is not a formality with one real answer.**
 
-    NIXL is *pull-based*: decode reads from prefill, so decode is where a
-    transfer is counted. Measured on a working 1P1D — prefill's
-    ``nixl_xfer_time_seconds_count`` stayed at 0.0 for the whole run while
-    decode's was 1.0. Reading the prefill side therefore reports a healthy
-    pair as "no KV ever moved", i.e. reports the exact failure this metric
-    exists to detect, on a deployment that is fine.
+    The rule is "whichever side moves the bytes", and the two engines differ:
 
-    A declaration and not a constant because push-based connectors exist;
-    for one of those this reads ``prefill`` and no code changes."""
+    - vLLM's NIXL *pulls*: decode reads from prefill, so decode counts.
+      Measured on a working 1P1D — prefill's
+      ``nixl_xfer_time_seconds_count`` stayed at 0.0 for the whole run while
+      decode's was 1.0.
+    - SGLang *pushes*: prefill writes into slots decode registered through
+      the bootstrap service, so prefill counts. Its byte and speed counters
+      exist only on prefill for exactly this reason.
+
+    Get it backwards and a healthy pair reports "no KV ever moved" — the
+    exact failure this metric exists to detect, fired at a deployment that is
+    fine. The default is ``decode`` only because NIXL came first, not because
+    it is the normal case."""
 
     xfer_count: Optional[str] = None
     """Cumulative count of completed KV transfers — the numerator of the
@@ -235,13 +241,20 @@ class PDTransferMetrics(BaseModel):
     """Labels a sample must carry to be counted, for engines that put every
     stage of a request in ONE family and separate them by label.
 
-    SGLang is why this exists. It exports a single
-    ``sglang:per_stage_req_latency_seconds`` histogram and distinguishes
-    ``stage="decode_bootstrap"`` from ``stage="decode_transferred"`` — so
-    summing the family without a selector counts every stage of every request
-    and yields a number several times the transfer count, which as a numerator
-    reads as an effectiveness ratio well above 1. Null for connectors like NIXL
-    that give each counter its own name."""
+    SGLang's ``sglang:per_stage_req_latency_seconds`` is why this exists: one
+    histogram, with ``stage="decode_bootstrap"`` and
+    ``stage="decode_transferred"`` telling the phases apart, so summing the
+    family without a selector counts every stage of every request.
+
+    ⚠️ **No shipped mode uses it today, and the reason is worth reading
+    before adding one back.** That family was the SGLang numerator until
+    2026-08-26, when it turned out to advance on an *idle* group (+1 per
+    ~45s: health probes and the engine's own synthetic requests traverse the
+    disaggregation path and land in the histogram). A label selector fixes
+    "which phase", not "was there a request" — and a numerator that ticks
+    without traffic makes silent degradation undetectable. Kept because the
+    label-selection hazard is real and will recur; not kept as an
+    endorsement of per-stage histograms as numerators."""
 
     min_expected_rate: Optional[float] = None
     """Coarse floor for the first-deployment case the baseline method
@@ -371,9 +384,15 @@ class PDRouterCapabilities(BaseModel):
     """What the router actually serves.
 
     Every field defaults to False: an undeclared endpoint must be treated
-    as absent, not assumed present. vllm-ascend's proxy example has neither
-    /metrics nor /v1/models, and polling them produced a ~1/s 404 storm in
-    the router log plus a permanent false alarm.
+    as absent, not assumed present. The measurement that set that direction
+    was vllm-ascend's proxy example, which served neither /metrics nor
+    /v1/models — polling them produced a ~1/s 404 storm in the router log plus
+    a permanent false alarm.
+
+    📌 That proxy is no longer in the catalog: the Ascend recipe launches
+    first-party `vllm-router` as of 2026-08-26, so no shipped mode has these
+    False any more. The default stays False for the mode that has no
+    measurement behind it at all — `custom`, where the router is the user's.
     """
 
     metrics: bool = False
@@ -399,11 +418,12 @@ class PDRouterRequestMetrics(BaseModel):
     per-worker one says which decode stopped pulling.
 
     Left empty means no denominator, and that is a first-class outcome
-    rather than a gap to paper over — vllm-ascend's proxy serves no
-    /metrics at all, and SGLang's gateway is the same codebase as
-    vllm-router but its counter names were never verified here. Guessing
-    them would produce a ratio that reads zero because the name was wrong,
-    which is indistinguishable from the failure being measured.
+    rather than a gap to paper over. Guessing a counter name would produce a
+    ratio that reads zero because the name was wrong, which is
+    indistinguishable from the failure being measured — and that risk is not
+    hypothetical: SGLang's gateway is a fork of the same codebase as
+    vllm-router, and its counters turned out to be prefixed `smg_` where
+    vllm-router uses `vllm_router_`. Shared ancestry predicted nothing.
     """
 
     prefill_requests: Optional[str] = None
@@ -438,6 +458,76 @@ class PDRouterRequestMetrics(BaseModel):
         )
 
 
+class PDMembershipAPI(BaseModel):
+    """How a router is told its peer list changed, without restarting it.
+
+    ⭐ Why this is worth a schema at all: the router is a single replica and the
+    gateway's only upstream, so restarting it to re-render peers is a full
+    outage for the group. Every change of ratio would cost one. An HTTP
+    membership call turns that into no interruption at all.
+
+    **Every field is optional, and all-empty is a legitimate declaration** —
+    it means "this router has no such API, fall back to re-render and restart".
+    Reading a missing API as a bug would make the fallback path look like a
+    failure.
+
+    ⚠️ **Declaring it is not the same as it working.** The vLLM-side API is
+    read from upstream source, not measured: `POST /workers` carries
+    `worker_type`, but the single-router path drops that field before it
+    reaches the PD router, which then returns a hardcoded "requires specific
+    add_prefill_server or add_decode_server methods". `--enable-igw` routes it
+    through the manager that does dispatch on `worker_type`. That is what
+    `requires_args` records, and it is still unverified on hardware (see
+    open-questions F12) — so a consumer should treat a failed call as "fall
+    back to restart", never as "the group is broken".
+    """
+
+    add: Optional[str] = None
+    """`"METHOD /path"`, e.g. `"POST /workers"`. Method included because the
+    two shapes upstream ships differ in it: a REST resource (`POST /workers`)
+    versus an action endpoint (`POST /instances/add`)."""
+
+    remove: Optional[str] = None
+    """`"METHOD /path"`, with `{url}` substituted for the peer being removed."""
+
+    probe: Optional[str] = None
+    """Read-back for reconciliation. The one field that is not optional in
+    practice: an accepted `add` does not mean the member is in the registry —
+    upstream implementations poll the peer first and drop it silently on
+    timeout, and the default windows are tuned for small models. Without a
+    read-back, a scale-out that quietly failed looks identical to one that
+    worked."""
+
+    body: Optional[Dict[str, str]] = None
+    """Body template for `add`. Values may carry the same `{{...}}`
+    placeholders the rest of the catalog uses."""
+
+    role_field: Optional[str] = None
+    """Which body key carries the role. Named rather than assumed because it
+    is the field the single-router path drops (see the class note), so a
+    consumer needs to know what to check for in the read-back."""
+
+    role_values: Optional[Dict[str, str]] = None
+    """GPUStack role name -> the value this router expects. Not an identity
+    map: a router may call them `prefill`/`decode` or something else, and the
+    router role itself has no membership at all."""
+
+    requires_args: List[str] = []
+    """Launch flags without which the API exists but does not work. Empty is
+    the normal case; a non-empty list means the recipe's `command` must already
+    carry them, and a mismatch is a catalog bug rather than a runtime one."""
+
+    @property
+    def available(self) -> bool:
+        """Whether scale-out can go through the API at all.
+
+        Both `add` and `probe`: an add with no read-back cannot be reconciled,
+        and the design's own rule is "send explicitly, read back, fall back to
+        restart on failure" — two of those three need this pair.
+        """
+        return bool(self.add and self.probe)
+
+
 class PDRouter(BaseModel):
     """The router role of a mode. There is no universal router — the
     catalog format is what generalizes, not the binary."""
@@ -470,6 +560,28 @@ class PDRouter(BaseModel):
     peers: Optional[PDRouterPeers] = None
     capabilities: PDRouterCapabilities = PDRouterCapabilities()
     request_metrics: PDRouterRequestMetrics = PDRouterRequestMetrics()
+    membership_api: PDMembershipAPI = PDMembershipAPI()
+
+    @property
+    def membership_api_usable(self) -> bool:
+        """Whether scale-out can go through the API *as this recipe launches it*.
+
+        Deliberately not an assertion in the loader. `membership_api` records
+        the shape upstream serves; `command` records what we actually start.
+        Those two legitimately disagree while a flag is declared but unverified
+        — which is today's state for `--enable-igw` — and a loader that refused
+        the mismatch would force the choice between deleting the knowledge and
+        enabling an untested flag.
+
+        So the mismatch gets a name instead. A consumer asking "can I add a
+        member without an outage" reads this and gets False, and it flips to
+        True the moment the flag is added to the recipe, with nothing else to
+        change.
+        """
+        if not self.membership_api.available:
+            return False
+        rendered = " ".join(self.command or [])
+        return all(flag in rendered for flag in self.membership_api.requires_args)
 
     health_path: Optional[str] = None
     """None means the router serves no health endpoint, so readiness falls

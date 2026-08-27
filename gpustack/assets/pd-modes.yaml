@@ -160,47 +160,73 @@ kv_transfer_metrics:
     xfer_bytes: null
     failed_transfers: null
   - connector: sglang-mooncake
-    # 🟢 Measured 2026-08-25 on a live 1P1D (SGLang 0.5.15.post1,
-    # Qwen3-0.6B), replacing "never verified here". Both stage counters
-    # advanced by exactly the request count — 7 -> 12 over a burst of 5 — on
-    # prefill and decode alike. That BOTH sides count is the difference from
-    # NIXL, where a pull-based transfer is only ever counted on decode: here
-    # the bootstrap is a handshake both participate in. Decode stays the side
-    # read, so the reading remains comparable to the NIXL path's and
-    # `read_from_role` keeps one meaning across connectors.
+    # 🔴 Reads PREFILL, and that is not a slip. SGLang is the one connector
+    # here that PUSHES: the router same-dispatches to both roles, decode
+    # allocates its receive slots and registers them through prefill's
+    # bootstrap service, and prefill then writes into them. The stage names
+    # say it in the voice they are written in —
+    #   prefill: prefill_bootstrap -> prefill_forward -> prefill_transfer_kv_cache
+    #   decode:  decode_prepare -> decode_bootstrap -> decode_waiting -> decode_transferred
+    # active on one side, passive on the other. The metric families say it
+    # harder: `kv_transfer_total_mb`, `kv_transfer_speed_gb_s` and
+    # `kv_transfer_latency_ms` exist ONLY on prefill, because the sender is
+    # the side that knows how many bytes went and how fast. Decode gets only
+    # `kv_transfer_bootstrap_ms` and `kv_transfer_alloc_ms` — handshake and
+    # buffer allocation, which is all a receiver does here.
     #
-    # Every stage of a request lands in ONE family, told apart by label, which
-    # is what `sample_labels` is for: summed unselected this also counts
-    # decode_prepare, decode_bootstrap, decode_waiting and fake_output, and
-    # returns roughly five times the transfers — a numerator that yields an
-    # "effectiveness" well above 1.
-    read_from_role: decode
-    xfer_count: "sglang:per_stage_req_latency_seconds_count"
-    xfer_seconds: "sglang:per_stage_req_latency_seconds_sum"
-    sample_labels:
-      stage: decode_transferred
+    # 🔴 What this replaced, and why, measured 2026-08-26 on a live 1P1D
+    # (SGLang, Qwen3-0.6B, 192.168.50.15): the previous declaration counted
+    # `per_stage_req_latency_seconds_count{stage="decode_transferred"}`, and
+    # that counter ADVANCES ON AN IDLE GROUP. Over 90 seconds with zero
+    # business requests it went 24 -> 25 -> 26 (roughly +1 per 45s) while
+    # `num_requests_total` stayed at 4 — health probing and SGLang's own
+    # synthetic requests traverse the disaggregation path and land in the
+    # stage histogram. Cumulatively it read 26 transfers against 3 routed
+    # requests, a ratio near 9 where a healthy one is near 1.
+    #
+    # That is not a cosmetic error. `_judge_effectiveness` calls a group
+    # AGGREGATED only when the ratio stops being positive; a numerator that
+    # ticks on its own can never stop being positive, so the one failure
+    # this whole mechanism exists to catch — silent degradation to
+    # aggregated serving — would have been masked forever. The counter below
+    # was measured in the same window and did NOT move (3 -> 3 -> 3): it
+    # only advances when bytes actually cross, so probes that transfer
+    # nothing do not count.
+    #
+    # The earlier "both sides advanced by exactly the request count, 7 -> 12
+    # over a burst of 5" was measured under a burst, where real traffic
+    # swamps a +1-per-45s background. Bursts cannot see this class of fault;
+    # only an idle window can.
+    read_from_role: prefill
+    xfer_count: "sglang:kv_transfer_total_mb_count"
+    # Deliberately null despite the counters existing. `kv_transfer_latency_ms`
+    # is milliseconds and `kv_transfer_total_mb` is megabytes, while these
+    # two fields are named — and consumed as — seconds and bytes. Feeding
+    # them mismatched units would make `_rate` report MB/ms while labelling
+    # it BYTES_PER_SECOND: self-consistent against its own baseline, and a
+    # lie to anyone who reads the unit. Declaring a unit is a schema change,
+    # not a bugfix, so the throughput arm stays off until it happens. Nothing
+    # regresses — the arm it turns off was running on the polluted counter
+    # and measuring probe cadence, not transfer throughput.
+    xfer_seconds: null
     xfer_bytes: null
     failed_transfers: null
   - connector: sglang-nixl
-    # 🟢 Measured 2026-08-25 on a live 1P1D (SGLang 0.5.15.post1,
-    # Qwen3-0.6B), replacing "never verified here". Both stage counters
-    # advanced by exactly the request count — 7 -> 12 over a burst of 5 — on
-    # prefill and decode alike. That BOTH sides count is the difference from
-    # NIXL, where a pull-based transfer is only ever counted on decode: here
-    # the bootstrap is a handshake both participate in. Decode stays the side
-    # read, so the reading remains comparable to the NIXL path's and
-    # `read_from_role` keeps one meaning across connectors.
+    # Same declaration as sglang-mooncake above, and the reasoning there
+    # applies verbatim: SGLang's disaggregation layer decides the direction
+    # and the counters, and the transfer backend underneath it does not.
     #
-    # Every stage of a request lands in ONE family, told apart by label, which
-    # is what `sample_labels` is for: summed unselected this also counts
-    # decode_prepare, decode_bootstrap, decode_waiting and fake_output, and
-    # returns roughly five times the transfers — a numerator that yields an
-    # "effectiveness" well above 1.
-    read_from_role: decode
-    xfer_count: "sglang:per_stage_req_latency_seconds_count"
-    xfer_seconds: "sglang:per_stage_req_latency_seconds_sum"
-    sample_labels:
-      stage: decode_transferred
+    # ⚠️ Inferred, not measured. The idle-drift measurement was taken on the
+    # mooncake backend; this path had no live group to check. Changed anyway,
+    # because the two possible outcomes are not symmetric: if
+    # `kv_transfer_total_mb_count` turns out not to exist on this backend the
+    # verdict degrades to UNMEASURABLE — "we cannot tell", which is true —
+    # whereas keeping the stage counter degrades to EFFECTIVE, which is a
+    # lie that hides the exact failure the check exists for. Verifying this
+    # on a live sglang-nixl group is on the list.
+    read_from_role: prefill
+    xfer_count: "sglang:kv_transfer_total_mb_count"
+    xfer_seconds: null
     xfer_bytes: null
     failed_transfers: null
 
@@ -281,11 +307,31 @@ modes:
         - "{{worker_ip}}"
         - --prometheus-port
         - "{{ports.prometheus}}"
+        # Asymmetric on purpose, and each side for its own reason.
+        #
+        # Prefill gets cache_aware because prefix reuse is the only thing a
+        # prefill role can win: two requests sharing a prompt prefix want the
+        # same worker, and routing them apart recomputes the shared part.
+        # It is also this router's own default — the earlier round_robin here
+        # was chosen on the belief that prefix-aware routing needs a tokenizer
+        # in the router, and it does not. The policy's whole configuration
+        # surface is router-side (cache_threshold, balance_abs_threshold,
+        # balance_rel_threshold, max_tree_size, eviction_interval_secs): an
+        # approximate radix tree over request text, with a load-imbalance
+        # escape hatch. There is no --model-path and no tokenizer to feed.
+        #
+        # Decode keeps round_robin because prefix affinity buys a decode role
+        # nothing — its prompt KV arrives over the connector from prefill, not
+        # out of its own cache, so what matters is decode-slot load. The
+        # load-aware policy for that is power_of_two, deliberately NOT used
+        # yet: it reads worker load through the router's load monitor, and
+        # whether a vLLM worker answers what that monitor asks for is
+        # unverified. round_robin is the honest placeholder until it is.
         - --prefill-policy
-        - round_robin
+        - cache_aware
         - --decode-policy
         - round_robin
-        # Two values, and only two. Everything the router's own defaults
+        # The values below, and only those. Everything the router's own defaults
         # cover is left to them — the health check above all.
         #
         # The division of labour is the whole argument. The circuit breaker
@@ -385,6 +431,39 @@ modes:
         # "did the router route anything at all", which is the question a
         # ratio of zero has to be read against.
         total_requests: vllm_router_pd_requests_total
+      # 🆕 Capability 7. Scale-out without restarting the router — and the
+      # reason it is worth a schema at all is that this router is a single
+      # replica and the gateway's only upstream, so re-rendering peers and
+      # restarting it takes the whole group offline for the restart. Every
+      # ratio change would cost one outage.
+      #
+      # ⚠️ Read from upstream source, NOT measured (open-questions F12). The
+      # single-router path drops `worker_type` before the PD router sees it and
+      # then returns a hardcoded "requires specific add_prefill_server or
+      # add_decode_server methods"; `--enable-igw` routes the call through the
+      # manager that dispatches on that field. That flag is what `requires_args`
+      # names, and the recipe's `command` above does NOT carry it yet — so a
+      # consumer must read a failed call as "fall back to restart", never as
+      # "the group is broken".
+      membership_api:
+        add: POST /workers
+        remove: DELETE /workers/{url}
+        # The field that makes the difference between "the request was
+        # accepted" and "the member is in the registry": upstream polls the
+        # peer before admitting it and drops it silently on timeout, with a
+        # default window tuned for small models. Without a read-back a
+        # scale-out that quietly failed is indistinguishable from one that
+        # worked.
+        probe: GET /workers
+        body:
+          url: "http://{{peer.ip}}:{{peer.port}}"
+          model_id: "{{model_name}}"
+        role_field: worker_type
+        role_values:
+          prefill: prefill
+          decode: decode
+        requires_args:
+          - --enable-igw
       health_path: /health
 
   - name: sglang-mooncake
@@ -447,6 +526,21 @@ modes:
         - "{{worker_ip}}"
         - --prometheus-port
         - "{{ports.prometheus}}"
+        # Stated rather than changed, on the prefill side. This gateway also
+        # defaults to cache_aware, so writing it here alters nothing and
+        # removes a silent divergence: the vLLM recipe used to override the
+        # default and this one did not, so the two engines routed differently
+        # for no recorded reason. Decode moves off the default for the reason
+        # given there — prompt KV reaches a decode role over the connector,
+        # not out of its own prefix cache.
+        #
+        # This gateway's policy set is the vLLM fork's minus consistent_hash
+        # and rendezvous_hash, plus `manual` (explicit routing keys). Both
+        # policies named here exist on both.
+        - --prefill-policy
+        - cache_aware
+        - --decode-policy
+        - round_robin
         # The same two values as the vLLM recipe, and for the same reason.
         # `vllm-project/router` is a fork of this gateway, so its defaults
         # are this one's verbatim — `cb_failure_threshold = 10`,
@@ -488,6 +582,16 @@ modes:
         total_requests: "smg_router_requests_total"
         worker_label: worker
         port_band: prometheus
+      # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
+      # fork this catalog's vLLM router descends from and it does serve
+      # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
+      # routes work under `--pd-disaggregation`, and which of the two shapes
+      # the body takes, was never read on this side. Declaring the vLLM shape
+      # here on the strength of the shared ancestry is the same mistake the
+      # metric names above avoided: it would look supported and fail at the
+      # first scale-out. Absent means "re-render and restart", which is
+      # correct and merely costs an outage.
+      # membership_api: {}
       health_path: /health
 
   - name: sglang-nixl
@@ -555,6 +659,21 @@ modes:
         - "{{worker_ip}}"
         - --prometheus-port
         - "{{ports.prometheus}}"
+        # Stated rather than changed, on the prefill side. This gateway also
+        # defaults to cache_aware, so writing it here alters nothing and
+        # removes a silent divergence: the vLLM recipe used to override the
+        # default and this one did not, so the two engines routed differently
+        # for no recorded reason. Decode moves off the default for the reason
+        # given there — prompt KV reaches a decode role over the connector,
+        # not out of its own prefix cache.
+        #
+        # This gateway's policy set is the vLLM fork's minus consistent_hash
+        # and rendezvous_hash, plus `manual` (explicit routing keys). Both
+        # policies named here exist on both.
+        - --prefill-policy
+        - cache_aware
+        - --decode-policy
+        - round_robin
         # The same two values as the vLLM recipe, and for the same reason.
         # `vllm-project/router` is a fork of this gateway, so its defaults
         # are this one's verbatim — `cb_failure_threshold = 10`,
@@ -593,6 +712,16 @@ modes:
         total_requests: "smg_router_requests_total"
         worker_label: worker
         port_band: prometheus
+      # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
+      # fork this catalog's vLLM router descends from and it does serve
+      # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
+      # routes work under `--pd-disaggregation`, and which of the two shapes
+      # the body takes, was never read on this side. Declaring the vLLM shape
+      # here on the strength of the shared ancestry is the same mistake the
+      # metric names above avoided: it would look supported and fail at the
+      # first scale-out. Absent means "re-render and restart", which is
+      # correct and merely costs an outage.
+      # membership_api: {}
       health_path: /health
 
   - name: vllm-ascend-mooncake
@@ -755,6 +884,39 @@ modes:
         worker_label: worker
         port_band: prometheus
         total_requests: vllm_router_pd_requests_total
+      # 🆕 Capability 7. Scale-out without restarting the router — and the
+      # reason it is worth a schema at all is that this router is a single
+      # replica and the gateway's only upstream, so re-rendering peers and
+      # restarting it takes the whole group offline for the restart. Every
+      # ratio change would cost one outage.
+      #
+      # ⚠️ Read from upstream source, NOT measured (open-questions F12). The
+      # single-router path drops `worker_type` before the PD router sees it and
+      # then returns a hardcoded "requires specific add_prefill_server or
+      # add_decode_server methods"; `--enable-igw` routes the call through the
+      # manager that dispatches on that field. That flag is what `requires_args`
+      # names, and the recipe's `command` above does NOT carry it yet — so a
+      # consumer must read a failed call as "fall back to restart", never as
+      # "the group is broken".
+      membership_api:
+        add: POST /workers
+        remove: DELETE /workers/{url}
+        # The field that makes the difference between "the request was
+        # accepted" and "the member is in the registry": upstream polls the
+        # peer before admitting it and drops it silently on timeout, with a
+        # default window tuned for small models. Without a read-back a
+        # scale-out that quietly failed is indistinguishable from one that
+        # worked.
+        probe: GET /workers
+        body:
+          url: "http://{{peer.ip}}:{{peer.port}}"
+          model_id: "{{model_name}}"
+        role_field: worker_type
+        role_values:
+          prefill: prefill
+          decode: decode
+        requires_args:
+          - --enable-igw
       health_path: /health
 
   - name: custom

@@ -4,6 +4,7 @@ from gpustack.schemas.models import PD_MODE_BACKENDS, BackendEnum, PDModeEnum
 from gpustack.schemas.pd_modes import (
     PDInjectTargetEnum,
     PDKVLeaseTargetEnum,
+    PDMembershipAPI,
     PDMode,
     PDPeerStyleEnum,
     PDPortScopeEnum,
@@ -566,6 +567,54 @@ def test_the_read_side_is_declared_because_reading_the_wrong_one_inverts_it():
     assert nixl.min_expected_rate is None
 
 
+def test_sglang_counts_on_prefill_because_it_pushes():
+    """SGLang is the direction NIXL is not, so `read_from_role` has to carry
+    both values for the field to be worth having.
+
+    The router same-dispatches to both roles; decode allocates receive slots
+    and registers them through prefill's bootstrap service; prefill writes
+    into them. The stage names are active on prefill
+    (`prefill_transfer_kv_cache`) and passive on decode
+    (`decode_transferred`), and the byte/speed/latency families exist only
+    on prefill, because the sender is the side that knows how much went and
+    how fast.
+    """
+    for connector in ("sglang-mooncake", "sglang-nixl"):
+        metrics = get_transfer_metrics(connector)
+        assert metrics.read_from_role == "prefill", connector
+
+
+def test_the_sglang_numerator_is_not_the_per_stage_histogram():
+    """Regression: that counter advances on an idle group.
+
+    Measured 2026-08-26 on a live 1P1D — over 90 seconds with zero business
+    requests, `per_stage_req_latency_seconds_count{stage="decode_transferred"}`
+    went 24 -> 25 -> 26 while `num_requests_total` held at 4, because health
+    probes and the engine's own synthetic requests traverse the
+    disaggregation path. `kv_transfer_total_mb_count` did not move in the
+    same window.
+
+    It matters because `_judge_effectiveness` only reaches AGGREGATED when
+    the ratio stops being positive. A numerator that ticks on its own can
+    never stop being positive, so a deployment that had silently degraded to
+    aggregated serving would keep reporting `effective` indefinitely — the
+    single failure the whole check exists to catch.
+    """
+    for connector in ("sglang-mooncake", "sglang-nixl"):
+        metrics = get_transfer_metrics(connector)
+        assert metrics.xfer_count == "sglang:kv_transfer_total_mb_count", connector
+        assert "per_stage_req_latency" not in (metrics.xfer_count or ""), connector
+        assert "per_stage_req_latency" not in (metrics.xfer_seconds or ""), connector
+        # The label selector went with it: selecting a phase answers "which
+        # phase", not "was there a request", so it never addressed this.
+        assert metrics.sample_labels is None, connector
+        # Units, not oversight: the engine's seconds are milliseconds and its
+        # bytes are megabytes, and these two fields are consumed as seconds
+        # and bytes. Declaring a unit is a schema change, not a bugfix.
+        assert metrics.xfer_seconds is None, connector
+        assert metrics.xfer_bytes is None, connector
+
+
 def test_a_connector_that_exports_nothing_says_so():
     """mooncake/stats.py exports zero Prometheus counters where NIXL exports
     fifteen. That is a measured fact, not an omission."""
@@ -753,3 +802,93 @@ def test_all_five_capabilities_round_trip_through_serialization():
     assert nixl["kv_lease"]["engine_default"] == 30
     assert ascend["kv_lease"]["param"] == "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT"
     assert ascend["kv_lease"]["engine_default"] == 480
+
+
+# ---------------------------------------------------------------------------
+# Capability 7 — the router's membership API.
+# ---------------------------------------------------------------------------
+
+
+def test_a_router_with_no_membership_api_is_a_valid_declaration():
+    """🔴 The regression this exists for.
+
+    Empty must mean "re-render and restart", not "the catalog is incomplete".
+    Two of the five modes have no readable PD-mode membership shape, and a
+    consumer that treated absence as an error would refuse to deploy them —
+    for a capability whose whole purpose is to make one operation cheaper.
+    """
+    api = PDMembershipAPI()
+    assert api.available is False
+    assert api.add is None and api.probe is None
+    assert api.requires_args == []
+
+
+def test_add_without_a_read_back_is_not_available():
+    """An accepted `add` is not a joined member: upstream polls the peer and
+    drops it silently on timeout, with a default window tuned for small
+    models. Without `probe`, a scale-out that quietly failed looks exactly
+    like one that worked — so the pair, not `add` alone, is what gates."""
+    assert PDMembershipAPI(add="POST /workers").available is False
+    assert PDMembershipAPI(probe="GET /workers").available is False
+    assert PDMembershipAPI(add="POST /workers", probe="GET /workers").available
+
+
+def test_the_two_vllm_router_recipes_declare_the_same_membership_shape():
+    """Same binary, so the same API. Both Ascend and CUDA now launch
+    `vllm-router` — Ascend's own proxy example is gone from the catalog — and a
+    divergence here would mean one of the two was updated and the other
+    forgotten."""
+    dumped = {mode.name: mode.router for mode in load_pd_modes()}
+    nixl = dumped[PDModeEnum.VLLM_NIXL.value].membership_api
+    ascend = dumped[PDModeEnum.VLLM_ASCEND_MOONCAKE.value].membership_api
+
+    assert nixl == ascend
+    assert nixl.add == "POST /workers"
+    assert nixl.remove == "DELETE /workers/{url}"
+    assert nixl.probe == "GET /workers"
+    # The field the single-router path drops, which is why it is named rather
+    # than assumed: the read-back has to be checked for it.
+    assert nixl.role_field == "worker_type"
+    assert nixl.role_values == {"prefill": "prefill", "decode": "decode"}
+
+
+def test_declared_is_not_the_same_as_usable_today():
+    """🔴 The distinction the whole capability turns on.
+
+    `--enable-igw` is read from upstream source, not measured on hardware
+    (open-questions F12), so the recipes deliberately do not launch with it.
+    That makes the API declared-but-not-reachable, and a consumer must get
+    False rather than try the call and read the failure as a broken group.
+
+    This assertion is expected to flip to True once the flag is verified and
+    added to the recipe's `command` — that is the only change it should need.
+    """
+    for mode in load_pd_modes():
+        router = mode.router
+        if router.membership_api.available:
+            assert router.membership_api.requires_args == ["--enable-igw"]
+            assert not router.membership_api_usable, mode.name
+        else:
+            assert not router.membership_api_usable, mode.name
+
+
+def test_the_sglang_recipes_leave_membership_undeclared_rather_than_guessed():
+    """`sglang_router` is the fork vllm-router descends from and serves
+    `/add_worker`, but whether that route works under `--pd-disaggregation`
+    was never read here. Copying the vLLM shape on the strength of shared
+    ancestry is the mistake the metric names in this file already avoided:
+    `smg_` versus `vllm_router_` proved the two diverge where it matters."""
+    for name in (PDModeEnum.SGLANG_MOONCAKE.value, PDModeEnum.SGLANG_NIXL.value):
+        mode = next(m for m in load_pd_modes() if m.name == name)
+        assert mode.router.membership_api.available is False, name
+
+
+def test_membership_api_round_trips_through_serialization():
+    """The endpoint serves the re-serialized catalog, so a field that does not
+    survive the dump is a field the UI never sees."""
+    for mode in load_pd_modes():
+        dumped = mode.model_dump(mode="json")
+        assert "membership_api" in dumped["router"]
+        assert PDMode.model_validate(dumped).router.membership_api == (
+            mode.router.membership_api
+        )

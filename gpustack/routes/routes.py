@@ -41,6 +41,7 @@ from gpustack.routes import (
     cloud_credentials,
     worker_pools,
     clusters,
+    kv_transfer_budget,
     token,
     benchmarks,
     benchmark_profiles,
@@ -171,6 +172,15 @@ cluster_client_router.add_api_route(
 model_routers = [
     {
         "router": models.router,
+        "prefix": "/models",
+        "tags": ["Models"],
+        "dependencies": _org_owner_only,
+    },
+    # Same prefix, separate module: this answers a question about a model that
+    # usually does not exist yet, so it shares no resource lifecycle with model
+    # CRUD -- only the noun in the path.
+    {
+        "router": kv_transfer_budget.router,
         "prefix": "/models",
         "tags": ["Models"],
         "dependencies": _org_owner_only,

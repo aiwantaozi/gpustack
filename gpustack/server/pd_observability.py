@@ -9,18 +9,28 @@ tells you the rest of it works.
 **Two facts decide every number here, and both have already been got wrong
 once.**
 
-🔴 *The numerator is on the decode side.* NIXL is pull-based: decode reads
-from prefill, so a completed transfer is counted where the read happened.
-Measured on a working cross-host 1P1D, prefill's
-``nixl_xfer_time_seconds_count`` sat at 0.0 for the entire run while
-decode's went to 1.0. Read prefill and a healthy pair reports "no KV ever
-moved" — the exact alarm this module exists to raise, fired at a deployment
-that is fine. The same run gives the two readings of one `/v1/completions`:
-decode 1 transfer over 1 routed request, a ratio of 1.0, against 0/1 = 0.0
-from the other side. Which side owns the counter is a *declaration*
-(``PDTransferMetrics.read_from_role``) rather than a constant here, so a
-push-based connector stays a YAML change and the reason stays written down
-next to the value.
+🔴 *The numerator sits on whichever side moves the bytes, and the two engines
+disagree.* vLLM's NIXL pulls — decode reads from prefill — so a completed
+transfer is counted where the read happened: measured on a working
+cross-host 1P1D, prefill's ``nixl_xfer_time_seconds_count`` sat at 0.0 for
+the entire run while decode's went to 1.0, so reading prefill would report
+"no KV ever moved" at a deployment that is fine. SGLang pushes — prefill
+writes into slots decode registered through the bootstrap service — and
+there the same mistake runs the other way. Which side owns the counter is a
+*declaration* (``PDTransferMetrics.read_from_role``) rather than a constant
+here, precisely because it is not a property of PD but of the connector.
+
+🔴 *A counter that advances on an idle group is worse than no counter.* The
+verdict below turns AGGREGATED only when the ratio stops being positive, so
+a numerator with any traffic-independent component can never fire it: the
+single failure this module exists to catch becomes undetectable, silently.
+Measured 2026-08-26, this was real — SGLang's
+``per_stage_req_latency_seconds_count{stage="decode_transferred"}`` climbed
++1 per ~45s on a group serving nothing, because health probes and the
+engine's own synthetic requests traverse the disaggregation path. A
+candidate numerator therefore has to be checked **on an idle group**, not
+under a burst; a burst cannot see this class of fault at all. Prefer a
+counter that only advances when bytes cross.
 
 🔴 *The denominator of the degradation check is the group's own past, not
 the link's nameplate speed.* "Effective bandwidth versus line rate" looks
@@ -237,10 +247,15 @@ class PDGroupObservation(BaseModel):
     denominator: DenominatorSourceEnum = DenominatorSourceEnum.NONE
     per_member: List[MemberRatio] = []
 
-    prefill_transfers: Optional[float] = None
-    """Recorded, never used as the numerator. It exists so that a reader who
-    wonders why the healthy-looking group reports 0.0 on prefill can see
-    that 0.0 is the expected value for a pull-based connector."""
+    other_transfers: Optional[float] = None
+    """Transfers counted on the role `read_from_role` does NOT name.
+
+    Recorded, never used as the numerator. It exists so that a reader who
+    wonders why a healthy-looking group reports 0.0 on one side can see that
+    0.0 is the expected value there — for NIXL the quiet side is prefill
+    (decode pulls), for SGLang it is decode (prefill pushes). Nonzero here
+    while the counted side is zero is the one signal that the declaration
+    has the direction backwards."""
 
     transfer_health: TransferHealthEnum = TransferHealthEnum.UNMEASURABLE
     rate: Optional[float] = None
@@ -441,7 +456,7 @@ def _judge_effectiveness(
     *,
     transfers: Optional[float],
     requests: Optional[float],
-    prefill_transfers: Optional[float],
+    other_transfers: Optional[float],
     counters_present: bool,
 ) -> None:
     """Fold the window's deltas into an effectiveness verdict."""
@@ -453,22 +468,25 @@ def _judge_effectiveness(
             "the first observation of a group has nothing to subtract from; "
             "a verdict needs two"
             if counters_present
-            else "the decode side exports no KV transfer counter, so "
+            else "the counted side exports no KV transfer counter, so "
             "disaggregation cannot be confirmed from metrics for this mode"
         )
         return
 
     observation.transfers = transfers
-    if prefill_transfers and not transfers:
-        # Guard, not a measured case: every connector shipped today is
-        # pull-based, so this can only mean the declared read side is wrong
-        # for a connector that pushes. KV is demonstrably moving either way,
-        # which is the one thing the verdict is about.
+    if other_transfers and not transfers:
+        # The declared side counts nothing while the other side counts
+        # something, which can only mean `read_from_role` names the wrong
+        # side. Direction is per connector, not per feature: vLLM's NIXL
+        # pulls (count on decode), SGLang pushes (count on prefill), so this
+        # is reachable from either declaration and the message must not
+        # assume which. KV is demonstrably moving either way, and that is the
+        # one thing the verdict is about.
         observation.effectiveness = PDEffectivenessEnum.EFFECTIVE
         observation.detail = (
-            "KV transfers are counted on prefill, not decode: this connector "
-            "pushes rather than pulls and its read_from_role declaration "
-            "should say so"
+            "KV transfers are counted on the role this connector's "
+            "read_from_role does not name, so the declaration has the "
+            "transfer direction backwards; transfers are happening"
         )
         state.silent_windows = 0
         return
@@ -480,7 +498,7 @@ def _judge_effectiveness(
         if transfers > 0:
             observation.effectiveness = PDEffectivenessEnum.EFFECTIVE
             observation.detail = (
-                f"{transfers:.0f} KV transfers on the decode side; no router "
+                f"{transfers:.0f} KV transfers on the counted side; no router "
                 "request metrics for this mode, so this is an absolute count "
                 "and not a ratio"
             )
@@ -592,8 +610,8 @@ def observe_group(
     *,
     model_id: int,
     group_id: Optional[str],
-    decode_readings: Sequence[EngineReading],
-    prefill_readings: Sequence[EngineReading] = (),
+    counted_readings: Sequence[EngineReading],
+    other_readings: Sequence[EngineReading] = (),
     router_requests=None,
     transfer_metrics: Optional[PDTransferMetrics] = None,
     state: Optional[PDWindowState] = None,
@@ -605,7 +623,7 @@ def observe_group(
     a verdict that depends on three consecutive windows is three calls in a
     test rather than three minutes of waiting.
 
-    `decode_readings` is the numerator's only source — see this module's
+    `counted_readings` is the numerator's only source — see this module's
     docstring for why reading the other side inverts the answer.
     """
     state = state.model_copy(deep=True) if state else PDWindowState()
@@ -621,7 +639,7 @@ def observe_group(
     seconds_deltas: List[Optional[float]] = []
     bytes_deltas: List[Optional[float]] = []
     matched_per_worker = False
-    for reading in decode_readings:
+    for reading in counted_readings:
         prefix = f"{reading.instance_id}"
         transfer_delta = _delta(state, f"{prefix}:transfers", reading.transfers)
         transfer_deltas.append(transfer_delta)
@@ -646,19 +664,19 @@ def observe_group(
             )
         )
 
-    prefill_deltas = [
+    other_deltas = [
         _delta(state, f"{reading.instance_id}:transfers", reading.transfers)
-        for reading in prefill_readings
+        for reading in other_readings
     ]
 
-    all_readings = list(decode_readings) + list(prefill_readings)
+    all_readings = list(counted_readings) + list(other_readings)
     observation.failed_transfers = _sum_optional(
         [reading.failed_transfers for reading in all_readings]
     )
     observation.kv_expired = _sum_optional(
         [reading.kv_expired for reading in all_readings]
     )
-    observation.prefill_transfers = _sum_optional(prefill_deltas)
+    observation.other_transfers = _sum_optional(other_deltas)
 
     requests = _sum_optional([member.requests for member in observation.per_member])
     if matched_per_worker:
@@ -679,9 +697,9 @@ def observe_group(
         state,
         transfers=_sum_optional(transfer_deltas),
         requests=requests,
-        prefill_transfers=observation.prefill_transfers,
+        other_transfers=observation.other_transfers,
         counters_present=any(
-            reading.transfers is not None for reading in decode_readings
+            reading.transfers is not None for reading in counted_readings
         ),
     )
 
@@ -871,8 +889,8 @@ class PDObserver:
             mode.kv_lease.expired_metric if mode and mode.kv_lease else None
         )
         transfer_metrics = mode.transfer_metrics if mode else None
-        decode_readings: List[EngineReading] = []
-        prefill_readings: List[EngineReading] = []
+        counted_readings: List[EngineReading] = []
+        other_readings: List[EngineReading] = []
         for address, instance in endpoints.items():
             reading = read_engine(
                 scraped.get(address),
@@ -889,9 +907,9 @@ class PDObserver:
                 else RoleNameEnum.DECODE.value
             )
             if instance.role == side:
-                decode_readings.append(reading)
+                counted_readings.append(reading)
             else:
-                prefill_readings.append(reading)
+                other_readings.append(reading)
 
         router_requests = (
             read_router_requests(scraped.get(router_address), mode)
@@ -903,8 +921,8 @@ class PDObserver:
         observation, state = observe_group(
             model_id=model.id,
             group_id=group_id,
-            decode_readings=decode_readings,
-            prefill_readings=prefill_readings,
+            counted_readings=counted_readings,
+            other_readings=other_readings,
             router_requests=router_requests,
             transfer_metrics=transfer_metrics,
             state=self._state.get(key),

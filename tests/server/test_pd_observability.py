@@ -130,8 +130,8 @@ def run(windows, *, prefills=None, state=None, requests=None, metrics=NIXL_METRI
         observation, state = observe_group(
             model_id=1,
             group_id="g1",
-            decode_readings=readings,
-            prefill_readings=(prefills[index] if prefills else ()),
+            counted_readings=readings,
+            other_readings=(prefills[index] if prefills else ()),
             router_requests=(requests[index] if requests else None),
             transfer_metrics=metrics,
             state=state,
@@ -188,17 +188,22 @@ def test_the_catalog_declares_decode_as_the_read_side():
     assert NIXL_METRICS.read_from_role == "decode"
 
 
-def test_transfers_counted_on_prefill_are_still_transfers():
-    """Guard for a push-based connector: KV is demonstrably moving, so the
-    verdict must not be 'aggregated' just because the declared side is
-    wrong."""
+def test_transfers_counted_on_the_undeclared_side_are_still_transfers():
+    """Guard for a `read_from_role` pointed at the wrong side: KV is
+    demonstrably moving, so the verdict must not be 'aggregated'.
+
+    Reachable from either declaration, which is why the message names
+    neither role: vLLM's NIXL pulls (declared `decode`, so a mistake shows up
+    on prefill) and SGLang pushes (declared `prefill`, so a mistake shows up
+    on decode)."""
     observation, _ = run(
         [[decode(transfers=0.0)], [decode(transfers=0.0)]],
         prefills=[[prefill(transfers=0.0)], [prefill(transfers=7.0)]],
         requests=[{"10.0.0.2:8000": 1.0}, {"10.0.0.2:8000": 5.0}],
     )
     assert observation.effectiveness == PDEffectivenessEnum.EFFECTIVE
-    assert "pushes rather than pulls" in observation.detail
+    assert "read_from_role does not name" in observation.detail
+    assert "direction backwards" in observation.detail
 
 
 # --- the ratio ------------------------------------------------------------- #

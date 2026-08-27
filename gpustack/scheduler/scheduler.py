@@ -27,6 +27,10 @@ from gpustack.policies.candidate_selectors import (
     VGPUResourceFitSelector,
     VLLMResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.instance_type_whole_card_selector import (
+    InstanceTypeWholeCardSelector,
+    is_whole_card_claim,
+)
 from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
     CustomBackendResourceFitSelector,
 )
@@ -63,6 +67,10 @@ from gpustack.schemas.models import (
 from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.server.bus import EventType
 from gpustack.server.db import async_session
+from gpustack.scheduler.group_schedule import (
+    is_group_forming,
+    schedule_group,
+)
 from gpustack.scheduler.calculator import (
     GPUOffloadEnum,
     calculate_gguf_model_resource_claim,
@@ -315,6 +323,75 @@ class Scheduler:
             except Exception as e:
                 logger.error(f"Failed to get item from schedule queue: {e}")
 
+    async def _try_schedule_group(
+        self,
+        session: AsyncSession,
+        model: Model,
+        model_instance: ModelInstance,
+        workers: List[Worker],
+        model_instances: List[ModelInstance],
+    ) -> bool:
+        """Place the whole group if this instance is the one that forms it.
+
+        Returns True when the group path owned this item — either it placed
+        every member, or it refused the group as a whole. False means "not a
+        forming group", and the caller continues down the per-instance path
+        unchanged.
+
+        The queue hands over one instance at a time, so the first member of an
+        unplaced group solves for all of them and writes every row. The
+        siblings arrive later, find themselves already scheduled, and take the
+        `False` branch — where `find_candidate` sees a placed instance and the
+        existing logic leaves it alone.
+        """
+        group_instances = [
+            i
+            for i in model_instances
+            if i.model_id == model.id
+            and i.group_id == model_instance.group_id
+            and i.group_id is not None
+        ]
+        if not is_group_forming(model, group_instances):
+            return False
+
+        by_instance, messages = await schedule_group(
+            session,
+            self._config,
+            model,
+            workers,
+            model_instances,
+            group_instances,
+        )
+        if by_instance is None:
+            # All-or-nothing (D14): not one member is placed, and the reason
+            # is put on the instance that triggered the solve so it surfaces
+            # somewhere rather than only in the log.
+            model_instance.state = ModelInstanceStateEnum.PENDING
+            model_instance.state_message = (
+                "The group could not be placed.\nDetails:\n" + "".join(messages)
+            )
+            await ModelInstanceService(session).update(model_instance)
+            logger.debug("Group %s not placeable: %s", model.name, "".join(messages))
+            return True
+
+        for instance_id, candidate in by_instance.items():
+            row = next((i for i in group_instances if i.id == instance_id), None)
+            if row is None:
+                continue
+            await apply_candidate_to_instance(session, model, row, candidate)
+            # INFO, unlike the single-instance path's debug: a group forms
+            # once per generation and its member-to-card mapping is the thing
+            # anyone diagnosing a disaggregated deployment asks for first.
+            # The per-instance path logs at debug because it runs constantly.
+            logger.info(
+                "Scheduled group member %s (role %s) to worker %s gpu %s",
+                row.name,
+                row.role,
+                row.worker_name,
+                candidate.gpu_indexes,
+            )
+        return True
+
     async def _schedule_one(self, instance: ModelInstance):  # noqa: C901
         """
         Schedule a model instance by picking one candidate.
@@ -344,6 +421,18 @@ class Scheduler:
             model_instances = await ModelInstance.all(
                 session, options=[selectinload(ModelInstance.model)]
             )
+
+            # 🔴 The group gate, and it is the whole safety argument. Only a
+            # model with `roles` whose generation has no placed GPU member
+            # gets here; a role-less deployment can never satisfy
+            # `is_group_forming`, so the path below is byte-for-byte the one it
+            # always took. See scheduler/group_schedule.py.
+            if workers and model and model.roles:
+                handled = await self._try_schedule_group(
+                    session, model, model_instance, workers, model_instances
+                )
+                if handled:
+                    return
 
             candidate = None
             messages = []
@@ -378,62 +467,159 @@ class Scheduler:
                     f"No suitable workers for model instance {model_instance.name}, state: {model_instance.state}"
                 )
             else:
-                # update model instance.
-                model_instance.state = ModelInstanceStateEnum.SCHEDULED
-                model_instance.state_message = ""
-                model_instance.worker_id = candidate.worker.id
-                model_instance.worker_name = candidate.worker.name
-                model_instance.worker_ip = candidate.worker.ip
-                model_instance.worker_advertise_address = (
-                    candidate.worker.advertise_address
+                await apply_candidate_to_instance(
+                    session, model, model_instance, candidate
                 )
-                model_instance.worker_ifname = candidate.worker.ifname
-                model_instance.computed_resource_claim = (
-                    candidate.computed_resource_claim
-                )
-                model_instance.gpu_type = candidate.gpu_type
-                model_instance.gpu_indexes = candidate.gpu_indexes
-                model_instance.gpu_addresses = candidate.gpu_addresses
-                model_instance.distributed_servers = DistributedServers(
-                    subordinate_workers=candidate.subordinate_workers,
-                )
-                if get_backend(model) in (
-                    BackendEnum.VLLM,
-                    BackendEnum.ASCEND_MINDIE,
-                    BackendEnum.SGLANG,
-                ):
-                    model_instance.distributed_servers.mode = (
-                        DistributedServerCoordinateModeEnum.INITIALIZE_LATER
-                    )
-
-                # Role-effective, not the Model's: attaching a cache to
-                # prefill alone is a normal disaggregated configuration, and
-                # reading the deployment's value would skip the re-resolve for
-                # exactly the member that asked for one.
-                scheduled_cache = role_effective_model(
-                    model, model_instance.role
-                ).extended_kv_cache
-                if scheduled_cache and scheduled_cache.is_shared():
-                    # The assigned worker is known now; re-resolve the
-                    # shared-cache snapshot so worker-dependent injection
-                    # (e.g. the client's own local_hostname) binds to this
-                    # instance's node.
-                    model_instance.cache_config = (
-                        await resolve_instance_cache_config_safe(
-                            session,
-                            model,
-                            worker=candidate.worker,
-                            spans_workers=model_instance.spans_workers,
-                            role=model_instance.role,
-                        )
-                    )
-
-                await ModelInstanceService(session).update(model_instance)
 
                 logger.debug(
                     f"Scheduled model instance {model_instance.name} to worker "
                     f"{model_instance.worker_name} gpu {candidate.gpu_indexes}"
                 )
+
+
+async def apply_candidate_to_instance(
+    session: AsyncSession,
+    model: Model,
+    model_instance: ModelInstance,
+    candidate: ModelInstanceScheduleCandidate,
+) -> None:
+    """Write a chosen candidate onto its instance row.
+
+    Extracted verbatim from `_schedule_one` so the group path writes members
+    the same way the single path writes one. The alternative was a second
+    write-back that starts identical and drifts: this block sets ten fields,
+    two of which (`distributed_servers.mode`, the shared-cache re-resolve)
+    are conditional on things a reader of the group path would not think to
+    check.
+    """
+    model_instance.state = ModelInstanceStateEnum.SCHEDULED
+    model_instance.state_message = ""
+    model_instance.worker_id = candidate.worker.id
+    model_instance.worker_name = candidate.worker.name
+    model_instance.worker_ip = candidate.worker.ip
+    model_instance.worker_advertise_address = candidate.worker.advertise_address
+    model_instance.worker_ifname = candidate.worker.ifname
+    model_instance.computed_resource_claim = candidate.computed_resource_claim
+    model_instance.gpu_type = candidate.gpu_type
+    model_instance.gpu_indexes = candidate.gpu_indexes
+    model_instance.gpu_addresses = candidate.gpu_addresses
+    model_instance.distributed_servers = DistributedServers(
+        subordinate_workers=candidate.subordinate_workers,
+    )
+    if get_backend(model) in (
+        BackendEnum.VLLM,
+        BackendEnum.ASCEND_MINDIE,
+        BackendEnum.SGLANG,
+    ):
+        model_instance.distributed_servers.mode = (
+            DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+        )
+
+    # Role-effective, not the Model's: attaching a cache to prefill alone is a
+    # normal disaggregated configuration, and reading the deployment's value
+    # would skip the re-resolve for exactly the member that asked for one.
+    scheduled_cache = role_effective_model(model, model_instance.role).extended_kv_cache
+    if scheduled_cache and scheduled_cache.is_shared():
+        # The assigned worker is known now; re-resolve the shared-cache
+        # snapshot so worker-dependent injection (e.g. the client's own
+        # local_hostname) binds to this instance's node.
+        model_instance.cache_config = await resolve_instance_cache_config_safe(
+            session,
+            model,
+            worker=candidate.worker,
+            spans_workers=model_instance.spans_workers,
+            role=model_instance.role,
+        )
+
+    await ModelInstanceService(session).update(model_instance)
+
+
+def _cards_per_member(model: Model) -> int:
+    """How many whole cards one member of this deployment wants.
+
+    Read off the engine's world size rather than `gpu_selector.gpus_per_replica`
+    — on this path that field is `None`. `set_model_gpus_per_replica` returns
+    early unless `gpu_selector.gpu_ids` is set, and manual card ids are
+    mutually exclusive with `gpu_type_selector`, so it is never computed for an
+    InstanceType claim. That is also why the admission check keyed on it never
+    fires (see design §3.7.11).
+    """
+    selector_map = {
+        BackendEnum.VLLM.value: VLLMResourceFitSelector,
+        BackendEnum.ASCEND_MINDIE.value: AscendMindIEResourceFitSelector,
+        BackendEnum.SGLANG.value: SGLangResourceFitSelector,
+    }
+    selector = selector_map.get(model.backend)
+    if selector is None:
+        return 1
+    try:
+        result = selector.get_world_size_from_backend_parameters(model)
+    except Exception as e:
+        logger.warning(
+            "Could not read the world size of %s from its backend parameters; "
+            "assuming one card per member: %s",
+            model.name,
+            e,
+        )
+        return 1
+    world_size, _ = result if result is not None else (None, None)
+    return max(int(world_size or 1), 1)
+
+
+def build_candidate_selector(
+    config: Config,
+    model: Model,
+    model_instances: List[ModelInstance],
+    cpu_only: bool = False,
+):
+    """Which resource-fit selector answers "does one more member fit here".
+
+    Extracted from `find_candidate` so the group scheduler's capacity count can
+    ask the *same* question the placement path asks. `count_offer_slots` works
+    by running a selector repeatedly against a growing instance list, and a
+    second, separately-chosen selector would let the count and the placement
+    disagree about the same worker — which is the one defect a capacity number
+    must not have, because the disagreement surfaces as a group admitted into a
+    domain that then cannot take it.
+
+    `model` is expected to be role-projected already (`role_effective_model`):
+    every branch here reads Model-level fields and none of them knows about
+    roles.
+    """
+    if cpu_only:
+        # Ahead of every backend branch, because the backend a router inherits
+        # is the group's engine and every one of those selectors sizes the
+        # model's weights. The router never loads them; asking for their VRAM
+        # is what leaves it unschedulable on a host whose cards its own peers
+        # have just filled.
+        return CustomBackendResourceFitSelector(
+            config, model, model_instances, cpu_only=True
+        )
+    if model.gpu_type_selector:
+        # Whole cards and slices are two different questions on the same field.
+        # A slice is a fraction of a card the node's device plugin picks, so
+        # "one per worker" is a real limit there; whole cards have no such
+        # difficulty and the operator hands out several at once. Branching here
+        # rather than inside the selector keeps the slicing path byte-for-byte
+        # unchanged — see policies/.../instance_type_whole_card_selector.py.
+        if is_whole_card_claim(model.gpu_type_selector):
+            return InstanceTypeWholeCardSelector(
+                config,
+                model,
+                model_instances,
+                cards_per_member=_cards_per_member(model),
+            )
+        return VGPUResourceFitSelector(config, model, model_instances)
+    if is_gguf_model(model):
+        return GGUFResourceFitSelector(model, model_instances, config.cache_dir)
+    if model.backend == BackendEnum.ASCEND_MINDIE:
+        return AscendMindIEResourceFitSelector(config, model, model_instances)
+    if model.backend == BackendEnum.VLLM and not is_omni_model(model):
+        # Note: Route omni categories to CustomSelector for vLLM-Omni.
+        return VLLMResourceFitSelector(config, model, model_instances)
+    if model.backend == BackendEnum.SGLANG:
+        return SGLangResourceFitSelector(config, model, model_instances)
+    return CustomBackendResourceFitSelector(config, model, model_instances)
 
 
 async def find_candidate(
@@ -486,40 +672,9 @@ async def find_candidate(
 
     # Initialize candidate selector.
     try:
-        if cpu_only:
-            # Ahead of every backend branch, because the backend a router
-            # inherits is the group's engine and every one of those selectors
-            # sizes the model's weights. The router never loads them; asking
-            # for their VRAM is what leaves it unschedulable on a host whose
-            # cards its own peers have just filled.
-            candidates_selector = CustomBackendResourceFitSelector(
-                config, model, model_instances, cpu_only=True
-            )
-        elif model.gpu_type_selector:
-            candidates_selector = VGPUResourceFitSelector(
-                config, model, model_instances
-            )
-        elif is_gguf_model(model):
-            candidates_selector = GGUFResourceFitSelector(
-                model, model_instances, config.cache_dir
-            )
-        elif model.backend == BackendEnum.ASCEND_MINDIE:
-            candidates_selector = AscendMindIEResourceFitSelector(
-                config, model, model_instances
-            )
-        elif model.backend == BackendEnum.VLLM and not is_omni_model(model):
-            # Note: Route omni categories to CustomSelector for vLLM-Omni.
-            candidates_selector = VLLMResourceFitSelector(
-                config, model, model_instances
-            )
-        elif model.backend == BackendEnum.SGLANG:
-            candidates_selector = SGLangResourceFitSelector(
-                config, model, model_instances
-            )
-        else:
-            candidates_selector = CustomBackendResourceFitSelector(
-                config, model, model_instances
-            )
+        candidates_selector = build_candidate_selector(
+            config, model, model_instances, cpu_only=cpu_only
+        )
     except Exception as e:
         return None, [f"Failed to initialize {model.backend} candidates selector: {e}"]
 

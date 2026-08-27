@@ -45,6 +45,7 @@ from gpustack.schemas.models import (
     get_backend,
     role_takes_no_accelerator,
     BackendEnum,
+    Model,
     ModelInstance,
     ModelInstanceUpdate,
     ModelInstanceStateEnum,
@@ -67,6 +68,11 @@ from gpustack.utils.runtime import transform_workload_plan
 from gpustack.worker.pd_injection import PDInjection, render_pd_injection
 
 logger = logging.getLogger(__name__)
+
+# Distinguishes "the caller said nothing" from "the caller said None". A
+# managed router legitimately has no backend row of its own, and passing None
+# has to mean that rather than falling back to this server's.
+_INHERIT = object()
 lock = threading.Lock()
 
 
@@ -608,9 +614,11 @@ class InferenceServer(ABC):
         for name, band in (instance.named_ports or {}).items():
             variables[f"ports.{name}"] = band.base
             variables[f"ports.{name}.count"] = band.count
-        return apply_managed_router(
+        rendered = apply_managed_router(
             model, instance.role, peers=peers, variables=variables
         )
+        _refuse_unrendered_router(rendered, instance)
+        return rendered
 
     def _pd_template_variables(self) -> Dict[str, object]:
         """The two placeholders only this layer can resolve: the KV-plane NIC
@@ -647,15 +655,48 @@ class InferenceServer(ABC):
             #
             # The raw image: no registry override and no version write-back,
             # since this is a template value, not the image being deployed.
+            spec = self._model_spec or self._model
             runner_image, _ = self._resolve_image(
-                backend=get_backend(self._model_spec or self._model)
+                backend=get_backend(spec),
+                spec=spec,
+                inference_backend=self._engine_inference_backend(spec),
             )
             if runner_image:
                 variables["runner_image"] = runner_image
         except Exception as e:
-            logger.debug(f"Failed to resolve the runner image for templating: {e}")
+            # Warning, not debug. A router's image in the catalog is
+            # `{{runner_image}}` and nothing else can supply it, so losing this
+            # value does not degrade the launch — it sends the literal
+            # placeholder to the container runtime, which rejects it as an
+            # invalid reference several layers from anything that names the
+            # cause. Measured on 910B2 with a custom backend version.
+            logger.warning(f"Failed to resolve the runner image for templating: {e}")
 
         return variables
+
+    def _engine_inference_backend(self, spec) -> Optional[InferenceBackend]:
+        """The backend row of the group's engine, for a member that is not one.
+
+        This server was handed the row for its *own* backend, and a managed
+        router's own backend is `custom` — which has no row, so what it was
+        handed is None. That is correct for launching it and useless for
+        answering "which image do the engines run", which is the only thing
+        the router needs the row for: a custom backend version's image lives
+        nowhere else. The runner catalog cannot stand in, because a
+        user-defined version is by definition not in it.
+        """
+        name = get_backend(spec)
+        if self.inference_backend and self.inference_backend.backend_name == name:
+            return self.inference_backend
+
+        # Built here rather than passed down: the row is needed by one role of
+        # one deployment shape, and threading it through the fork boundary
+        # would put it in every backend's constructor.
+        from gpustack.worker.inference_backend_manager import InferenceBackendManager
+
+        return InferenceBackendManager(self._clientset).get_backend_by_name(
+            name, getattr(spec, "owner_principal_id", None)
+        )
 
     def _pd_arguments(self) -> List[str]:
         """The PD role's engine arguments, or an empty list."""
@@ -1435,6 +1476,8 @@ exec "$@"
     def _resolve_image(  # noqa: C901
         self,
         backend: Optional[str] = None,
+        spec: Optional[Model] = None,
+        inference_backend: Optional["InferenceBackend"] = _INHERIT,
     ) -> (Optional[str], Optional[str]):
         """
         Resolve the container image to use for the current backend.
@@ -1442,8 +1485,16 @@ exec "$@"
         This method returns the raw image name without applying any registry
         override. Callers should apply overrides as needed.
 
+        `spec` and `inference_backend` answer the question for a model other
+        than the one this server is starting. Exactly one caller needs that: a
+        managed router asking which image its *engines* run, because that is
+        what `{{runner_image}}` names. The router's own projected model says
+        `backend=custom` — deliberately, so it launches a command rather than
+        an engine — and custom is neither a runner service nor a backend row,
+        so resolving against it returns nothing twice over.
+
         Precedence:
-        1) Explicitly configured image on the model (self._model.image_name)
+        1) Explicitly configured image on the model (model.image_name)
         2) Prefer image name from the user's config when using custom backend or built-in backend with a custom version
         3) Auto-detected image from gpustack-runner based on device vendor/arch and backend
 
@@ -1451,14 +1502,18 @@ exec "$@"
             image_name, backend_version
 
         """
+        model = spec if spec is not None else self._model
+        if inference_backend is _INHERIT:
+            inference_backend = self.inference_backend
+
         # 1) Return directly if explicitly provided.
-        if self._model.image_name:
-            return self._model.image_name, None
+        if model.image_name:
+            return model.image_name, None
 
         # 2) Configuration takes priority when backend_version is set
-        if self._model and self.inference_backend:
-            image_name, target_version = self.inference_backend.get_image_name(
-                self._model.backend_version
+        if model and inference_backend:
+            image_name, target_version = inference_backend.get_image_name(
+                model.backend_version
             )
             if image_name and target_version:
                 return image_name, target_version
@@ -1499,11 +1554,11 @@ exec "$@"
         """
 
         backend_variant = None
-        service = self._model.backend.lower()
+        service = model.backend.lower()
         # A blank backend version means "Auto", same as None. Legacy/migrated data
         # and API clients can store "", which would otherwise be used as an exact
         # version filter and match no runner at all.
-        model_service_version = self._model.backend_version or None
+        model_service_version = model.backend_version or None
         service_version = model_service_version
 
         # Default variant for some backends.
@@ -1874,3 +1929,44 @@ def read_lora_max_rank(paths: List[str]) -> Optional[int]:
         if ranks:
             max_rank = max([max_rank, *ranks]) if max_rank is not None else max(ranks)
     return max_rank
+
+
+def _refuse_unrendered_router(model, instance) -> None:
+    """The same rule as `_refuse_unrendered`, at the second place it can break.
+
+    A router does not go through the injector, so the injector's check never
+    sees it. Its three rendered fields fail in three different ways, and only
+    one of them is legible on its own:
+
+      image_name   the container runtime rejects `{{runner_image}}` as an
+                   invalid reference — an error that names the placeholder but
+                   not why it has no value, several layers from the cause
+      run_command  the router starts and forwards to the literal string as if
+                   it were a host
+      env          silent, exactly as on the engine side
+
+    Measured on 910B2: a custom backend version resolved the engines' image
+    correctly and left the router's unresolved, because `_resolve_image` reads
+    `model.image_name` first and the catalog had just put the placeholder
+    there. The launch failed at docker with `invalid reference format`.
+    """
+    from gpustack.worker.pd_injection import _ANY_PLACEHOLDER, PDInjectionError
+
+    unrendered = []
+    for field in ("image_name", "run_command"):
+        for match in _ANY_PLACEHOLDER.finditer(str(getattr(model, field, "") or "")):
+            unrendered.append(f"{field}={match.group(0)}")
+    for name, value in sorted((getattr(model, "env", None) or {}).items()):
+        for match in _ANY_PLACEHOLDER.finditer(str(value)):
+            unrendered.append(f"{name}={match.group(0)}")
+
+    if not unrendered:
+        return
+
+    raise PDInjectionError(
+        f"The managed router for {instance.name} would start with "
+        f"{len(unrendered)} unrendered value(s) — {', '.join(unrendered)}. "
+        "`{{runner_image}}` in particular means the backend version in use "
+        "has no image on this worker: check that the model's backend version "
+        "exists and, if it is a custom one, that its image is pullable here."
+    )

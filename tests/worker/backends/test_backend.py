@@ -1700,3 +1700,169 @@ def test_a_single_writer_leaves_the_command_alone(cache_args, pd_args):
         == len(cache_args) // 2 + len(pd_args) // 2
     )
     assert "MultiConnector" not in " ".join(arguments)
+
+
+def _router_server(monkeypatch, engine_backend, captured=None):
+    """A server as it exists mid-launch for a managed router.
+
+    `_model` is already projected to the custom backend — that is what makes it
+    launch a command instead of an engine — while `_model_spec` still holds the
+    group's engine and version. The backend row it was handed is None, because
+    `custom` has no row.
+    """
+    import gpustack.worker.backends.base as base_module
+
+    def fake_merged(*_, **kwargs):
+        if captured is not None:
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(base_module, "merged_backend_runners", fake_merged)
+
+    server = VLLMServer.__new__(VLLMServer)
+    server._model = types.SimpleNamespace(
+        image_name=None, backend="custom", backend_version=None
+    )
+    server._model_spec = types.SimpleNamespace(
+        image_name=None,
+        backend="vLLM",
+        backend_version="0.20.2-ascend-pd-custom",
+        owner_principal_id=None,
+    )
+    server.inference_backend = None
+    server._get_device_info = lambda: ("cann", "9.0", "910b")
+    server._fetch_runner_overrides = lambda: []
+    server._engine_inference_backend = lambda spec: engine_backend
+    return server
+
+
+def test_resolve_image_for_a_router_reads_the_engine_spec_not_its_own_model(
+    monkeypatch,
+):
+    """The custom version's image lives only on the engine's backend row.
+
+    Resolving against the router's own projected model asks for a `custom`
+    service at no version, which matches neither the row nor the runner
+    catalog — measured on 910B2, where it produced the literal
+    `{{runner_image}}` and docker rejected it as an invalid reference.
+    """
+    asked = []
+
+    engine_backend = types.SimpleNamespace(
+        backend_name="vLLM",
+        get_image_name=lambda version: (
+            asked.append(version),
+            ("gpustack/runner:cann9.0-910b-vllm0.20.2-router", version),
+        )[1],
+    )
+    server = _router_server(monkeypatch, engine_backend)
+
+    image_name, version = server._resolve_image(
+        backend="cann",
+        spec=server._model_spec,
+        inference_backend=engine_backend,
+    )
+
+    assert image_name == "gpustack/runner:cann9.0-910b-vllm0.20.2-router"
+    assert version == "0.20.2-ascend-pd-custom"
+    assert asked == ["0.20.2-ascend-pd-custom"]
+
+
+def test_resolve_image_queries_the_runner_catalog_for_the_engine_service(
+    monkeypatch,
+):
+    """The spec has to reach the catalog query too, not just the backend row.
+
+    A group whose engine version *is* in the catalog never touches the row, so
+    the fallback path has to be looking up `vllm` — `custom` is not a runner
+    service and matches nothing.
+    """
+    captured = {}
+    server = _router_server(monkeypatch, None, captured=captured)
+
+    server._resolve_image(
+        backend="cann",
+        spec=server._model_spec,
+        inference_backend=None,
+    )
+
+    assert captured["service"] == "vllm"
+    assert captured["service_version"] == "0.20.2-ascend-pd-custom"
+
+
+def test_resolve_image_without_a_spec_still_reads_this_server(monkeypatch):
+    """The override is opt-in: every other backend's call must be unchanged."""
+    captured = {}
+    server = _router_server(monkeypatch, None, captured=captured)
+
+    server._resolve_image()
+
+    assert captured["service"] == "custom"
+
+
+def test_resolve_image_honours_an_explicit_none_backend_row(monkeypatch):
+    """`None` means "this model has no row", not "use mine".
+
+    Told to use the server's own row instead, a router would resolve the
+    image of whatever backend it was handed — which for the fallback custom
+    row is the router's own command, not the engine's image.
+    """
+    own_row = types.SimpleNamespace(
+        backend_name="custom",
+        get_image_name=lambda version: ("wrong/image:from-the-routers-own-row", "x"),
+    )
+    server = _router_server(monkeypatch, None)
+    server.inference_backend = own_row
+
+    image_name, _ = server._resolve_image(
+        spec=server._model_spec, inference_backend=None
+    )
+
+    assert image_name is None
+
+
+def _rendered_router(**overrides):
+    fields = {
+        "image_name": "gpustack/runner:x",
+        "run_command": "vllm-router",
+        "env": {},
+    }
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_fragment",
+    [
+        ({"image_name": "{{runner_image}}"}, "image_name={{runner_image}}"),
+        ({"run_command": "vllm-router --prefill {{peers}}"}, "{{peers}}"),
+        (
+            {"env": {"UCX_NET_DEVICES": "{{net_device}}"}},
+            "UCX_NET_DEVICES={{net_device}}",
+        ),
+    ],
+)
+def test_refuse_unrendered_router_names_the_value(overrides, expected_fragment):
+    from gpustack.worker.backends.base import _refuse_unrendered_router
+    from gpustack.worker.pd_injection import PDInjectionError
+
+    instance = types.SimpleNamespace(name="qwen3-pd-router-abc12")
+
+    with pytest.raises(PDInjectionError) as excinfo:
+        _refuse_unrendered_router(_rendered_router(**overrides), instance)
+
+    assert expected_fragment in str(excinfo.value)
+    assert "qwen3-pd-router-abc12" in str(excinfo.value)
+
+
+def test_refuse_unrendered_router_passes_a_fully_rendered_router():
+    from gpustack.worker.backends.base import _refuse_unrendered_router
+
+    _refuse_unrendered_router(
+        _rendered_router(
+            image_name="quay.io/gpustack/runner:cann9.0-910b-vllm0.20.2-router",
+            run_command="vllm-router --prefill http://192.168.13.3:40056",
+            env={"UCX_NET_DEVICES": "bond1"},
+        ),
+        types.SimpleNamespace(name="qwen3-pd-router-abc12"),
+    )

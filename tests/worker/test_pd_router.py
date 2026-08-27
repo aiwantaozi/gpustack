@@ -410,15 +410,20 @@ def test_materialisation_does_not_reach_the_stored_spec():
 
 
 def test_the_runner_image_is_resolved_against_the_groups_engine():
-    """Measured on a live cluster: the image reached Kubernetes as the literal
-    `{{runner_image}}` and the pod was rejected with InvalidImageName.
+    """Measured twice on live clusters, the same symptom from two causes.
 
-    Two causes compounded. The resolution ran inside `get_model()`, before
-    `inference_backend` was assigned, so it raised and the placeholder
-    survived; and a managed router has already been switched to the custom
-    backend by then, which resolves no image by definition. The router binary
-    ships inside the ENGINE's runner image, so that is the backend to ask
-    about.
+    First on Kubernetes: the image reached the apiserver as the literal
+    `{{runner_image}}` and the pod was rejected with InvalidImageName, because
+    the resolution ran inside `get_model()` before `inference_backend` was
+    assigned. Naming the engine's backend in the call looked like enough.
+
+    It was not. On 910B2 the same placeholder reached docker, which rejected it
+    as an invalid reference — because naming the backend does not change which
+    model gets read. A managed router is switched to the custom backend before
+    this runs, and `custom` is neither a runner service nor a backend row, so
+    both resolution paths came back empty. The router binary ships inside the
+    ENGINE's runner image, so the ENGINE's spec and backend row are what have
+    to reach the resolver.
     """
     from types import SimpleNamespace
 
@@ -426,9 +431,13 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
     from gpustack.worker.backends.base import InferenceServer
 
     asked = {}
+    engine_row = SimpleNamespace(backend_name=BackendEnum.VLLM.value)
+    spec = SimpleNamespace(
+        backend=BackendEnum.VLLM.value, backend_version="0.20.2-ascend-pd-custom"
+    )
 
-    def _resolve_image(backend=None):
-        asked["backend"] = backend
+    def _resolve_image(backend=None, spec=None, inference_backend=None):
+        asked.update(backend=backend, spec=spec, inference_backend=inference_backend)
         return "gpustack/runner:cuda12.9-vllm0.17.1", None
 
     fake = SimpleNamespace(
@@ -436,16 +445,22 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
         _config=SimpleNamespace(kv_ifname=None),
         # The unprojected model still carries the group's engine; the projected
         # one has been switched to Custom.
-        _model_spec=SimpleNamespace(backend=BackendEnum.VLLM.value),
+        _model_spec=spec,
         _model=SimpleNamespace(backend=BackendEnum.CUSTOM.value),
         _resolve_image=_resolve_image,
+        _engine_inference_backend=lambda _spec: engine_row,
     )
 
     variables = InferenceServer._pd_template_variables(fake)
 
-    assert asked["backend"] == BackendEnum.VLLM.value, (
-        "asking the custom backend yields no image, which is how the "
-        "placeholder reached Kubernetes"
+    assert asked["backend"] == BackendEnum.VLLM.value
+    assert asked["spec"] is spec, (
+        "the resolver reads the model it is given; without the spec it reads "
+        "the projected one, whose backend is custom"
+    )
+    assert asked["inference_backend"] is engine_row, (
+        "a custom backend version's image lives only on the backend row, and "
+        "the row this server was handed is the router's own — which is None"
     )
     assert variables["runner_image"] == "gpustack/runner:cuda12.9-vllm0.17.1"
 

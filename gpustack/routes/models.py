@@ -889,14 +889,39 @@ async def validate_gpu_type_selector(
             "are mutually exclusive."
         )
 
+    # 🔴 Narrowed to the slicing and partition modes, and it needs to be.
+    #
+    # A slice is a fraction of one card the node's device plugin picks at
+    # allocation time, so "more than one" has no meaning: the caller cannot say
+    # which card the first one landed on. A *whole-card* claim has no such
+    # difficulty — the operator's resource model hands out several at once, and
+    # the container sees exactly the devices allocated, so an engine told tp=4
+    # finds four. Refusing that was refusing something the layer below can do.
+    #
+    # ⚠️ Note this check has never actually fired on the common path:
+    # `set_model_gpus_per_replica` returns early unless `gpu_selector.gpu_ids`
+    # is set, and manual ids are mutually exclusive with `gpu_type_selector`
+    # above — so `gpus_per_replica` is `None` for every InstanceType claim. The
+    # real behaviour was "accepted, then scheduled onto one card while the
+    # engine expected several", which is worse than a refusal. Whole-card
+    # multi-card is handled by `InstanceTypeWholeCardSelector`; see design
+    # §3.7.11.
+    sliced_or_partitioned = (
+        (selector.accelerator_sliced_memory_percentage or 0) > 0
+        or (selector.accelerator_sliced_cores_percentage or 0) > 0
+        or bool(selector.accelerator_partitioned_profile)
+    )
     if (
-        gpu_selector is not None
+        sliced_or_partitioned
+        and gpu_selector is not None
         and gpu_selector.gpus_per_replica is not None
         and gpu_selector.gpus_per_replica > 1
     ):
         raise BadRequestException(
-            message="gpus_per_replica must be 1 when gpu_type_selector is set: "
-            "an InstanceType provides exactly one card per worker per replica."
+            message="gpus_per_replica must be 1 when a sliced or partitioned "
+            "gpu_type_selector is set: one slice is a fraction of one card, so "
+            "asking for several has no meaning. Use a whole-card claim (all "
+            "slicing percentages zero) for a member that needs several cards."
         )
 
     memory_pct = selector.accelerator_sliced_memory_percentage

@@ -1001,12 +1001,35 @@ class InferenceServer(ABC):
         cores = selector.accelerator_sliced_cores_percentage or 0
         if memory == 0 and cores == 0:
             # Whole-card exclusive: the bare base resource, no slicing keys.
-            resources[base] = "1"
+            #
+            # The count is the member's own card count, not a hard 1. A slice
+            # is a fraction of one card so "1" is the only answer there, but a
+            # whole-card claim for a tp=4 member needs four — and the
+            # operator's resource model hands out several at once (its
+            # `Accelerator` view is documented as "1", "4"). Writing 1 here
+            # while the engine was told tp=4 is the shape of the bug: the pod
+            # is admitted with one card and the engine then cannot start.
+            resources[base] = str(self._whole_card_count())
             return resources
         resources[f"{base}.sliced"] = "1"
         resources[f"{base}.sliced.memory-percentage"] = str(memory)
         resources[f"{base}.sliced.cores-percentage"] = str(cores)
         return resources
+
+    def _whole_card_count(self) -> int:
+        """How many whole cards this member was scheduled with.
+
+        Taken from the claim the scheduler already computed rather than
+        re-derived from backend parameters: the claim is what the placement
+        decision was made against, and a second derivation here could disagree
+        with it — which would mean the pod asks for a different number of cards
+        than the worker was chosen for.
+        """
+        claim = getattr(self._model_instance, "computed_resource_claim", None)
+        vram = getattr(claim, "vram", None) if claim else None
+        if vram:
+            return max(len(vram), 1)
+        return 1
 
     def _get_vgpu_resource_base(self) -> str:
         """

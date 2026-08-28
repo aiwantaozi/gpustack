@@ -89,6 +89,7 @@ from gpustack.schemas.cache_services import (
     CacheServiceStateEnum,
 )
 from gpustack.server.cache_provider_catalog import get_cache_provider
+from gpustack.server.pd_membership import outcome_for as membership_outcome_for
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
 from gpustack.server.workload_namespace import (
     WorkloadNamespaceEnsurer,
@@ -2039,11 +2040,18 @@ def upstream_registration_ready(model: Model) -> bool:
     )
     if not has_router:
         return True
-    # TODO(track D, router upstream registration): return the recorded
-    # outcome of the registration attempt for this group. Until that step
-    # exists there is nothing to observe, so a group whose roles are all
-    # covered is reported servable rather than parked forever in PARTIAL.
-    return True
+    outcome = membership_outcome_for(model.id)
+    if outcome is None:
+        # 🔑 No attempt recorded yet, and the answer is "servable" rather than
+        # "not yet" on purpose. A recipe that does not launch `--enable-igw`
+        # has no membership step at all: the router already knows its peers
+        # from the command line, so parking such a group in PARTIAL would
+        # break every deployment that works today.
+        #
+        # Under igw the reconcile runs on the same pass that computes this, so
+        # an unrecorded outcome there is the first pass only.
+        return True
+    return outcome.ok
 
 
 def is_model_servable(model: Model) -> bool:
@@ -2186,6 +2194,70 @@ def derive_model_state(
     return ModelStateEnum.RUNNING, None
 
 
+async def _reconcile_router_membership(
+    model: Model, instances: List[ModelInstance]
+) -> None:
+    """Tell every running router of this group who its members are.
+
+    Records the outcome for `upstream_registration_ready`, which is what keeps
+    a group whose registration failed out of RUNNING — it stays PARTIAL with
+    the router's own words instead of claiming to serve.
+
+    Never raises. A failure here has to read as "not registered yet" and be
+    retried on the next pass, because the alternative is a controller loop
+    that stops syncing every other status field over one unreachable router.
+    """
+    from gpustack.server import pd_membership
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    if model.disaggregation is None:
+        pd_membership.forget(model.id)
+        return
+
+    mode_name = getattr(model.disaggregation.mode, "value", None) or str(
+        model.disaggregation.mode
+    )
+    mode = get_pd_mode(mode_name)
+    if mode is None or not mode.router.membership_api_usable:
+        # Command-line path: the router knows its peers already. Recording
+        # nothing is what lets `upstream_registration_ready` stay vacuously
+        # true for these groups.
+        pd_membership.forget(model.id)
+        return
+
+    addresses = pd_membership.router_addresses(instances)
+    if not addresses:
+        pd_membership.record(
+            model.id,
+            pd_membership.MembershipOutcome(
+                ok=False, reason="no router is running yet"
+            ),
+        )
+        return
+
+    # Every router, and the worst outcome wins: one router with an empty
+    # registry serves 503s while another serves fine, and a group is only
+    # servable when the thing in front of it is.
+    worst = None
+    for address in addresses:
+        try:
+            outcome = await pd_membership.reconcile(model, mode, instances, address)
+        except Exception as e:
+            logger.warning(
+                "Router membership reconcile failed for model %s at %s: %s",
+                model.name,
+                address,
+                e,
+            )
+            outcome = pd_membership.MembershipOutcome(
+                ok=False, reason=f"membership reconcile raised: {e}"
+            )
+        if worst is None or (worst.ok and not outcome.ok):
+            worst = outcome
+    if worst is not None:
+        pd_membership.record(model.id, worst)
+
+
 async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     """
     Synchronize the model's server-owned status from its instances.
@@ -2246,6 +2318,18 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
             )
             for role in model.roles
         }
+
+    # 🔴 Reconcile BEFORE deriving the state, because under `--enable-igw` the
+    # router's registry is the only way members get in: the CLI peers are
+    # never passed (upstream builds the igw PD router with empty worker
+    # lists), so a router process that is up with an empty registry answers
+    # 503. Deriving RUNNING first and registering after would publish an
+    # upstream that cannot serve — the window is structural, not a failure.
+    #
+    # A no-op for every group whose recipe does not carry the flag, which is
+    # all of them today: `reconcile` returns ok immediately when
+    # `membership_api_usable` is false.
+    await _reconcile_router_membership(model, instances)
 
     state, state_message = derive_model_state(
         model,

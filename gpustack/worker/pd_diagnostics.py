@@ -23,7 +23,7 @@ import logging
 import re
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Deque, Dict, Mapping, Optional, Tuple
+from typing import Deque, Dict, Mapping, Optional, Sequence, Tuple
 
 from pydantic import BaseModel
 
@@ -194,7 +194,10 @@ def diagnose(
     if not log_text:
         return None
 
-    for raw_line in log_text.splitlines():
+    lines = log_text.splitlines()
+    warned: Optional[Diagnosis] = None
+
+    for raw_line in lines:
         for name, pattern, summary in _COMPILED:
             match = pattern.search(raw_line)
             if match is None:
@@ -207,8 +210,65 @@ def diagnose(
                     detail = f"{summary} The port belongs to the '{band}' band."
             elif name == "unresolved placeholder":
                 detail = f"{summary} Unrendered: {match.group(0)}."
-            return Diagnosis(signature=name, line=line, summary=detail)
+            found = Diagnosis(signature=name, line=line, summary=detail)
+            if not _is_warning(raw_line):
+                return found
+            # 🔴 A warning is held back rather than returned, and this is the
+            # bug that made the rule necessary (measured on a live SGLang
+            # prefill): the engine logged `W0828 ... No RDMA devices found` at
+            # startup — benign on a host with no HCA, where the transport
+            # falls back to TCP and had already moved 276 KV transfers
+            # successfully — and three seconds later died of
+            # `ValueError: Loaded weights leave no GPU memory for the KV cache`.
+            # "Earliest match wins" is right *within* a cascade of errors; a
+            # warning is not part of that cascade, it just happens to come
+            # first, and returning it renamed a memory-sizing failure as an
+            # RDMA problem.
+            if warned is None:
+                warned = found
+            break
+
+    if warned is not None and not _has_unrecognised_fatal(lines):
+        # No fatal error we failed to recognise, so the warning is the best
+        # account of the failure available and is better than silence.
+        return warned
     return None
+
+
+# Severity markers, in the two shapes these engines emit: glog's `W0828 ...`
+# / `E0828 ...` prefix (Mooncake, NIXL, the transfer engines) and Python's
+# `WARNING:` / `ERROR:` (uvicorn, SGLang, vLLM).
+_GLOG_WARNING = re.compile(r"^\s*W\d{4}\s")
+_TEXT_WARNING = re.compile(r"\b(WARNING|WARN)\b\s*:?", re.IGNORECASE)
+# What an unrecognised fatal looks like. Deliberately broad: the cost of a
+# false positive here is only that a warning-level diagnosis is withheld and
+# the caller reports the engine's own last error instead, which is never
+# actively misleading.
+_FATAL_MARKERS = re.compile(
+    r"^\s*(Traceback \(most recent call last\)|"
+    r"[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)\s*:|"
+    r"E\d{4}\s)"
+)
+
+
+def _is_warning(line: str) -> bool:
+    if _GLOG_WARNING.search(line):
+        return True
+    # An `ERROR` on the same line wins: some loggers print both a level and a
+    # message that happens to contain the word "warning".
+    if re.search(r"^\s*E\d{4}\s|\bERROR\b", line):
+        return False
+    return bool(_TEXT_WARNING.search(line))
+
+
+def _has_unrecognised_fatal(lines: Sequence[str]) -> bool:
+    """Whether the log holds a fatal error no signature matched.
+
+    The question a withheld warning turns on: if the engine died of something
+    this module cannot summarise, saying nothing lets the caller report the
+    engine's own words, which are at least about the right failure.
+    """
+    return any(_FATAL_MARKERS.search(line) for line in lines)
 
 
 def _attribute_port(

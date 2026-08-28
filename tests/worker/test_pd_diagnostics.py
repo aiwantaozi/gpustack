@@ -327,3 +327,72 @@ def test_a_healthy_log_is_not_diagnosed_as_a_failed_transfer():
     )
 
     assert diagnose(log) is None
+
+
+# ---------------------------------------------------------------------------
+# Severity: "earliest match wins" is right within a cascade, not across one.
+# ---------------------------------------------------------------------------
+
+_REAL_SGLANG_PREFILL_LOG = """\
+E0828 01:41:15.002852    73 transfer_metadata.cpp:877] Local segment descriptor not found
+W0828 01:41:15.002805    73 topology.cpp:156] No RDMA devices found, check your device installation
+I0828 01:41:15.002866    73 tcp_transport.cpp:553] TcpTransport: listen on port 16792
+[2026-08-28 01:41:17] Load weight end. elapsed=0.60 s
+[2026-08-28 01:41:18] Scheduler hit an exception: Traceback (most recent call last):
+  File "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py", line 4325
+    raise ValueError(
+ValueError: Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.5.
+"""
+
+
+def test_a_warning_does_not_get_reported_as_the_cause_of_a_fatal_error():
+    """🔴 The regression this exists for, captured verbatim from a live run.
+
+    The engine logged `No RDMA devices found` — benign on a host with no HCA,
+    where the transport falls back to TCP and had already moved 276 KV
+    transfers successfully — and died three seconds later of a memory-sizing
+    ValueError. "Earliest recognised failure" returned the warning, so the
+    instance's `state_message` blamed RDMA for an out-of-memory failure and
+    sent whoever read it to check for an HCA.
+
+    The rule stands *within* a cascade of derived errors, which is what it was
+    written for. A warning is not part of that cascade; it merely comes first.
+    """
+    assert diagnose(_REAL_SGLANG_PREFILL_LOG) is None
+
+
+def test_a_warning_is_still_reported_when_nothing_fatal_is_hiding_behind_it():
+    """Withholding it unconditionally would throw away a real diagnosis. The
+    warning is the best account available when the log holds no fatal error
+    this module failed to recognise."""
+    log = (
+        "W0828 01:41:15.002805 73 topology.cpp:156] No RDMA devices found\n"
+        "[2026-08-28 01:41:20] Application startup complete.\n"
+    )
+    result = diagnose(log)
+    assert result is not None
+    assert result.signature == "rdma unavailable"
+
+
+def test_an_error_level_match_still_wins_and_still_wins_earliest():
+    """The original behaviour, unchanged: among error-level lines the first
+    one is the actionable one, because everything after it is derived."""
+    log = (
+        "E0828 01:41:15 nixl] NIXL_ERR_BACKEND handshake failed\n"
+        "Traceback (most recent call last):\n"
+        "IndexError: list index out of range\n"
+    )
+    result = diagnose(log)
+    assert result is not None
+    assert result.signature == "NIXL_ERR_BACKEND"
+
+
+def test_the_word_error_on_a_line_outranks_the_word_warning():
+    """Some loggers put both on one line. Treating such a line as a warning
+    would reintroduce the masking this fix removes."""
+    from gpustack.worker.pd_diagnostics import _is_warning
+
+    assert _is_warning("W0828 01:41:15 topology.cpp:156] No RDMA devices found")
+    assert _is_warning("WARNING: rdma_create_event_channel failed")
+    assert not _is_warning("ERROR: warning threshold exceeded, rdma_create_id failed")
+    assert not _is_warning("E0828 01:41:15 nixl] NIXL_ERR_BACKEND")

@@ -127,6 +127,42 @@ gpustack_metrics:
 # -----------------------------
 # Runtime Metrics Mapping (user-configurable)
 # -----------------------------
+  # --- Prefill/decode disaggregation -------------------------------------
+  # Read on the role the connector's semantics name: NIXL has decode PULL, so
+  # decode counts; SGLang has prefill PUSH, so prefill counts. A healthy pair
+  # therefore reports zero on the other side, and reading the wrong one turns
+  # a working group into a silent-degradation alarm.
+  gpustack:pd_kv_transfer_bytes:
+    type: Histogram
+    unit: bytes
+    description: "KV bytes transferred between prefill and decode. Its _count is the number of transfers."
+
+  gpustack:pd_kv_transfer_seconds:
+    type: Histogram
+    unit: seconds
+    description: "Time spent transferring KV between prefill and decode. Divided into the bytes above this is throughput while transferring, not throughput per wall second."
+
+  gpustack:pd_kv_transfer_failed:
+    type: Counter
+    description: "Failed KV transfers reported by the engine."
+
+  gpustack:pd_kv_lease_expired:
+    type: Counter
+    description: "Requests whose KV lease expired unread: their prefill was computed and thrown away. Tracked on the PREFILL instance."
+
+  gpustack:pd_router_prefill_requests:
+    type: Counter
+    description: "Requests the router dispatched to a prefill worker. Per worker, so a low ratio points at one member rather than at the group."
+
+  gpustack:pd_router_decode_requests:
+    type: Counter
+    description: "Requests the router dispatched to a decode worker."
+
+  gpustack:pd_router_requests:
+    type: Counter
+    description: "Requests the router handled, aggregated by route. The coarse denominator, used when no per-worker counter exists."
+
+
 runtime_mapping:
   vLLM:
     "*": # 0.21.0
@@ -158,6 +194,16 @@ runtime_mapping:
       vllm:request_generation_tokens: gpustack:request_generation_tokens
       vllm:inter_token_latency_seconds: gpustack:inter_token_latency_seconds
       vllm:spec_decode_num_accepted_tokens: gpustack:spec_decode_accepted_tokens
+      # PD: already in base units, so a plain rename.
+      vllm:nixl_bytes_transferred: gpustack:pd_kv_transfer_bytes
+      vllm:nixl_xfer_time_seconds: gpustack:pd_kv_transfer_seconds
+      vllm:nixl_num_failed_transfers: gpustack:pd_kv_transfer_failed
+      vllm:nixl_num_kv_expired_reqs: gpustack:pd_kv_lease_expired
+      # The router's own counters. It is a model instance like any other; its
+      # exposition just lives on a separate port band (see `_metrics_port`).
+      vllm_router_pd_prefill_requests: gpustack:pd_router_prefill_requests
+      vllm_router_pd_decode_requests: gpustack:pd_router_decode_requests
+      vllm_router_pd_requests: gpustack:pd_router_requests
       vllm:spec_decode_num_draft_tokens: gpustack:spec_decode_draft_tokens
     "<0.11.1":
       vllm:num_requests_swapped: gpustack:num_requests_swapped
@@ -170,6 +216,23 @@ runtime_mapping:
 
   SGLang:
     "*": # 0.5.12.post1
+      # PD: NOT in base units. SGLang reports transfer volume in MEGABYTES
+      # and duration in MILLISECONDS where vLLM reports bytes and seconds
+      # (measured on a live 1P1D: total_mb_sum=189.0, latency_ms_sum=214.15
+      # over the same 83 transfers). Mapping them without `scale` would put
+      # two units under one name, which is worse than two names because a
+      # reader can no longer tell which they have.
+      sglang:kv_transfer_total_mb:
+        name: gpustack:pd_kv_transfer_bytes
+        scale: 1048576
+      sglang:kv_transfer_latency_ms:
+        name: gpustack:pd_kv_transfer_seconds
+        scale: 0.001
+      # This gateway exports no per-worker dispatch counter, only the route
+      # aggregate. Declaring the coarse one is honest; inventing the per-worker
+      # names from the shared fork ancestry is how the `smg_` vs
+      # `vllm_router_` divergence would have been missed.
+      smg_router_requests: gpustack:pd_router_requests
       sglang:num_running_reqs: gpustack:num_requests_running
       sglang:num_queue_reqs: gpustack:num_requests_waiting
       sglang:num_retracted_requests: gpustack:request_preemptions
@@ -202,3 +265,146 @@ runtime_mapping:
       num_preemptions: gpustack:request_preemptions
       request_prompt_tokens: gpustack:request_prompt_tokens
       request_generation_tokens: gpustack:request_generation_tokens
+
+# -----------------------------
+# Declared PromQL (gpustack/schemas/metric_queries.py)
+#
+# The expressions a feature runs, kept beside the names they read so a renamed
+# counter and the query over it are edited in one place. Scope is per operand:
+# `counted_role` is the role whose transfer counter is authoritative for the
+# connector (decode where it pulls, prefill where it pushes) and the caller
+# resolves it from the catalog; `group` is everything under the model.
+#
+# Version ranges resolve like `runtime_mapping` above — a matching range wins
+# key by key over `"*"`. Only `"*"` is populated: the axis is here because our
+# own unified names can change, and during a rolling upgrade two workers
+# publish two vintages of them, where an expression written for the newer one
+# returns empty against the older and empty reads as "nothing happened".
+# -----------------------------
+metric_queries:
+  pd:
+    "*":
+      # `_count` of the bytes histogram IS the transfer count, so the
+      # numerator needs no separate counter.
+      transfers:
+        counter_increase:
+          metric: gpustack:pd_kv_transfer_bytes_count
+          scope: counted_role
+      bytes:
+        counter_increase:
+          metric: gpustack:pd_kv_transfer_bytes_sum
+          scope: counted_role
+      seconds:
+        counter_increase:
+          metric: gpustack:pd_kv_transfer_seconds_sum
+          scope: counted_role
+      failed:
+        counter_increase:
+          metric: gpustack:pd_kv_transfer_failed_total
+          scope: group
+      # Scoped to the group, not to a role: vLLM tracks the lease counter on
+      # PREFILL while the transfer counters are on decode, so summing the
+      # group is right either way and encodes no guess about which side.
+      expired:
+        counter_increase:
+          metric: gpustack:pd_kv_lease_expired_total
+          scope: group
+      # The good denominator: per-worker, so a low ratio points at one decode
+      # rather than at "the group".
+      requests_per_worker:
+        counter_increase:
+          metric: gpustack:pd_router_decode_requests_total
+          scope: group
+      # The fallback, for a router that exports no per-worker counter. Coarser,
+      # and still the right answer to "did anything get routed at all", which
+      # is the question a ratio of zero is meaningless without.
+      requests_total:
+        counter_increase:
+          metric: gpustack:pd_router_requests_total
+          scope: group
+      # --- Transport health -------------------------------------------
+      # Percentiles, not just the mean. A degrading path shows up in the tail
+      # first, and a mean over a window is guaranteed to hide it: llm-d's own
+      # PD dashboard charts p50/p95/p99 of exactly this histogram.
+      kv_transfer_seconds_p50:
+        histogram_quantile:
+          quantile: 0.5
+          metric: gpustack:pd_kv_transfer_seconds
+          scope: counted_role
+      kv_transfer_seconds_p95:
+        histogram_quantile:
+          quantile: 0.95
+          metric: gpustack:pd_kv_transfer_seconds
+          scope: counted_role
+      kv_transfer_seconds_p99:
+        histogram_quantile:
+          quantile: 0.99
+          metric: gpustack:pd_kv_transfer_seconds
+          scope: counted_role
+      # Mean bytes per transfer. Worth its own figure because a drop here
+      # precedes a slowdown: smaller chunks mean more per-transfer overhead
+      # for the same volume.
+      kv_transfer_bytes_avg:
+        ratio_increase:
+          numerator:   { metric: gpustack:pd_kv_transfer_bytes_sum,   scope: counted_role }
+          denominator: { metric: gpustack:pd_kv_transfer_bytes_count, scope: counted_role }
+
+      # --- Balance, per role --------------------------------------------
+      # 🔑 The only objective signal for whether the P:D ratio is right, and
+      # which way it is wrong. A gauge, so it is averaged over the window
+      # rather than increased — `increase()` on a queue depth is meaningless.
+      # The newest sample, not the window's mean: queue depth describes *now*.
+      # Averaged over fifteen minutes, a backlog that formed a minute ago is
+      # divided by fifteen and reads as calm, and one that cleared ten minutes
+      # ago keeps being reported until the window rolls past it -- wrong in
+      # both directions, and in the direction that matters wrong when it
+      # matters most.
+      pending_requests:
+        gauge_last:
+          metric: gpustack:num_requests_waiting
+        group_by: [role]
+      running_requests:
+        gauge_avg:
+          metric: gpustack:num_requests_running
+        group_by: [role]
+
+      # --- Latency, per role --------------------------------------------
+      # 🔑 The reason PD is worth running at all: prefill owns TTFT and decode
+      # owns TPOT. A figure averaged across both roles describes neither, so
+      # these are grouped by role rather than summed.
+      #
+      # 📌 llm-d splits these by matching pod NAMES (`pod=~".*prefill.*"`).
+      # We have a real `role` label from the aggregator, which does not break
+      # when instance naming changes and works for engines whose role is not
+      # in the pod name.
+      time_to_first_token_seconds:
+        ratio_increase:
+          numerator:   { metric: gpustack:time_to_first_token_seconds_sum }
+          denominator: { metric: gpustack:time_to_first_token_seconds_count }
+        group_by: [role]
+      time_per_output_token_seconds:
+        ratio_increase:
+          numerator:   { metric: gpustack:time_per_output_token_seconds_sum }
+          denominator: { metric: gpustack:time_per_output_token_seconds_count }
+        group_by: [role]
+      # Throughput WHILE TRANSFERRING: bytes over time spent moving them, not
+      # over wall clock. A window that was mostly idle would otherwise read as
+      # a collapse in throughput.
+      rate_series:
+        ratio_increase:
+          numerator:
+            metric: gpustack:pd_kv_transfer_bytes_sum
+            scope: counted_role
+          denominator:
+            metric: gpustack:pd_kv_transfer_seconds_sum
+            scope: counted_role
+      # 🔑 The mixed-scope case the per-operand design exists for: transfers
+      # counted on one role, requests counted across the group.
+      ratio_series:
+        ratio_increase:
+          numerator:
+            metric: gpustack:pd_kv_transfer_bytes_count
+            scope: counted_role
+          denominator:
+            metric: gpustack:pd_router_requests_total
+            scope: group

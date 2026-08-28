@@ -5,9 +5,11 @@ from gpustack.schemas.pd_modes import (
     PDInjectTargetEnum,
     PDKVLeaseTargetEnum,
     PDMembershipAPI,
+    PDTransferMetrics,
     PDMode,
     PDPeerStyleEnum,
     PDPortScopeEnum,
+    PDRouter,
     PDRouterProtocolEnum,
 )
 from gpustack.server.pd_mode_catalog import (
@@ -549,22 +551,36 @@ def test_unsettable_window_must_not_claim_an_injection_target():
 
 
 def test_the_read_side_is_declared_because_reading_the_wrong_one_inverts_it():
-    """NIXL is pull-based: a completed transfer is counted on decode. On a
-    working 1P1D, prefill's counter stayed 0.0 for the whole run and
-    decode's went to 1.0, so reading prefill reports a healthy pair as
-    having transferred nothing."""
+    """🔴 The one fact that survived the metric names moving out.
+
+    Which side owns the transfer counters is the connector's semantics, not its
+    spelling, so normalization cannot absorb it: NIXL PULLS (decode reads from
+    prefill, decode counts) and SGLang PUSHES (prefill writes into decode's
+    registered slots, prefill counts). Measured on a working 1P1D -- the
+    non-counting side stays at 0.0 for the whole run.
+
+    Read the wrong side and a healthy pair reports "no KV ever moved": the
+    exact alarm this exists to raise, fired at a deployment that is fine.
+    """
     nixl = get_transfer_metrics("nixl")
     assert nixl.read_from_role == "decode"
-    assert nixl.xfer_count == "vllm:nixl_xfer_time_seconds_count"
-    assert nixl.xfer_seconds == "vllm:nixl_xfer_time_seconds_sum"
-    assert nixl.failed_transfers == "vllm:nixl_num_failed_transfers_total"
-    # No byte counter in the measured record, so the degradation check runs
-    # on a rate in transfers rather than on true bandwidth.
-    assert nixl.xfer_bytes is None
-    # And no floor: a threshold is a calibration on real hardware, and the
-    # measured spread (94% of line rate on 2.5GbE, 9% on 910B2 RoCE) is why
-    # an invented one is worse than none.
-    assert nixl.min_expected_rate is None
+    assert nixl.observable is True
+
+    for connector in ("sglang-mooncake", "sglang-nixl"):
+        assert get_transfer_metrics(connector).read_from_role == "prefill", connector
+
+
+def test_the_metric_names_are_gone_from_this_catalog():
+    """🔴 The regression this pins, and it is about a *removal*.
+
+    The names moved to `metrics_config.yaml`, where the aggregator normalizes
+    every engine's spelling and units onto one set of `gpustack:pd_*` series.
+    A second copy here would be two files to edit for one rename -- and worse,
+    nothing reads this one any more, so it would look authoritative and change
+    nothing. Adding a metric name back is the mistake this catches.
+    """
+    fields = set(PDTransferMetrics.model_fields)
+    assert fields == {"connector", "read_from_role", "observable"}, fields
 
 
 def test_sglang_counts_on_prefill_because_it_pushes():
@@ -582,37 +598,6 @@ def test_sglang_counts_on_prefill_because_it_pushes():
     for connector in ("sglang-mooncake", "sglang-nixl"):
         metrics = get_transfer_metrics(connector)
         assert metrics.read_from_role == "prefill", connector
-
-
-def test_the_sglang_numerator_is_not_the_per_stage_histogram():
-    """Regression: that counter advances on an idle group.
-
-    Measured 2026-08-26 on a live 1P1D — over 90 seconds with zero business
-    requests, `per_stage_req_latency_seconds_count{stage="decode_transferred"}`
-    went 24 -> 25 -> 26 while `num_requests_total` held at 4, because health
-    probes and the engine's own synthetic requests traverse the
-    disaggregation path. `kv_transfer_total_mb_count` did not move in the
-    same window.
-
-    It matters because `_judge_effectiveness` only reaches AGGREGATED when
-    the ratio stops being positive. A numerator that ticks on its own can
-    never stop being positive, so a deployment that had silently degraded to
-    aggregated serving would keep reporting `effective` indefinitely — the
-    single failure the whole check exists to catch.
-    """
-    for connector in ("sglang-mooncake", "sglang-nixl"):
-        metrics = get_transfer_metrics(connector)
-        assert metrics.xfer_count == "sglang:kv_transfer_total_mb_count", connector
-        assert "per_stage_req_latency" not in (metrics.xfer_count or ""), connector
-        assert "per_stage_req_latency" not in (metrics.xfer_seconds or ""), connector
-        # The label selector went with it: selecting a phase answers "which
-        # phase", not "was there a request", so it never addressed this.
-        assert metrics.sample_labels is None, connector
-        # Units, not oversight: the engine's seconds are milliseconds and its
-        # bytes are megabytes, and these two fields are consumed as seconds
-        # and bytes. Declaring a unit is a schema change, not a bugfix.
-        assert metrics.xfer_seconds is None, connector
-        assert metrics.xfer_bytes is None, connector
 
 
 def test_a_connector_that_exports_nothing_says_so():
@@ -654,90 +639,24 @@ def test_a_connector_missing_from_the_counter_registry_fails_the_load():
         )
 
 
-def test_transfer_seconds_without_a_count_is_not_a_rate():
-    with pytest.raises(PDModeCatalogError, match="a rate needs both"):
-        parse_pd_mode_catalog(
-            _document(
-                [],
-                kv_leases=[
-                    {
-                        "connector": "nixl",
-                        "param": "kv_lease_duration",
-                        "inject_to": "connector_extra_config",
-                    }
-                ],
-                kv_transfer_metrics=[{"connector": "nixl", "xfer_seconds": "s"}],
-            )
-        )
+def test_the_denominator_names_left_this_catalog():
+    """🔴 A removal, and the reason it is worth a test.
 
+    The router's request-counter names used to be declared here. They moved to
+    `metrics_config.yaml`, where the worker's aggregator normalizes every
+    router's spelling onto `gpustack:pd_router_*` — and after the move nothing
+    read this copy, so it was a declaration that looked authoritative and
+    changed nothing. Two files to edit for one rename is the cheaper half of
+    that cost; the expensive half is the next person editing the copy that
+    does nothing.
 
-def test_the_ratios_denominator_is_declared_per_router():
-    """Per-worker, which is what localises the failure to one decode rather
-    than to "the group"."""
-    nixl = get_pd_mode(PDModeEnum.VLLM_NIXL.value).router.request_metrics
-    assert nixl.prefill_requests == "vllm_router_pd_prefill_requests_total"
-    assert nixl.decode_requests == "vllm_router_pd_decode_requests_total"
-    assert nixl.worker_label == "worker"
-    # Coarser and measured too: aggregated by route, so it localises
-    # nothing but still answers whether anything was routed.
-    assert nixl.total_requests == "vllm_router_pd_requests_total"
-
-    # SGLang's gateway is the same codebase, and the names are still NOT the
-    # same — this one prefixes `smg_`, vllm-router `vllm_router_`. So the
-    # guess the catalog used to refuse to make would have read zero, which is
-    # exactly why it refused. Declared now because measured, not inferred.
-    for name in (PDModeEnum.SGLANG_MOONCAKE.value, PDModeEnum.SGLANG_NIXL.value):
-        sglang = get_pd_mode(name).router.request_metrics
-        assert sglang.available is True
-        assert sglang.total_requests == "smg_router_requests_total"
-        assert not sglang.total_requests.startswith("vllm_router")
-        # Its exposition is a second listener on a band GPUStack allocates:
-        # measured, the router binds the hardcoded 29000 when left alone, so
-        # two groups on a host would collide and the serving port 404s.
-        assert sglang.port_band == "prometheus"
-
-    # A router that declares no metrics has no denominator by capability
-    # rather than by omission. Synthetic since the router swap: every shipped
-    # mode serves metrics now, and the rule is about the capability, not about
-    # whichever entry happened to lack it.
-    from copy import deepcopy
-
-    silent = deepcopy(get_pd_mode(PDModeEnum.VLLM_NIXL.value).router)
-    silent.capabilities.metrics = False
-    # `available` is derived from the counter names, so clearing them is what
-    # makes the denominator absent — the object stays, which is why callers can
-    # ask without a None check.
-    silent.request_metrics.prefill_requests = None
-    silent.request_metrics.decode_requests = None
-    silent.request_metrics.total_requests = None
-    assert silent.capabilities.metrics is False
-    assert silent.request_metrics.available is False
-
-
-def test_request_metrics_behind_a_metrics_false_capability_fail_the_load():
-    with pytest.raises(PDModeCatalogError, match="nothing would ever scrape them"):
-        parse_pd_mode_catalog(
-            _document(
-                [
-                    {
-                        "name": PDModeEnum.VLLM_NIXL.value,
-                        "backends": PD_MODE_BACKENDS[PDModeEnum.VLLM_NIXL.value],
-                        "router": {
-                            "protocol": "two_hop",
-                            "command": ["router"],
-                            "peers": {"style": "repeated_flag"},
-                            "capabilities": {"metrics": False},
-                            "request_metrics": {"decode_requests": "x_total"},
-                        },
-                    }
-                ]
-            )
-        )
-
-
-# ---------------------------------------------------------------------------
-# Loader behaviour.
-# ---------------------------------------------------------------------------
+    What stays on the router is what normalization cannot absorb: whether it
+    serves an exposition at all (`capabilities.metrics`) and where
+    (`ports`, the band the API port is not on).
+    """
+    fields = set(PDRouter.model_fields)
+    assert "request_metrics" not in fields
+    assert {"capabilities", "ports", "membership_api"} <= fields
 
 
 def test_catalog_is_cached_and_reloadable():

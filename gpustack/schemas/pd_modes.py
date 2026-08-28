@@ -185,103 +185,53 @@ class PDKVLease(BaseModel):
 
 
 class PDTransferMetrics(BaseModel):
-    """The engine-side counters one connector exports about KV transfer.
+    """What one connector's KV transfer means, not what it is called.
 
-    Declared per connector rather than hardcoded because the names, and
-    whether they exist at all, are the connector's business: NIXL exports
-    fifteen counters, Mooncake exports none, and SGLang's transfer backends
-    were never measured. A mode whose entry is all-null is a mode where PD
-    effectiveness is not observable from Prometheus, and saying that out
-    loud is the point — the alternative is a ratio that silently reads
-    zero because the metric was never there.
+    🔴 **The metric NAMES used to live here and no longer do.** They moved to
+    `metrics_config.yaml`, where the worker's aggregator already normalizes
+    every engine's own spelling — and its own units — onto one set of
+    `gpustack:pd_*` names. Keeping a second copy here meant two files to edit
+    for one rename, and worse: after the move nothing read this copy, so it
+    was a declaration that looked authoritative and changed nothing.
+
+    What stays is the part that is genuinely about the connector and cannot be
+    normalized away, because it is semantics rather than spelling.
     """
 
     connector: str
     """The key modes resolve through, the same id ``kv_leases`` uses."""
 
     read_from_role: str = "decode"
-    """🔴 Which side of the pair owns these counters. **Both values are in
-    use — this is not a formality with one real answer.**
+    """🔴 Which side of the pair owns the transfer counters. **Both values are
+    in use — this is not a formality with one real answer.**
 
     The rule is "whichever side moves the bytes", and the two engines differ:
 
     - vLLM's NIXL *pulls*: decode reads from prefill, so decode counts.
-      Measured on a working 1P1D — prefill's
-      ``nixl_xfer_time_seconds_count`` stayed at 0.0 for the whole run while
-      decode's was 1.0.
-    - SGLang *pushes*: prefill writes into slots decode registered through
-      the bootstrap service, so prefill counts. Its byte and speed counters
-      exist only on prefill for exactly this reason.
+      Measured on a working 1P1D — prefill's transfer count stayed at 0.0 for
+      the whole run while decode's rose with every request.
+    - SGLang *pushes*: prefill writes into slots decode registered through the
+      bootstrap service, so prefill counts. Its byte and speed counters exist
+      only on prefill for exactly this reason.
 
-    Get it backwards and a healthy pair reports "no KV ever moved" — the
-    exact failure this metric exists to detect, fired at a deployment that is
-    fine. The default is ``decode`` only because NIXL came first, not because
-    it is the normal case."""
+    Get it backwards and a healthy pair reports "no KV ever moved" — the exact
+    failure this metric exists to detect, fired at a deployment that is fine.
+    The default is ``decode`` only because NIXL came first, not because it is
+    the normal case."""
 
-    xfer_count: Optional[str] = None
-    """Cumulative count of completed KV transfers — the numerator of the
-    PD-effectiveness ratio. Spelled as it appears in the exposition
-    (a histogram's ``_count`` sample), not as the family name."""
+    observable: bool = True
+    """Whether this connector exports any transfer counter at all.
 
-    xfer_seconds: Optional[str] = None
-    """Cumulative seconds spent transferring. Paired with ``xfer_count`` it
-    gives a per-window transfer rate, which is what the degradation check
-    compares against the group's own baseline."""
+    Declared rather than derived, and that changed when the names moved out:
+    it used to be `bool(xfer_count or xfer_bytes or ...)`, which stopped
+    having anything to look at. Declaring it keeps the one fact that mattered
+    — vLLM's `mooncake/stats.py` exports **zero** Prometheus counters where
+    NIXL exports fifteen.
 
-    xfer_bytes: Optional[str] = None
-    """Cumulative bytes transferred, if the connector exports it. When it
-    does the rate is a true bandwidth; when it does not the check falls
-    back to transfers per second of transfer time, which is a rate in a
-    different unit and therefore only ever comparable to a baseline taken
-    in the same unit."""
-
-    failed_transfers: Optional[str] = None
-
-    sample_labels: Optional[Dict[str, str]] = None
-    """Labels a sample must carry to be counted, for engines that put every
-    stage of a request in ONE family and separate them by label.
-
-    SGLang's ``sglang:per_stage_req_latency_seconds`` is why this exists: one
-    histogram, with ``stage="decode_bootstrap"`` and
-    ``stage="decode_transferred"`` telling the phases apart, so summing the
-    family without a selector counts every stage of every request.
-
-    ⚠️ **No shipped mode uses it today, and the reason is worth reading
-    before adding one back.** That family was the SGLang numerator until
-    2026-08-26, when it turned out to advance on an *idle* group (+1 per
-    ~45s: health probes and the engine's own synthetic requests traverse the
-    disaggregation path and land in the histogram). A label selector fixes
-    "which phase", not "was there a request" — and a numerator that ticks
-    without traffic makes silent degradation undetectable. Kept because the
-    label-selection hazard is real and will recur; not kept as an
-    endorsement of per-stage histograms as numerators."""
-
-    min_expected_rate: Optional[float] = None
-    """Coarse floor for the first-deployment case the baseline method
-    cannot see (a group that was already degraded when its baseline was
-    taken). Null everywhere on purpose: a floor is a calibration against
-    real hardware, and the measured spread — 94% of line rate on 2.5GbE
-    versus 9% on 910B2 RoCE — is exactly why an invented number would
-    either alarm forever on one platform or never on the other."""
-
-    @model_validator(mode="after")
-    def check_rate_inputs(self) -> "PDTransferMetrics":
-        if self.xfer_seconds and not self.xfer_count:
-            raise ValueError(
-                f"transfer metrics for '{self.connector}' declare "
-                "xfer_seconds without xfer_count; a rate needs both"
-            )
-        if self.min_expected_rate is not None and not self.xfer_count:
-            raise ValueError(
-                f"transfer metrics for '{self.connector}' declare a floor but "
-                "no counter to measure against it"
-            )
-        return self
-
-    @property
-    def observable(self) -> bool:
-        """Whether anything at all can be read from this connector."""
-        return bool(self.xfer_count or self.xfer_bytes or self.failed_transfers)
+    False means PD effectiveness is not decidable from metrics for this
+    connector, and saying that out loud is the point: the alternative is a
+    ratio that reads zero because the counter was never there, which is
+    indistinguishable from the failure it is supposed to catch."""
 
 
 class PDPortSpec(BaseModel):
@@ -408,56 +358,6 @@ class PDRouterCapabilities(BaseModel):
     Mirrors ``kv_lease.expired_metric``; the loader asserts they agree."""
 
 
-class PDRouterRequestMetrics(BaseModel):
-    """The router-side counters that give the PD-effectiveness ratio its
-    denominator.
-
-    The denominator is *not* counted by GPUStack. vllm-router already
-    exports per-worker request counters, and per-worker is the shape that
-    matters: a group-wide ratio says "something is wrong somewhere", a
-    per-worker one says which decode stopped pulling.
-
-    Left empty means no denominator, and that is a first-class outcome
-    rather than a gap to paper over. Guessing a counter name would produce a
-    ratio that reads zero because the name was wrong, which is
-    indistinguishable from the failure being measured — and that risk is not
-    hypothetical: SGLang's gateway is a fork of the same codebase as
-    vllm-router, and its counters turned out to be prefixed `smg_` where
-    vllm-router uses `vllm_router_`. Shared ancestry predicted nothing.
-    """
-
-    prefill_requests: Optional[str] = None
-    decode_requests: Optional[str] = None
-
-    worker_label: str = "worker"
-    """Label carrying the peer the request was dispatched to. Measured, its
-    value is the whole peer URL the router was launched with
-    (``http://192.168.50.15:40005``) rather than a worker name or id, so a
-    member is matched on host:port and not on the whole string."""
-
-    port_band: Optional[str] = None
-    """Named port band the exposition is served on. None means the router's
-    own HTTP port.
-
-    Not the same port for vllm-router: its API and its Prometheus endpoint
-    are separate listeners, and the second one is a band GPUStack allocates
-    because upstream's default (29000) is fixed and two routers on a host
-    would collide. Scraping the API port instead returns 404, which reads as
-    "no denominator" — a check that silently stops working."""
-
-    total_requests: Optional[str] = None
-    """Group-level request counter, aggregated by route instead of by peer.
-    The fallback denominator: coarser, but it still answers "did the router
-    route anything at all", which is the question a ratio of zero is
-    meaningless without."""
-
-    @property
-    def available(self) -> bool:
-        return bool(
-            self.prefill_requests or self.decode_requests or self.total_requests
-        )
-
-
 class PDMembershipAPI(BaseModel):
     """How a router is told its peer list changed, without restarting it.
 
@@ -559,7 +459,6 @@ class PDRouter(BaseModel):
 
     peers: Optional[PDRouterPeers] = None
     capabilities: PDRouterCapabilities = PDRouterCapabilities()
-    request_metrics: PDRouterRequestMetrics = PDRouterRequestMetrics()
     membership_api: PDMembershipAPI = PDMembershipAPI()
 
     @property
@@ -589,14 +488,6 @@ class PDRouter(BaseModel):
 
     @model_validator(mode="after")
     def check_user_provided(self) -> "PDRouter":
-        if self.request_metrics.available and not self.capabilities.metrics:
-            # Two spellings of one fact, the same trap `kv_expired_metric`
-            # guards: a name declared behind `metrics: false` would be
-            # scraped from an endpoint that does not exist.
-            raise ValueError(
-                "router declares request metric names but capabilities.metrics "
-                "is false, so nothing would ever scrape them"
-            )
         user_provided = self.protocol == PDRouterProtocolEnum.USER_PROVIDED
         if user_provided and (self.command or self.image or self.ports):
             raise ValueError(

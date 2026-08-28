@@ -129,106 +129,51 @@ kv_leases:
 # prefill's nixl_xfer_time_seconds_count stayed 0.0 while decode's went to
 # 1.0. Read the prefill side and a perfectly healthy pair reports "no KV
 # ever moved", which is precisely the alarm this metric exists to raise.
+# Which side of a pair owns the KV transfer counters, and whether it has any.
+#
+# 🔴 The metric NAMES were here until 2026-08-28 and are now in
+# `metrics_config.yaml`, where the worker's aggregator normalizes every
+# engine's spelling AND its units onto one set of `gpustack:pd_*` names.
+# Two copies meant two files per rename, and after the move nothing read this
+# one -- a declaration that looked authoritative and changed nothing.
+#
+# What is left is semantics, which normalization cannot absorb.
 kv_transfer_metrics:
+  # NIXL PULLS: decode reads from prefill, so decode counts. Measured on a
+  # working 1P1D -- prefill's transfer count stayed at 0.0 for the whole run.
   - connector: nixl
     read_from_role: decode
-    # Spelled as they appear in the exposition: xfer_time_seconds is a
-    # histogram, so _count / _sum are its samples, and num_failed_transfers
-    # is a counter, so the exposition suffixes it _total.
-    xfer_count: "vllm:nixl_xfer_time_seconds_count"
-    xfer_seconds: "vllm:nixl_xfer_time_seconds_sum"
-    # No byte counter in the measured record, so the degradation check runs
-    # on transfers-per-second-of-transfer-time instead of true bandwidth.
-    # That is a rate in a different unit, which is exactly why it is only
-    # ever compared against the same group's own baseline.
-    xfer_bytes: null
-    failed_transfers: "vllm:nixl_num_failed_transfers_total"
-    min_expected_rate: null
+
+  # 🔴 vLLM's mooncake/stats.py exports ZERO Prometheus counters where NIXL
+  # exports fifteen. So PD effectiveness is not decidable from metrics on this
+  # connector at all, and the diagnostic path is log scanning (X2 3.6).
+  # Declaring that beats a ratio that reads zero because the counter was never
+  # there -- which is indistinguishable from the failure it should catch.
   - connector: mooncake
-    # vllm's mooncake/stats.py exports zero Prometheus counters where NIXL
-    # exports fifteen. Nothing to scrape; the diagnostic path for this
-    # connector is log scanning (X2 §3.3).
     read_from_role: decode
-    xfer_count: null
-    xfer_seconds: null
-    xfer_bytes: null
-    failed_transfers: null
+    observable: false
+
   - connector: moriio
     read_from_role: decode
-    xfer_count: null
-    xfer_seconds: null
-    xfer_bytes: null
-    failed_transfers: null
+    observable: false
+
+  # 🔴 SGLang PUSHES, so PREFILL counts -- the opposite of NIXL, and not a
+  # slip. The router same-dispatches to both roles, decode allocates its
+  # receive slots and registers them through prefill's bootstrap service, and
+  # prefill then writes into them. The metric families say it harder than the
+  # docs do: `kv_transfer_total_mb`, `kv_transfer_speed_gb_s` and
+  # `kv_transfer_latency_ms` exist ONLY on prefill, because the sender is the
+  # side that knows how many bytes went and how fast. Decode gets only
+  # `kv_transfer_bootstrap_ms` and `kv_transfer_alloc_ms` -- handshake and
+  # buffer allocation, which is all a receiver does here.
+  #
+  # ⚠️ Read the wrong side and a healthy pair reports "no KV ever moved": the
+  # exact alarm this exists to raise, fired at a deployment that is fine.
   - connector: sglang-mooncake
-    # 🔴 Reads PREFILL, and that is not a slip. SGLang is the one connector
-    # here that PUSHES: the router same-dispatches to both roles, decode
-    # allocates its receive slots and registers them through prefill's
-    # bootstrap service, and prefill then writes into them. The stage names
-    # say it in the voice they are written in —
-    #   prefill: prefill_bootstrap -> prefill_forward -> prefill_transfer_kv_cache
-    #   decode:  decode_prepare -> decode_bootstrap -> decode_waiting -> decode_transferred
-    # active on one side, passive on the other. The metric families say it
-    # harder: `kv_transfer_total_mb`, `kv_transfer_speed_gb_s` and
-    # `kv_transfer_latency_ms` exist ONLY on prefill, because the sender is
-    # the side that knows how many bytes went and how fast. Decode gets only
-    # `kv_transfer_bootstrap_ms` and `kv_transfer_alloc_ms` — handshake and
-    # buffer allocation, which is all a receiver does here.
-    #
-    # 🔴 What this replaced, and why, measured 2026-08-26 on a live 1P1D
-    # (SGLang, Qwen3-0.6B, 192.168.50.15): the previous declaration counted
-    # `per_stage_req_latency_seconds_count{stage="decode_transferred"}`, and
-    # that counter ADVANCES ON AN IDLE GROUP. Over 90 seconds with zero
-    # business requests it went 24 -> 25 -> 26 (roughly +1 per 45s) while
-    # `num_requests_total` stayed at 4 — health probing and SGLang's own
-    # synthetic requests traverse the disaggregation path and land in the
-    # stage histogram. Cumulatively it read 26 transfers against 3 routed
-    # requests, a ratio near 9 where a healthy one is near 1.
-    #
-    # That is not a cosmetic error. `_judge_effectiveness` calls a group
-    # AGGREGATED only when the ratio stops being positive; a numerator that
-    # ticks on its own can never stop being positive, so the one failure
-    # this whole mechanism exists to catch — silent degradation to
-    # aggregated serving — would have been masked forever. The counter below
-    # was measured in the same window and did NOT move (3 -> 3 -> 3): it
-    # only advances when bytes actually cross, so probes that transfer
-    # nothing do not count.
-    #
-    # The earlier "both sides advanced by exactly the request count, 7 -> 12
-    # over a burst of 5" was measured under a burst, where real traffic
-    # swamps a +1-per-45s background. Bursts cannot see this class of fault;
-    # only an idle window can.
     read_from_role: prefill
-    xfer_count: "sglang:kv_transfer_total_mb_count"
-    # Deliberately null despite the counters existing. `kv_transfer_latency_ms`
-    # is milliseconds and `kv_transfer_total_mb` is megabytes, while these
-    # two fields are named — and consumed as — seconds and bytes. Feeding
-    # them mismatched units would make `_rate` report MB/ms while labelling
-    # it BYTES_PER_SECOND: self-consistent against its own baseline, and a
-    # lie to anyone who reads the unit. Declaring a unit is a schema change,
-    # not a bugfix, so the throughput arm stays off until it happens. Nothing
-    # regresses — the arm it turns off was running on the polluted counter
-    # and measuring probe cadence, not transfer throughput.
-    xfer_seconds: null
-    xfer_bytes: null
-    failed_transfers: null
+
   - connector: sglang-nixl
-    # Same declaration as sglang-mooncake above, and the reasoning there
-    # applies verbatim: SGLang's disaggregation layer decides the direction
-    # and the counters, and the transfer backend underneath it does not.
-    #
-    # ⚠️ Inferred, not measured. The idle-drift measurement was taken on the
-    # mooncake backend; this path had no live group to check. Changed anyway,
-    # because the two possible outcomes are not symmetric: if
-    # `kv_transfer_total_mb_count` turns out not to exist on this backend the
-    # verdict degrades to UNMEASURABLE — "we cannot tell", which is true —
-    # whereas keeping the stage counter degrades to EFFECTIVE, which is a
-    # lie that hides the exact failure the check exists for. Verifying this
-    # on a live sglang-nixl group is on the list.
     read_from_role: prefill
-    xfer_count: "sglang:kv_transfer_total_mb_count"
-    xfer_seconds: null
-    xfer_bytes: null
-    failed_transfers: null
 
 modes:
   - name: vllm-nixl
@@ -395,8 +340,28 @@ modes:
         # `policy_decisions_total` (32) — eight requests decided upon and
         # never dispatched, because the worker had been ejected. Now every
         # one of the seven matches: policy decisions 7, prefill 7, decode 7.
+        # 🔴 Was "2", raised to upstream's own default after a live failure
+        # (2026-08-28, SGLang 1P1D). Under GPU contention a handful of
+        # requests timed out; at threshold 2 that opened the prefill circuit,
+        # and it never closed again — every later request was fast-failed in
+        # ~0.17s with `No available prefill workers (all circuits open or
+        # unhealthy)`, while the router's own `smg_worker_health` for that
+        # worker stayed at 1 and the engine answered `/health` 200 the whole
+        # time. Still 503 after 90 seconds of silence, well past the 60s
+        # half-open timer.
+        #
+        # The group was down and *nothing else in the product said so*: all
+        # three instances RUNNING, the model `state: running`. The only signal
+        # was the PD-effectiveness ratio going `suspect`, which is the check
+        # working, but the cause was our own setting.
+        #
+        # ⚠️ The deeper problem this does not fix: with a single replica per
+        # role there is no worker to fail over to, so an open circuit is never
+        # failover — it converts "slow" into "dead". Upstream has
+        # `--disable-circuit-breaker`; whether to use it per-role is
+        # open-questions F20.
         - --cb-failure-threshold
-        - "2"
+        - "10"
         - --retry-max-retries
         - "3"
       peers:
@@ -410,41 +375,45 @@ modes:
         # are per-worker, which is the shape the PD-effectiveness ratio
         # needs; the engine side exports the KV-expiry counter.
         kv_expired_metric: true
-      # The ratio's denominator, and the reason GPUStack counts nothing
-      # itself. Per-worker: a group-wide ratio only says something is
-      # wrong, this one says which decode stopped pulling. Verified to
-      # carry values on a 1P1D run.
-      request_metrics:
-        prefill_requests: vllm_router_pd_prefill_requests_total
-        decode_requests: vllm_router_pd_decode_requests_total
-        # Measured: the label's value is the whole peer URL the router was
-        # launched with — worker="http://192.168.50.15:40005" — not a worker
-        # name or id, so a member is matched on host:port.
-        worker_label: worker
-        # The exposition is a separate listener from the API: it lives on
-        # the band above, not on {{port}}. Scraping the API port returns
-        # 404, and a 404 reads as "no denominator" — the check would stop
-        # working without ever saying so.
-        port_band: prometheus
-        # Aggregated by route rather than by peer. Coarser, and the right
-        # denominator when no member matches its label: it still answers
-        # "did the router route anything at all", which is the question a
-        # ratio of zero has to be read against.
-        total_requests: vllm_router_pd_requests_total
       # 🆕 Capability 7. Scale-out without restarting the router — and the
       # reason it is worth a schema at all is that this router is a single
       # replica and the gateway's only upstream, so re-rendering peers and
       # restarting it takes the whole group offline for the restart. Every
       # ratio change would cost one outage.
       #
-      # ⚠️ Read from upstream source, NOT measured (open-questions F12). The
-      # single-router path drops `worker_type` before the PD router sees it and
-      # then returns a hardcoded "requires specific add_prefill_server or
-      # add_decode_server methods"; `--enable-igw` routes the call through the
-      # manager that dispatches on that field. That flag is what `requires_args`
-      # names, and the recipe's `command` above does NOT carry it yet — so a
-      # consumer must read a failed call as "fall back to restart", never as
-      # "the group is broken".
+      # 🟢 MEASURED 2026-08-28 on a live 1P1D, replacing "read from upstream
+      # source, not measured" (open-questions F12). All four checks passed:
+      #
+      #   without --enable-igw  POST /workers -> 400 "PD router requires
+      #                         specific add_prefill_server or
+      #                         add_decode_server methods"   (the source
+      #                         reading was right: worker_type is dropped
+      #                         before the PD router sees it)
+      #   with    --enable-igw  POST /workers -> 200, worker_type dispatched,
+      #                         GET /workers shows prefill=1 decode=1
+      #   traffic               a real two-hop /v1/chat/completions through the
+      #                         dynamically-added pair -> 200
+      #   removal               DELETE /workers/{url} -> 200, the member leaves
+      #                         the registry
+      #   metric names          vllm_router_pd_{prefill,decode}_requests_total
+      #                         and pd_requests_total UNCHANGED under igw, with
+      #                         the same `worker` label -- so the effectiveness
+      #                         ratio's denominator survives the flag
+      #
+      # 🔴 **The flag is NOT backward compatible, and this is the finding that
+      # matters most.** Under igw the peers passed on the COMMAND LINE never
+      # enter the registry ("Router ready | workers: []"), and a request then
+      # gets 503 "No available workers (all circuits open or unhealthy)".
+      # Measured directly: same flags, same running 1P1D, no API call -> 503;
+      # after two POST /workers -> 200 and a real two-hop completion.
+      #
+      # So membership stops being an optimisation and becomes the ONLY way in.
+      # Turning the flag on without a consumer that registers every member at
+      # group formation does not lose "scale without restart" — it loses the
+      # group. That is why `requires_args` names the flag while the recipe's
+      # `command` deliberately does not carry it: the declaration records what
+      # upstream needs, and flipping it is a change to the group's startup
+      # contract, not a config tweak.
       membership_api:
         add: POST /workers
         remove: DELETE /workers/{url}
@@ -549,8 +518,28 @@ modes:
         # spent learning what two would have taught it, and that is as true
         # here as there. See the vllm-nixl recipe for why the health check
         # is deliberately left alone.
+        # 🔴 Was "2", raised to upstream's own default after a live failure
+        # (2026-08-28, SGLang 1P1D). Under GPU contention a handful of
+        # requests timed out; at threshold 2 that opened the prefill circuit,
+        # and it never closed again — every later request was fast-failed in
+        # ~0.17s with `No available prefill workers (all circuits open or
+        # unhealthy)`, while the router's own `smg_worker_health` for that
+        # worker stayed at 1 and the engine answered `/health` 200 the whole
+        # time. Still 503 after 90 seconds of silence, well past the 60s
+        # half-open timer.
+        #
+        # The group was down and *nothing else in the product said so*: all
+        # three instances RUNNING, the model `state: running`. The only signal
+        # was the PD-effectiveness ratio going `suspect`, which is the check
+        # working, but the cause was our own setting.
+        #
+        # ⚠️ The deeper problem this does not fix: with a single replica per
+        # role there is no worker to fail over to, so an open circuit is never
+        # failover — it converts "slow" into "dead". Upstream has
+        # `--disable-circuit-breaker`; whether to use it per-role is
+        # open-questions F20.
         - --cb-failure-threshold
-        - "2"
+        - "10"
         - --retry-max-retries
         - "3"
       peers:
@@ -567,21 +556,6 @@ modes:
         models_endpoint: true
         # SGLang's Mooncake path exports no KV-expiry counter.
         kv_expired_metric: false
-      # 🟢 Measured 2026-08-25, replacing "never measured on this side". The
-      # names are NOT vllm-router's despite the shared ancestry — this gateway
-      # prefixes `smg_` and vllm-router `vllm_router_`, so the guess the
-      # comment refused to make would indeed have read zero.
-      #
-      # Per-worker is `smg_worker_cb_outcomes_total`, whose `worker` label
-      # carries the whole peer URL the router was launched with, which is the
-      # shape `worker_label` already expects. It counts circuit-breaker
-      # outcomes rather than dispatches — the closest per-worker series this
-      # router exports — so the group total below is the reliable denominator
-      # and the per-worker split is the hint.
-      request_metrics:
-        total_requests: "smg_router_requests_total"
-        worker_label: worker
-        port_band: prometheus
       # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
       # fork this catalog's vLLM router descends from and it does serve
       # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
@@ -682,8 +656,28 @@ modes:
         # spent learning what two would have taught it, and that is as true
         # here as there. See the vllm-nixl recipe for why the health check
         # is deliberately left alone.
+        # 🔴 Was "2", raised to upstream's own default after a live failure
+        # (2026-08-28, SGLang 1P1D). Under GPU contention a handful of
+        # requests timed out; at threshold 2 that opened the prefill circuit,
+        # and it never closed again — every later request was fast-failed in
+        # ~0.17s with `No available prefill workers (all circuits open or
+        # unhealthy)`, while the router's own `smg_worker_health` for that
+        # worker stayed at 1 and the engine answered `/health` 200 the whole
+        # time. Still 503 after 90 seconds of silence, well past the 60s
+        # half-open timer.
+        #
+        # The group was down and *nothing else in the product said so*: all
+        # three instances RUNNING, the model `state: running`. The only signal
+        # was the PD-effectiveness ratio going `suspect`, which is the check
+        # working, but the cause was our own setting.
+        #
+        # ⚠️ The deeper problem this does not fix: with a single replica per
+        # role there is no worker to fail over to, so an open circuit is never
+        # failover — it converts "slow" into "dead". Upstream has
+        # `--disable-circuit-breaker`; whether to use it per-role is
+        # open-questions F20.
         - --cb-failure-threshold
-        - "2"
+        - "10"
         - --retry-max-retries
         - "3"
       peers:
@@ -697,21 +691,6 @@ modes:
         metrics: true
         models_endpoint: true
         kv_expired_metric: false
-      # 🟢 Measured 2026-08-25, replacing "never measured on this side". The
-      # names are NOT vllm-router's despite the shared ancestry — this gateway
-      # prefixes `smg_` and vllm-router `vllm_router_`, so the guess the
-      # comment refused to make would indeed have read zero.
-      #
-      # Per-worker is `smg_worker_cb_outcomes_total`, whose `worker` label
-      # carries the whole peer URL the router was launched with, which is the
-      # shape `worker_label` already expects. It counts circuit-breaker
-      # outcomes rather than dispatches — the closest per-worker series this
-      # router exports — so the group total below is the reliable denominator
-      # and the per-worker split is the hint.
-      request_metrics:
-        total_requests: "smg_router_requests_total"
-        worker_label: worker
-        port_band: prometheus
       # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
       # fork this catalog's vLLM router descends from and it does serve
       # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
@@ -848,8 +827,28 @@ modes:
         # costs ten users what two would have taught it. Everything else is
         # left to the router's own defaults, the health check above all — see
         # the vllm-nixl recipe for why.
+        # 🔴 Was "2", raised to upstream's own default after a live failure
+        # (2026-08-28, SGLang 1P1D). Under GPU contention a handful of
+        # requests timed out; at threshold 2 that opened the prefill circuit,
+        # and it never closed again — every later request was fast-failed in
+        # ~0.17s with `No available prefill workers (all circuits open or
+        # unhealthy)`, while the router's own `smg_worker_health` for that
+        # worker stayed at 1 and the engine answered `/health` 200 the whole
+        # time. Still 503 after 90 seconds of silence, well past the 60s
+        # half-open timer.
+        #
+        # The group was down and *nothing else in the product said so*: all
+        # three instances RUNNING, the model `state: running`. The only signal
+        # was the PD-effectiveness ratio going `suspect`, which is the check
+        # working, but the cause was our own setting.
+        #
+        # ⚠️ The deeper problem this does not fix: with a single replica per
+        # role there is no worker to fail over to, so an open circuit is never
+        # failover — it converts "slow" into "dead". Upstream has
+        # `--disable-circuit-breaker`; whether to use it per-role is
+        # open-questions F20.
         - --cb-failure-threshold
-        - "2"
+        - "10"
         - --retry-max-retries
         - "3"
       ports:
@@ -874,16 +873,6 @@ modes:
         # only in the engine log. A router with metrics does not conjure an
         # engine-side counter that was never written.
         kv_expired_metric: false
-      request_metrics:
-        # The same binary as the vLLM recipe, so the same counter names — and
-        # measured here too, on 910B2 through a real prefill-decode pair:
-        # pd_prefill_requests_total and pd_decode_requests_total both went 0
-        # to 1 to 2 across two requests, and pd_requests_total tracked them.
-        prefill_requests: vllm_router_pd_prefill_requests_total
-        decode_requests: vllm_router_pd_decode_requests_total
-        worker_label: worker
-        port_band: prometheus
-        total_requests: vllm_router_pd_requests_total
       # 🆕 Capability 7. Scale-out without restarting the router — and the
       # reason it is worth a schema at all is that this router is a single
       # replica and the gateway's only upstream, so re-rendering peers and

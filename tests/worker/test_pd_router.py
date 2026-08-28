@@ -105,13 +105,26 @@ ROUTER_MODES = ["vllm-nixl", "sglang-mooncake", "sglang-nixl"]
 
 @pytest.mark.parametrize("mode", ROUTER_MODES)
 def test_the_breaker_is_what_carries_fast_failure_detection(mode):
-    """Upstream opens the circuit breaker after ten failures, which is ten
-    users' requests spent learning what two would have taught it. This is the
-    fast path — it runs on the request path and sees a dead worker at real
-    traffic rate — so it is the one value worth overriding."""
+    """🔴 This asserted "2", on the reasoning that ten failures is "ten users'
+    requests spent learning what two would have taught it". A live run taught
+    the other half of it (2026-08-28, SGLang 1P1D): under GPU contention a
+    handful of timeouts opened the prefill circuit at threshold 2, and it never
+    closed — every later request fast-failed in ~0.17s with "all circuits open
+    or unhealthy", while the router's own health gauge for that worker read 1
+    and the engine answered /health 200. Still 503 after 90s of silence, past
+    the 60s half-open timer.
+
+    So the breaker is still the fast path and still the right mechanism; the
+    value was wrong. What two failures buy in detection latency they can cost
+    as an unrecoverable outage, and with one replica per role there is nothing
+    to fail over to — an open circuit is not failover, it is the outage.
+
+    `--retry-max-retries` is unchanged: retries are bounded work on the request
+    path and have no latching state to get stuck in.
+    """
     command = render_router(get_pd_mode(mode), VARIABLES, PEERS).command
 
-    assert command[command.index("--cb-failure-threshold") + 1] == "2"
+    assert command[command.index("--cb-failure-threshold") + 1] == "10"
     assert command[command.index("--retry-max-retries") + 1] == "3"
 
 

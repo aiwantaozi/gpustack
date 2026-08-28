@@ -703,17 +703,12 @@ class DegradationReasonEnum(str, Enum):
     """
 
     CACHE_NOT_INJECTED = "cache_not_injected"
-    BANDWIDTH_DEGRADED = "bandwidth_degraded"
-    PD_INEFFECTIVE = "pd_ineffective"
-    """The group is serving without transferring any KV — disaggregation has
-    silently collapsed into aggregated serving.
-
-    Kept apart from `bandwidth_degraded` because the two are different
-    failures with different fixes: slower-than-baseline transfer is a
-    transport problem, no transfer at all is a pairing that never formed. A
-    single marker would send an operator looking at the network for a
-    connector that was never wired up."""
-
+    # `bandwidth_degraded` and `pd_ineffective` used to live here, written by
+    # an in-process observer that scraped the engines itself. Both are now
+    # answered by `GET /models/{id}/pd-metrics`, which reads the same counters
+    # out of Prometheus — where the worker's aggregator has already put them,
+    # labelled and over a network path that handles tunnelled hosts. A marker
+    # on the row would be a second, staler copy of that answer.
     RATIO_UNMET = "ratio_unmet"
     NO_ATOMIC_ADMISSION = "no_atomic_admission"
 

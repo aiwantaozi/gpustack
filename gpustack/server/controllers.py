@@ -90,7 +90,6 @@ from gpustack.schemas.cache_services import (
 )
 from gpustack.server.cache_provider_catalog import get_cache_provider
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
-from gpustack.server.pd_observability import get_pd_observation
 from gpustack.server.workload_namespace import (
     WorkloadNamespaceEnsurer,
     placement_drifted,
@@ -2187,34 +2186,6 @@ def derive_model_state(
     return ModelStateEnum.RUNNING, None
 
 
-def _apply_pd_observation(
-    model: Model, reasons: List[str], state_message: Optional[str]
-) -> Optional[str]:
-    """Fold the PD observer's latest verdict into this pass's degradations.
-
-    The verdict is computed elsewhere and only its *conclusion* is persisted
-    here. It has to be: the ratio and the transfer rate come from counters
-    scraped off decode's and the router's Prometheus endpoints, which a scan
-    of the instance rows cannot see, while the marker an operator acts on
-    belongs on the row with the other four. Keeping the write here is what
-    keeps `sync_model_status` the single writer of the status fields (D26).
-
-    A model with no observation is left alone rather than cleared: the
-    observer runs on the leader and may not have completed a window yet, and
-    treating "not measured" as "not degraded" would flap the marker on every
-    failover.
-    """
-    observation = get_pd_observation(model.id)
-    if observation is None:
-        return state_message
-    for reason in observation.degradations:
-        if reason not in reasons:
-            reasons.append(reason)
-    if not observation.message:
-        return state_message
-    return "; ".join(m for m in (state_message, observation.message) if m) or None
-
-
 async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     """
     Synchronize the model's server-owned status from its instances.
@@ -2303,8 +2274,6 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         if cache_reason:
             detail = f"{detail}: {cache_reason}"
         state_message = "; ".join(m for m in (state_message, detail) if m) or None
-
-    state_message = _apply_pd_observation(model, reasons, state_message)
 
     if instances and placement_drifted(
         instances,

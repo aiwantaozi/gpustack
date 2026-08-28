@@ -99,6 +99,9 @@ from gpustack.routes.model_common import (
     model_state_stream_filter,
 )
 from gpustack.config.config import get_global_config
+from gpustack.server.pd_metrics import PDMetricsPublic, collect_pd_metrics
+from gpustack.server.pd_mode_catalog import get_pd_mode
+from gpustack.server.prometheus_query import parse_window
 from gpustack.utils.grafana import resolve_grafana_base_url
 from gpustack.utils.lora_model_source import lora_route_name_for
 
@@ -244,6 +247,43 @@ async def get_model(
     public = ModelPublic.model_validate(model)
     public.has_stale_lora_instances = is_lora_list_stale(model)
     return public
+
+
+@router.get("/{id}/pd-metrics", response_model=PDMetricsPublic)
+async def get_model_pd_metrics(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    window: str = "15m",
+):
+    """Whether this disaggregated group is actually disaggregating.
+
+    The one signal that separates "PD is working" from "PD has silently
+    collapsed to aggregated serving" — a failure that returns correct answers,
+    logs nothing, and leaves every instance RUNNING.
+
+    Read from Prometheus rather than from a column: the engines and the router
+    already export the counters, the worker's aggregator already normalizes
+    and labels them, and Prometheus already scrapes the worker over a path
+    that handles tunnelled hosts. The label selector is injected server-side,
+    so a caller only ever reads the series of a model it can already see.
+    """
+    model = await _get_model(session=session, ctx=ctx, id=id)
+    if not model.disaggregation:
+        raise BadRequestException(message="This deployment is not disaggregated")
+    try:
+        window_seconds = parse_window(window)
+    except ValueError as e:
+        raise BadRequestException(message=str(e))
+
+    mode_name = getattr(model.disaggregation.mode, "value", None) or str(
+        model.disaggregation.mode
+    )
+    return await collect_pd_metrics(
+        model_id=model.id,
+        mode=get_pd_mode(mode_name),
+        window_seconds=window_seconds,
+    )
 
 
 @router.get("/{id}/dashboard")

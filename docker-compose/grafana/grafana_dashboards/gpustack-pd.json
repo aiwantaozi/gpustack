@@ -1,0 +1,1272 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        },
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Prefill/decode disaggregation. Everything here is specific to a PD deployment -- for a single-role model the panels are empty by construction, which is why this is its own dashboard rather than rows on the model dashboard.\n\nRoles carry a real `role` label from the worker's metrics aggregator, not a pod-name regex, so nothing here breaks when instance naming changes or when an engine's role is not in its pod name.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 101,
+      "panels": [],
+      "title": "Is disaggregation actually happening",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 102,
+      "type": "stat",
+      "title": "KV Transfers per Request",
+      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 103,
+      "type": "stat",
+      "title": "Requests Routed",
+      "description": "Counted at the router, which is the only place a request is counted ONCE. Engine-side request counters double under PD: every request traverses both roles, so summing them across the group reports twice the traffic.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 104,
+      "type": "stat",
+      "title": "KV Transfers",
+      "description": "Read on $counted_role only. Which role counts is a property of the connector, not a choice: NIXL has decode PULL so decode counts, SGLang has prefill PUSH so prefill counts, and a healthy pair reports zero on the other side.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 105,
+      "type": "stat",
+      "title": "Failed Transfers",
+      "description": "Cumulative. Any nonzero value is transfers that actually failed.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}) or vector(0)",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 106,
+      "type": "timeseries",
+      "title": "KV Transfers per Request over time",
+      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "transfers / request",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 107,
+      "type": "timeseries",
+      "title": "Requests Dispatched by Role",
+      "description": "Per-worker dispatch counts from the router. The two lines diverging means requests are reaching one role and not the other.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(gpustack:pd_router_prefill_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "prefill",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(gpustack:pd_router_decode_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "decode",
+          "range": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "id": 108,
+      "panels": [],
+      "title": "KV transfer: how fast, how big, and is any of it lost",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 109,
+      "type": "stat",
+      "title": "KV Transfer Throughput",
+      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Do not compare this to your link's nameplate speed. Measured effective bandwidth is 94% of line rate on 2.5GbE and ~9% on a 200G RoCE link, so a nameplate denominator calls one of those two broken. Compare it to this group's own history instead.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 110,
+      "type": "stat",
+      "title": "Bytes per Transfer",
+      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 111,
+      "type": "stat",
+      "title": "KV Transfer p99",
+      "description": "The tail is where a degrading path shows up first, and where a mean is guaranteed to hide it.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gpustack:pd_kv_transfer_seconds_bucket{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 112,
+      "type": "stat",
+      "title": "KV Leases Expired",
+      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\nAbsent (no data) rather than zero on connectors that export no such counter -- Mooncake exports none, and '0 expired' there would be a claim we cannot make.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}) or vector(0)",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 113,
+      "type": "timeseries",
+      "title": "KV Transfer Duration Percentiles",
+      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(gpustack:pd_kv_transfer_seconds_bucket{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gpustack:pd_kv_transfer_seconds_bucket{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gpustack:pd_kv_transfer_seconds_bucket{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 114,
+      "type": "timeseries",
+      "title": "KV Transfer Throughput over time",
+      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval]))",
+          "legendFormat": "throughput",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "id": 115,
+      "panels": [],
+      "title": "Balance: is the prefill:decode ratio right",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 116,
+      "type": "timeseries",
+      "title": "Queue Depth by Role",
+      "description": "🔑 The only objective signal for whether the ratio is right, and which way it is wrong: a queue that only ever builds on one side is that side asking for more replicas.\n\nRead the SHAPE, not the value -- a queue that drains is healthy at any depth.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "avg by (role) (gpustack:num_requests_waiting{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 117,
+      "type": "timeseries",
+      "title": "Requests In Flight by Role",
+      "description": "Concurrency actually achieved per role.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (role) (gpustack:num_requests_running{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 118,
+      "type": "timeseries",
+      "title": "Time To First Token by Role",
+      "description": "🔑 TTFT belongs to PREFILL -- that is what a user waited for. Decode's TTFT is the time from its own first forward pass and is not comparable.\n\nThis is why the two are charted apart rather than averaged: a figure across both roles describes neither, which is the premise of running PD at all.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (role) (increase(gpustack:time_to_first_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_to_first_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 119,
+      "type": "timeseries",
+      "title": "Time Per Output Token by Role",
+      "description": "🔑 TPOT belongs to DECODE. Prefill emits one token and then hands over, so its inter-token latency is not a steady-state figure.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (role) (increase(gpustack:time_per_output_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_per_output_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "preload": false,
+  "refresh": "30s",
+  "schemaVersion": 42,
+  "tags": [
+    "gpustack",
+    "pd"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "label": "Datasource",
+        "hide": 0,
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "multi": false,
+        "includeAll": false,
+        "refresh": 1
+      },
+      {
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "definition": "query_result(max by(cluster_id, cluster_name, provider) (gpustack:cluster_info) and on(cluster_id) gpustack:worker_info)",
+        "label": "Cluster",
+        "name": "cluster_name",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "query_result(max by(cluster_id, cluster_name, provider) (gpustack:cluster_info) and on(cluster_id) gpustack:worker_info)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "/cluster_name=\"([^\"]+)\"/",
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "definition": "query_result(max by(cluster_id, cluster_name, model_id, model_name, runtime, runtime_version, source, source_key, category) (gpustack:model_info{cluster_name=\"$cluster_name\"}))",
+        "label": "Model",
+        "name": "model_name",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "query_result(max by(cluster_id, cluster_name, model_id, model_name, runtime, runtime_version, source, source_key, category) (gpustack:model_info{cluster_name=\"$cluster_name\"}))",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "/model_name=\"([^\"]+)\"/",
+        "type": "query"
+      },
+      {
+        "name": "counted_role",
+        "label": "KV counted on",
+        "type": "custom",
+        "description": "Which role's transfer counter is authoritative. A property of the connector, not a preference: NIXL has decode PULL so decode counts; SGLang has prefill PUSH so prefill counts. Set this wrong and a perfectly healthy pair reads as zero transfers.",
+        "query": "decode,prefill",
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "selected": true,
+          "text": "decode",
+          "value": "decode"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "decode",
+            "value": "decode"
+          },
+          {
+            "selected": false,
+            "text": "prefill",
+            "value": "prefill"
+          }
+        ]
+      },
+      {
+        "name": "role",
+        "label": "Roles",
+        "type": "custom",
+        "description": "Which roles the per-role panels show.",
+        "query": "prefill|decode|router",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          {
+            "selected": false,
+            "text": "prefill",
+            "value": "prefill"
+          },
+          {
+            "selected": false,
+            "text": "decode",
+            "value": "decode"
+          },
+          {
+            "selected": false,
+            "text": "router",
+            "value": "router"
+          }
+        ]
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "GPUStack PD Disaggregation",
+  "uid": "gpustack-pd",
+  "version": 1
+}

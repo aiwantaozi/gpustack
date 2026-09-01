@@ -79,6 +79,33 @@ class PDRoleMetrics(BaseModel):
     time_per_output_token_seconds: Optional[float] = None
     """Mean inter-token latency. Owned by decode."""
 
+    prompt_tokens: Optional[float] = None
+    """Prefill tokens the role processed in the window.
+
+    Per role because a request increments this on both of them, so a group-wide
+    sum is exactly twice the traffic — and twice a token rate still reads as a
+    plausible token rate."""
+
+    cached_prompt_tokens: Optional[float] = None
+    """Of those, the ones served from cache — local HBM prefix cache and the
+    shared cache service together. Both engines report the sum: vLLM documents
+    its counter as "local + external", SGLang's carries a `cache_source` label
+    that the aggregator collapses."""
+
+    cache_missed_prompt_tokens_per_second: Optional[float] = None
+    """`(prompt_tokens - cached_prompt_tokens) / window` — the tokens prefill
+    actually had to compute.
+
+    🔑 On prefill this is the throughput signal to scale on, and raw
+    `prompt_tokens` is not: prefill is only compute-bound for tokens it
+    computed, so a high hit rate makes the raw figure overstate the work by
+    whatever share came from cache. ByteDance's HeteroScale rejected raw prefill
+    TPS for this reason and kept only "KV cache missed prefill TPS".
+
+    Null — not the raw rate — when the cached counter is missing, because
+    falling back to the raw rate would reintroduce exactly the overstatement
+    this figure exists to remove, and would do it silently."""
+
 
 class PDKVTransferMetrics(BaseModel):
     """The KV transfer itself: is it happening, how fast, and is any of it
@@ -137,10 +164,13 @@ class PDMetricsPublic(BaseModel):
       crossing. Disaggregation has silently collapsed: the deployment still
       answers correctly, logs nothing and shows every instance running, so
       this is the only place that failure is visible.
-    - `idle` — nothing was routed. Not a degradation; a model nobody calls
-      transfers nothing.
-    - `unmeasurable` — no denominator exists, so idle and aggregated cannot be
-      told apart. Deliberately not reported as either.
+    - `idle` — nothing was routed and nothing crossed. Not a degradation; a
+      model nobody calls transfers nothing.
+    - `unmeasurable` — the window cannot be judged. Either no denominator
+      exists at all, or the two counters disagree about it: a zero denominator
+      against a non-zero numerator means KV demonstrably crossed, so the group
+      is not idle and the router counter simply has not been scraped yet.
+      Deliberately not reported as `idle` or `aggregated`.
     """
 
     kv_transfers_per_request: Optional[float] = None
@@ -194,14 +224,23 @@ def judge(transfers: Optional[float], requests: Optional[float]) -> str:
     - no denominator at all -> `unmeasurable`. An idle group and one that has
       degraded to aggregated serving are indistinguishable without knowing
       whether anything was routed, so this must not be reported as either.
-    - nothing routed -> `idle`. A model nobody called transfers nothing; that
-      is not a degradation.
+    - nothing routed *and* nothing transferred -> `idle`. A model nobody called
+      transfers nothing; that is not a degradation.
     - routed, but effectively no transfers -> `aggregated`. The alarm.
+
+    🔑 `idle` is a positive claim — "nobody called this group" — so it is only
+    made when the numerator agrees. A zero denominator against a non-zero
+    numerator is not an idle group: KV demonstrably crossed, so something was
+    called and the two counters simply disagree about the window. That happens
+    on a group whose first requests have landed but whose router counter has
+    not been scraped yet, and reporting it as `idle` would state the one thing
+    the data has already ruled out — and stop the reader from looking further.
+    `unmeasurable` is the honest answer: the window cannot be judged.
     """
     if requests is None or transfers is None:
         return "unmeasurable"
     if requests <= 0:
-        return "idle"
+        return "idle" if transfers <= 0 else "unmeasurable"
     if transfers / requests < AGGREGATED_RATIO:
         return "aggregated"
     return "effective"
@@ -262,6 +301,25 @@ def _fill_roles(result: PDMetricsPublic, by_role: dict) -> None:
                 continue
             entry = result.roles.setdefault(role, PDRoleMetrics())
             setattr(entry, key, value)
+
+
+def _derive_role_rates(result: PDMetricsPublic, window_seconds: int) -> None:
+    """The one per-role figure that is computed rather than read.
+
+    Both operands are counters over the window, so the subtraction has to
+    happen after they are both in — and it happens here, per role, so it can
+    never be taken over a group sum that counted every request twice.
+    """
+    if window_seconds <= 0:
+        return
+    for entry in result.roles.values():
+        if entry.prompt_tokens is None or entry.cached_prompt_tokens is None:
+            continue
+        missed = entry.prompt_tokens - entry.cached_prompt_tokens
+        # Clamped: a counter reset inside the window, or the two counters being
+        # scraped a scrape apart, can put the subtraction slightly below zero.
+        # A negative token rate is not a reading anyone can act on.
+        entry.cache_missed_prompt_tokens_per_second = max(missed, 0.0) / window_seconds
 
 
 def _preflight(mode: Optional[PDMode]):
@@ -380,9 +438,7 @@ async def collect_pd_metrics(
             _fill_transfer(result, values)
             _fill_verdict(result, values)
             _fill_roles(result, by_role)
-            _fill_transfer(result, values)
-            _fill_verdict(result, values)
-            _fill_roles(result, by_role)
+            _derive_role_rates(result, window_seconds)
 
             step = max(window_seconds // 60, 15)
             rate_window = f"{max(step * 4, 300)}s"

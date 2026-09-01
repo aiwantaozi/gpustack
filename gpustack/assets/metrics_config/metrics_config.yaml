@@ -368,6 +368,37 @@ metric_queries:
           metric: gpustack:num_requests_running
         group_by: [role]
 
+      # --- Prefill work actually done, per role -------------------------
+      # 🔑 Grouped by role, and that is not a presentation choice: a request
+      # increments `prompt_tokens` on BOTH roles (measured -- one 16-token
+      # request adds 16 on prefill and 16 on decode), so a group-wide sum
+      # doubles it. The failure is silent, because twice the real figure still
+      # looks like a plausible token rate.
+      #
+      # The pair exists to be subtracted. Prefill's compute-bound premise holds
+      # only for tokens it actually computed, so the tokens served from cache
+      # have to come off before the figure means anything: ByteDance's
+      # HeteroScale rejected raw prefill TPS as a scaling signal for exactly
+      # this reason and kept only "KV cache missed prefill TPS".
+      #
+      # Subtracted in Python rather than declared as PromQL arithmetic, for two
+      # reasons: a `-` between two instant vectors drops every series that does
+      # not match on both sides, so one absent counter would empty the result
+      # instead of reporting a gap; and the two operands are worth reporting on
+      # their own -- their ratio is the cache hit share.
+      #
+      # `_total` is the exposed name: the Prometheus client appends it to a
+      # counter at exposition, while `metric_families` above declares the
+      # registered name without it.
+      prompt_tokens:
+        counter_increase:
+          metric: gpustack:prompt_tokens_total
+        group_by: [role]
+      cached_prompt_tokens:
+        counter_increase:
+          metric: gpustack:prompt_tokens_cached_total
+        group_by: [role]
+
       # --- Latency, per role --------------------------------------------
       # 🔑 The reason PD is worth running at all: prefill owns TTFT and decode
       # owns TPOT. A figure averaged across both roles describes neither, so

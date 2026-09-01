@@ -2088,6 +2088,97 @@ def is_model_servable(model: Model) -> bool:
     return model.state == ModelStateEnum.RUNNING
 
 
+def derive_route_target_state(
+    target: ModelRouteTarget, model: Optional[Model]
+) -> TargetStateEnum:
+    """The state a target should be in, from what it points at.
+
+    A pure function of the target and its model, so the answer can be
+    recomputed at any time from rows that are already loaded — which is what
+    makes the state correctable rather than only updatable.
+
+    A provider target is always ACTIVE: its availability belongs to the
+    provider, not to us. A target that points at neither a model nor a
+    provider is UNAVAILABLE rather than left as it was; the previous code left
+    that case's variable unbound.
+    """
+    if target.provider_id is not None:
+        return TargetStateEnum.ACTIVE
+    if target.model_id is not None and model is not None:
+        return (
+            TargetStateEnum.ACTIVE
+            if is_model_servable(model)
+            else TargetStateEnum.UNAVAILABLE
+        )
+    return TargetStateEnum.UNAVAILABLE
+
+
+async def reconcile_route_target_states(session: AsyncSession, model: Model) -> bool:
+    """Bring this model's route targets in line with its servability.
+
+    🔴 Level-triggered on purpose, and this is the point of the function.
+    The target's state used to be written only from a Model *transition*:
+    `notify_model_route_target` publishes when `state` / `ready_replicas` /
+    `replicas` change, and `ModelRouteTargetController` reacts. That works
+    right up until the transition and its consumer do not overlap in time —
+    the bus does not replay, so a transition published while the controller
+    was not subscribed is lost, and nothing afterwards re-derives the answer.
+
+    Measured 2026-08-31: a worker went unreachable during a rolling image
+    update at 11:37, the model left RUNNING and its target was correctly set
+    UNAVAILABLE; the model was back at RUNNING by 11:39, but the
+    `modelroutetarget` subscription was only re-established at 11:55. The
+    recovery event fell in that hole, the model then stayed RUNNING with
+    nothing left to transition, and the target sat UNAVAILABLE for good —
+    `/v1/models` returned an empty list while the deployment served fine when
+    addressed directly.
+
+    Called from `sync_model_status`, which already runs on every model and
+    instance event, so any subsequent event repairs a lost one. Writes only on
+    a difference, like every other gate here, so the common case costs one
+    comparison.
+
+    🔴 The targets are queried, not read off `model.model_route_targets`, and
+    that is the whole reason this function ever repaired nothing.
+
+    Measured 2026-08-31: this ran on every model event for weeks and returned
+    at the emptiness check every single time. `sync_model_status` is always
+    reached with the Model already loaded in the session -- `_reconcile` fetches
+    it plainly and hands it over -- so the later fetch *with*
+    `selectinload(model_route_targets)` hits SQLAlchemy's identity map, returns
+    that same instance and never applies the loader option. The relationship
+    stays unloaded, and an unloaded collection reads as `[]` rather than
+    raising. Confirmed side by side: a clean session yields 1 target, a session
+    that had already loaded the row yields 0.
+
+    That is the worst possible shape for a repair -- silent, total, and
+    indistinguishable from "this model has no route targets". A query cannot be
+    short-circuited by an object that is already in the session.
+    """
+    targets = await ModelRouteTarget.all_by_fields(
+        session, fields={"model_id": model.id, "deleted_at": None}
+    )
+    if not targets:
+        return False
+
+    changed = False
+    for target in targets:
+        desired = derive_route_target_state(target, model)
+        if target.state != desired:
+            logger.info(
+                "Route target %s of model %s: %s -> %s (re-derived from the "
+                "model's state)",
+                target.name,
+                model.name,
+                target.state,
+                desired,
+            )
+            target.state = desired
+            await target.update(session=session, auto_commit=True)
+            changed = True
+    return changed
+
+
 def pairing_locality(
     model: Model, instances: Sequence[ModelInstance]
 ) -> Optional[float]:
@@ -2507,8 +2598,28 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         model.stale = stale
         model.degradations = degradations
         await ModelService(session).update(model)
-        return True
-    return False
+        updated = True
+    else:
+        updated = False
+
+    # 🔴 After the state is settled, not inside the gate above: the target has
+    # to be corrected even on a pass that found the model unchanged, because
+    # the case this exists for is exactly "the model is right and the target
+    # is not". Gating it on `updated` would reproduce the edge-triggered
+    # behaviour it replaces.
+    try:
+        await reconcile_route_target_states(session, model)
+    except Exception as e:
+        # A target left stale is a routing outage, but so is a status pass that
+        # raises: this is a repair, and it must not be able to break the thing
+        # it rides on.
+        logger.warning(
+            "Could not re-derive route target states for model %s: %s",
+            model.name,
+            e,
+        )
+
+    return updated
 
 
 async def get_cluster_registry(
@@ -4782,6 +4893,17 @@ class ModelRouteTargetController:
         self._config = config
 
     async def start(self):
+        # 🔴 Before the subscription, because the gap between them is the hole
+        # this closes. The bus does not replay: a model that changed state
+        # while this controller was down published an event nobody consumed,
+        # and since the state then stops changing there is nothing left to
+        # react to. Measured 2026-08-31 — a target sat UNAVAILABLE against a
+        # RUNNING model until a human noticed `/v1/models` was empty.
+        #
+        # One sweep at startup answers it for every target at once, and costs
+        # one pass over a table with as many rows as there are route targets.
+        await self._resync_all_targets()
+
         async for event in ModelRouteTarget.subscribe(
             source="model_route_target_controller"
         ):
@@ -4789,6 +4911,43 @@ class ModelRouteTargetController:
                 await self._reconcile(event)
             except Exception as e:
                 logger.exception(f"Failed to reconcile model route target: {e}")
+
+    async def _resync_all_targets(self):
+        """Re-derive every target's state from what it points at.
+
+        Idempotent and write-on-difference, so a healthy fleet logs nothing
+        and writes nothing.
+        """
+        try:
+            async with async_session() as session:
+                targets = await ModelRouteTarget.all(session)
+                repaired = 0
+                for target in targets:
+                    model = None
+                    if target.model_id is not None:
+                        model = await Model.one_by_id(session, target.model_id)
+                    desired = derive_route_target_state(target, model)
+                    if target.state != desired:
+                        logger.info(
+                            "Startup resync: route target %s %s -> %s",
+                            target.name,
+                            target.state,
+                            desired,
+                        )
+                        target.state = desired
+                        await target.update(session=session, auto_commit=True)
+                        repaired += 1
+                if repaired:
+                    logger.info(
+                        "Startup resync corrected %d route target(s) whose "
+                        "state had drifted from their model's.",
+                        repaired,
+                    )
+        except Exception as e:
+            # Never fatal: the controller's steady-state job is more important
+            # than this repair, and the per-model pass in `sync_model_status`
+            # is a second chance at the same correction.
+            logger.warning("Route target startup resync failed: %s", e)
 
     async def _notify_parents(
         self, session: AsyncSession, target: ModelRouteTarget, event: Event

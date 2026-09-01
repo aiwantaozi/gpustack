@@ -63,10 +63,21 @@ class MembershipOutcome:
         ok: bool,
         reason: Optional[str] = None,
         registered: Optional[Sequence[str]] = None,
+        unreadable: bool = False,
     ):
         self.ok = ok
         self.reason = reason
         self.registered = list(registered or [])
+        # 🔴 Separate from `ok` because only one kind of failure is worth
+        # restarting the router over. A refused `POST` means the router is
+        # alive and disagrees -- a version or argument mismatch that a restart
+        # repeats rather than fixes, and under `--enable-igw` a restart turns
+        # "some members registered" into "none", because the command-line
+        # peers no longer enter the registry (measured 2026-08-28: a router
+        # started with `--prefill` reports `GET /workers` -> `total: 0`).
+        # A registry that cannot be READ is the other thing: the process
+        # itself is not answering, and restarting is the only move left.
+        self.unreadable = unreadable
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"MembershipOutcome(ok={self.ok}, reason={self.reason!r})"
@@ -317,6 +328,7 @@ async def reconcile(
             if current is None:
                 return MembershipOutcome(
                     ok=False,
+                    unreadable=True,
                     reason=(
                         "the router's member list could not be read, so whether "
                         "it can serve is unknown"
@@ -344,7 +356,9 @@ async def reconcile(
             final = await _read_registry(client, api, base)
             if final is None:
                 return MembershipOutcome(
-                    ok=False, reason="the router's member list became unreadable"
+                    ok=False,
+                    unreadable=True,
+                    reason="the router's member list became unreadable",
                 )
             missing = sorted(set(wanted) - set(final))
             if missing:
@@ -394,8 +408,21 @@ async def reconcile(
 
 _outcomes: Dict[int, MembershipOutcome] = {}
 _failures: Dict[int, int] = {}
+_unreadable: Dict[int, int] = {}
 
 PERSISTENT_FAILURE_PASSES = 5
+
+# How many consecutive passes the registry must be unreadable before the
+# router is restarted.
+#
+# Not one. Under `--enable-igw` a restart is expensive in a way it is not on
+# the command-line path: the new process comes up with an empty registry and
+# answers 503 until registration completes (measured), so a single dropped
+# request would trade a blip for a real outage. Five passes of a reconcile
+# that runs on every model pass is long enough that a router which is merely
+# busy has answered, and short enough that a wedged one is not left serving
+# nothing for minutes.
+RESTART_AFTER_UNREADABLE_PASSES = 5
 """Consecutive failed reconciles before the message names the way out.
 
 🔴 The escape hatch is an OPERATOR action, not something this code can take.
@@ -411,6 +438,13 @@ a router that is not going to admit its members on its own."""
 
 
 def record(model_id: int, outcome: MembershipOutcome) -> None:
+    # Tracked apart from `_failures`: that counter drives the wording of a
+    # persistent failure, this one drives an action.
+    if outcome.unreadable:
+        _unreadable[model_id] = _unreadable.get(model_id, 0) + 1
+    else:
+        _unreadable.pop(model_id, None)
+
     if outcome.ok:
         _failures.pop(model_id, None)
     else:
@@ -442,6 +476,23 @@ def forget(model_id: int) -> None:
 
 def consecutive_failures(model_id: int) -> int:
     return _failures.get(model_id, 0)
+
+
+def should_restart_router(model_id: int) -> bool:
+    """Whether the router has been unreachable long enough to be worth losing.
+
+    True only for the unreadable case, and only after
+    `RESTART_AFTER_UNREADABLE_PASSES` of them in a row. A router that refuses
+    a member is answering, and restarting it repeats the refusal from an empty
+    registry instead of a partial one.
+    """
+    return _unreadable.get(model_id, 0) >= RESTART_AFTER_UNREADABLE_PASSES
+
+
+def clear_restart_signal(model_id: int) -> None:
+    """Forget the streak once a restart has been ordered, so the next pass
+    measures the new process rather than re-ordering against the old count."""
+    _unreadable.pop(model_id, None)
 
 
 def router_addresses(instances: Sequence[ModelInstance]) -> List[str]:

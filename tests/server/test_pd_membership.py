@@ -72,23 +72,44 @@ def test_every_running_router_is_reconciled():
 
 
 @pytest.mark.asyncio
-async def test_a_recipe_without_the_flag_is_not_a_failure():
-    """🔴 The regression that protects every deployment that works today.
+async def test_a_recipe_that_declares_the_api_without_launching_it_is_not_a_failure():
+    """🔴 The regression that protects every deployment on the other path.
 
-    Without `--enable-igw` the router already knows its peers from the command
-    line and the API returns 400. Reporting that as a failed registration would
-    park every current PD group in PARTIAL forever.
+    Declared is not usable: without the flag its API needs, the router already
+    knows its peers from the command line and `POST /workers` answers 400.
+    Reporting that as a failed registration would park such a group in PARTIAL
+    forever.
+
+    The state is built here rather than read off a shipped recipe. It used to
+    be `vllm-nixl`'s, and when that recipe gained `--enable-igw` (verified
+    2026-08-28, F12) this test broke while the behaviour it guards did not
+    change at all -- so the mode it needs is now constructed, and the test
+    survives the next recipe that flips either way.
     """
     from gpustack.server.pd_mode_catalog import get_pd_mode
 
-    mode = get_pd_mode("vllm-nixl")
-    # The shipped recipe declares the API but deliberately does not launch the
-    # flag it needs, so this is the state of every group today.
-    assert mode.router.membership_api.available is True
-    assert mode.router.membership_api_usable is False
+    shipped = get_pd_mode("vllm-nixl")
+    assert shipped.router.membership_api.available is True
+
+    unlaunched = shipped.model_copy(
+        update={
+            "router": shipped.router.model_copy(
+                update={
+                    "command": [
+                        token
+                        for token in (shipped.router.command or [])
+                        if str(token) != "--enable-igw"
+                    ]
+                }
+            )
+        },
+        deep=True,
+    )
+    assert unlaunched.router.membership_api.available is True
+    assert unlaunched.router.membership_api_usable is False
 
     outcome = await pd_membership.reconcile(
-        _model(), mode, [_instance("decode", 40011)], "10.0.0.1:40012"
+        _model(), unlaunched, [_instance("decode", 40011)], "10.0.0.1:40012"
     )
     assert outcome.ok is True
     assert outcome.reason is None
@@ -170,3 +191,68 @@ def test_a_members_url_is_percent_encoded_in_the_removal_path():
     # future "simplification" back to it fails here rather than in production.
     assert "{url}" not in template.replace("{url}", quote(url, safe=""))
     assert "/workers/http://" in template.replace("{url}", url)
+
+
+def test_only_an_unreadable_registry_counts_toward_a_restart():
+    """🔴 Which failure a restart can fix, and which it only makes worse.
+
+    Under `--enable-igw` the command-line peers never enter the registry
+    (measured 2026-08-28: a router started with `--prefill` reports
+    `GET /workers` -> total 0), so restarting turns "some members registered"
+    into "none registered, answering 503". That price buys something only when
+    the router is not answering at all. A refused member means it is alive and
+    disagreeing -- a version or argument mismatch it would refuse again.
+    """
+    model_id = 7788
+    pd_membership.forget(model_id)
+
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES + 2):
+        pd_membership.record(
+            model_id,
+            pd_membership.MembershipOutcome(ok=False, reason="router refused a member"),
+        )
+    assert pd_membership.should_restart_router(model_id) is False
+
+    pd_membership.forget(model_id)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(
+            model_id,
+            pd_membership.MembershipOutcome(
+                ok=False, unreadable=True, reason="could not read the registry"
+            ),
+        )
+    assert pd_membership.should_restart_router(model_id) is True
+    pd_membership.forget(model_id)
+
+
+def test_one_unreadable_pass_does_not_cost_the_group_an_outage():
+    """A single dropped request must not trade a blip for a real outage."""
+    model_id = 7789
+    pd_membership.forget(model_id)
+    pd_membership.record(
+        model_id,
+        pd_membership.MembershipOutcome(
+            ok=False, unreadable=True, reason="could not read the registry"
+        ),
+    )
+    assert pd_membership.should_restart_router(model_id) is False
+    pd_membership.forget(model_id)
+
+
+def test_a_readable_pass_breaks_the_streak():
+    """The streak has to be consecutive: a router that answers once is not the
+    wedged process this path exists for."""
+    model_id = 7790
+    pd_membership.forget(model_id)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES - 1):
+        pd_membership.record(
+            model_id,
+            pd_membership.MembershipOutcome(ok=False, unreadable=True, reason="x"),
+        )
+    pd_membership.record(model_id, pd_membership.MembershipOutcome(ok=True))
+    pd_membership.record(
+        model_id,
+        pd_membership.MembershipOutcome(ok=False, unreadable=True, reason="x"),
+    )
+    assert pd_membership.should_restart_router(model_id) is False
+    pd_membership.forget(model_id)

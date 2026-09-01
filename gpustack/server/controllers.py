@@ -89,6 +89,7 @@ from gpustack.schemas.cache_services import (
     CacheServiceStateEnum,
 )
 from gpustack.server.cache_provider_catalog import get_cache_provider
+from gpustack.server import pd_membership
 from gpustack.server.pd_membership import outcome_for as membership_outcome_for
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
 from gpustack.server.workload_namespace import (
@@ -2502,7 +2503,6 @@ async def _reconcile_router_membership(
     retried on the next pass, because the alternative is a controller loop
     that stops syncing every other status field over one unreachable router.
     """
-    from gpustack.server import pd_membership
     from gpustack.server.pd_mode_catalog import get_pd_mode
 
     if model.disaggregation is None:
@@ -2551,6 +2551,38 @@ async def _reconcile_router_membership(
             worst = outcome
     if worst is not None:
         pd_membership.record(model.id, worst)
+
+
+async def _restart_unreachable_routers(
+    session: AsyncSession, model: Model, instances: Sequence[ModelInstance]
+) -> None:
+    """Delete the router members so convergence recreates them.
+
+    Deleting rather than restarting in place: the router's command line is
+    rendered from its peers' live addresses at creation, so a recreated router
+    picks up the current ones — which is also the repair for the case that
+    produced this path in the first place, a member whose port changed under a
+    router that still holds the old one.
+    """
+    from gpustack.schemas.models import ModelInstanceStateEnum
+
+    for instance in instances:
+        if instance.role != RoleNameEnum.ROUTER.value:
+            continue
+        if instance.state != ModelInstanceStateEnum.RUNNING:
+            continue
+        logger.warning(
+            "Router %s of model %s has been unreachable for %d passes; "
+            "deleting it so a fresh one is created with the group's current "
+            "member addresses.",
+            instance.name,
+            model.name,
+            pd_membership.RESTART_AFTER_UNREADABLE_PASSES,
+        )
+        try:
+            await instance.delete(session)
+        except Exception as e:
+            logger.warning("Could not delete router %s: %s", instance.name, e)
 
 
 async def sync_model_status(session: AsyncSession, model: Model) -> bool:
@@ -2625,6 +2657,20 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # all of them today: `reconcile` returns ok immediately when
     # `membership_api_usable` is false.
     await _reconcile_router_membership(model, instances)
+
+    # 🔴 The one failure a restart can fix, and only after it has persisted.
+    #
+    # Under `--enable-igw` the command-line peers never enter the registry
+    # (measured 2026-08-28: a router started with `--prefill` reports
+    # `GET /workers` -> `total: 0`), so a restart costs a real outage — the new
+    # process answers 503 until registration completes. That price is worth
+    # paying only when the router is not answering at all, which is what
+    # `unreadable` means; a router that refuses a member is alive and
+    # disagreeing, and would refuse the same thing again from an empty
+    # registry.
+    if pd_membership.should_restart_router(model.id):
+        pd_membership.clear_restart_signal(model.id)
+        await _restart_unreachable_routers(session, model, instances)
 
     state, state_message = derive_model_state(
         model,

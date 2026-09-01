@@ -1182,6 +1182,10 @@ async def _sync_replicas_legacy(
 # silent and returns wrong answers (F7 3.3 — `max_model_len` mismatched across
 # P and D handshakes fine, transfers fine, and only a long prompt reveals it,
 # after prefill has already been paid for).
+# Distinguishes "no override" from "override with None", which is exactly the
+# case that matters here: an unset `backend_version` is a real spec value.
+_UNSET = "\x00unset"
+
 _DIGEST_EXCLUDED_SPEC_FIELDS = frozenset(
     {
         # Descriptive. Renaming the description must not restart a group.
@@ -1260,19 +1264,29 @@ async def _instance_type_snapshots(
     return snapshots
 
 
-async def model_spec_digest(session: AsyncSession, model: Model) -> str:
+async def model_spec_digest(
+    session: AsyncSession,
+    model: Model,
+    backend_version: Optional[str] = _UNSET,
+) -> str:
     """The generation identity of `model`'s deployment shape.
 
     Shaped after `GPUInstanceType.compute_snapshot` (F7 3.3, D13): a content
     hash over the definitional spec with the mutable description fields
     excluded, so an unchanged spec keeps its digest across restarts and a
     changed one produces a new generation.
+
+    `backend_version` substitutes for the model's own, and exists for one
+    caller: asking whether a *particular member* is out of date with the spec.
+    See `_stale_members`.
     """
     payload: Dict[str, Any] = {}
     for field in ModelSpecBase.model_fields:
         if field in _DIGEST_EXCLUDED_SPEC_FIELDS:
             continue
         value = getattr(model, field, None)
+        if field == "backend_version" and backend_version is not _UNSET:
+            value = backend_version
         if field == "roles":
             value = [_role_digest_payload(role) for role in (value or [])] or None
         elif isinstance(value, BaseModel):
@@ -1292,6 +1306,71 @@ async def model_spec_digest(session: AsyncSession, model: Model) -> str:
 
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return f"sha1:{hashlib.sha1(blob.encode('utf-8')).hexdigest()}"
+
+
+async def _stale_members(
+    session: AsyncSession,
+    model: Model,
+    instances: Sequence[ModelInstance],
+) -> Optional[bool]:
+    """Whether any running member predates the config it is shown with.
+
+    None where nothing can be said: a member created before `spec_digest`
+    existed carries None, and reading that as "differs" would mark every
+    pre-upgrade model stale on the first pass after an upgrade.
+
+    🔴 One exemption, and it is not a loophole -- it is the difference between
+    a config change and a record of what is already running.
+
+    Measured 2026-08-31 on `sgl-moon-qwen3-0.6b`, deployed with no version
+    pinned. Its three members started, the engine reported SGLang
+    `0.5.15.post1`, and the worker wrote that back to the Model. That write is
+    deliberate: without it a later replica resolves its own, newer build and
+    the group goes heterogeneous. But `backend_version` is in the digest --
+    also correctly, since a different engine build needs a new container -- so
+    the digest changed and all three members went stale nine seconds after the
+    last one started, with nobody having edited anything.
+
+    The banner then told the user to restart a group in order to adopt a value
+    that had been read off that very group. Restarting would have cleared it,
+    which is the worst property of the bug: the advice appears to work, so the
+    reading is never questioned.
+
+    So a member is excused when both hold:
+
+    - its stamp matches the spec with `backend_version` unset. Not a guess at
+      the old value -- the write-back only fires when the field was falsy, so
+      unset is precisely what the member was stamped against.
+    - the version now recorded is the one the member is actually running.
+      Without this, pinning 0.5.14 onto a group running 0.5.15 would also be
+      excused, and that edit genuinely needs a restart. A member that cannot
+      say what it runs stays stale, which is the conservative direction.
+
+    The stamps are deliberately *not* rewritten to match. `group_id` is derived
+    from the digest and is what the router matches its peers on, so re-stamping
+    would rename a running group's generation underneath it.
+    """
+    digested = [i for i in instances if i.spec_digest]
+    if not digested:
+        return None
+
+    current = await model_spec_digest(session, model)
+    if all(i.spec_digest == current for i in digested):
+        return False
+
+    unpinned = await model_spec_digest(session, model, backend_version=None)
+    recorded = model.backend_version
+
+    def is_current(instance: ModelInstance) -> bool:
+        if instance.spec_digest == current:
+            return True
+        return (
+            instance.spec_digest == unpinned
+            and recorded is not None
+            and instance.backend_version == recorded
+        )
+
+    return not all(is_current(i) for i in digested)
 
 
 def _generation_group_id(model: Model, digest: str) -> str:
@@ -2577,11 +2656,7 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # Only members that carry a digest count. A row created before this column
     # existed has None, and reading that as "differs" would mark every
     # pre-upgrade model stale on the first pass after an upgrade.
-    stale: Optional[bool] = None
-    digested = [i.spec_digest for i in instances if i.spec_digest]
-    if digested:
-        current_digest = await model_spec_digest(session, model)
-        stale = any(digest != current_digest for digest in digested)
+    stale = await _stale_members(session, model, instances)
 
     if (
         model.ready_replicas != ready_replicas

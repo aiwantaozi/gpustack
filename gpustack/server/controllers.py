@@ -6,7 +6,7 @@ import string
 import asyncio
 from importlib.resources import files
 from functools import partial
-from typing import Any, Dict, Iterable, List, Tuple, Optional, Set
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional, Set
 from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -2088,6 +2088,131 @@ def is_model_servable(model: Model) -> bool:
     return model.state == ModelStateEnum.RUNNING
 
 
+def pairing_locality(
+    model: Model, instances: Sequence[ModelInstance]
+) -> Optional[float]:
+    """The chance a request's KV transfer stays inside one host.
+
+    Not "how many pairs are local", because nothing pairs them: the router
+    picks a prefill and a decode *independently* (`--prefill-policy
+    cache_aware --decode-policy round_robin`), and topology-aware pairing is
+    an explicit non-goal of this phase. So the honest figure is the
+    probability that two independent picks land on the same worker:
+
+        P(local) = Σ_w  (prefill_w / prefill_total) × (decode_w / decode_total)
+
+    which reproduces the known ceiling on its own: an evenly spread xPxD gives
+    1/x, and that is the best any placement can do while the router chooses at
+    random. A single host gives 1.0; prefill entirely on one host and decode
+    entirely on another gives 0.
+
+    None when the question does not apply — not a group, or a role with no
+    running member, where 0 would read as a verdict rather than as silence.
+    """
+    if not model.roles:
+        return None
+
+    by_role: Dict[str, Dict[int, int]] = {}
+    for instance in instances:
+        role = instance.role
+        if role not in (RoleNameEnum.PREFILL.value, RoleNameEnum.DECODE.value):
+            continue
+        if instance.state != ModelInstanceStateEnum.RUNNING:
+            continue
+        if instance.worker_id is None:
+            continue
+        by_role.setdefault(role, {})
+        by_role[role][instance.worker_id] = by_role[role].get(instance.worker_id, 0) + 1
+
+    prefill = by_role.get(RoleNameEnum.PREFILL.value) or {}
+    decode = by_role.get(RoleNameEnum.DECODE.value) or {}
+    if not prefill or not decode:
+        return None
+
+    prefill_total = sum(prefill.values())
+    decode_total = sum(decode.values())
+    return sum(
+        (count / prefill_total) * (decode.get(worker_id, 0) / decode_total)
+        for worker_id, count in prefill.items()
+    )
+
+
+def _pairing_remote(model: Model, instances: Sequence[ModelInstance]) -> bool:
+    """Whether *no* request can keep its KV off the network.
+
+    🔴 The threshold is zero, not a fraction, and that is the whole design of
+    this marker.
+
+    A partial locality is not a misconfiguration — it is the arithmetic of a
+    router that pairs at random, where an evenly spread xPxD tops out at 1/x
+    however well it was placed. Warning at "below some fraction" would fire on
+    every correctly placed 4P4D and teach people to ignore the marker.
+
+    Zero is different in kind: prefill and decode share no host at all, so
+    every single transfer crosses the network, and it is reachable by ordinary
+    manual selection — pick host A's cards for prefill and host B's for
+    decode and nothing today says a word. That is the case worth a marker,
+    and on a link without RDMA it is the difference between PD helping and PD
+    being strictly worse than not disaggregating (§0.2 T4).
+    """
+    locality = pairing_locality(model, instances)
+    return locality is not None and locality == 0
+
+
+async def _degradation_reasons(
+    session: AsyncSession,
+    model: Model,
+    instances: Sequence[ModelInstance],
+    *,
+    ready_replicas: int,
+    role_status: Optional[Dict[str, RoleStatus]],
+    cache_not_injected: bool,
+    cache_reason: Optional[str],
+    state_message: Optional[str],
+) -> Tuple[List[str], Optional[str]]:
+    """Every way this deployment is up but worse than it was asked for.
+
+    Degradations coexist with RUNNING by construction -- `derive_model_state`
+    looks at neither the cache nor the ratio -- which is the whole reason they
+    are a separate list rather than a state.
+
+    Returns the reasons and a possibly-extended `state_message`: one of them
+    (the cache) carries a detail worth putting in front of the user, and
+    threading it back is cheaper than a second pass to recover it.
+    """
+    reasons: List[str] = []
+
+    if _ratio_unmet(model, ready_replicas=ready_replicas, role_status=role_status):
+        reasons.append(DegradationReasonEnum.RATIO_UNMET.value)
+
+    if cache_not_injected:
+        # A resolved cache the instance could not attach to only makes it
+        # slower (D10), so it is a marker and never a lifecycle value.
+        reasons.append(DegradationReasonEnum.CACHE_NOT_INJECTED.value)
+        detail = "shared cache not injected"
+        if cache_reason:
+            detail = f"{detail}: {cache_reason}"
+        state_message = "; ".join(m for m in (state_message, detail) if m) or None
+
+    if _pairing_remote(model, instances):
+        # Placement-only, so it is knowable the moment the members are placed
+        # rather than after traffic has shown it. That is the point: on a link
+        # without RDMA an all-remote pairing makes PD strictly worse than not
+        # disaggregating, and the user should not have to learn that from a
+        # TTFT regression.
+        reasons.append(DegradationReasonEnum.PAIRING_REMOTE.value)
+
+    if instances and placement_drifted(
+        instances,
+        await resolve_workload_namespace(
+            session, model.owner_principal_id, model.cluster_id
+        ),
+    ):
+        reasons.append(DegradationReasonEnum.PLACEMENT_DRIFTED.value)
+
+    return reasons, state_message
+
+
 def _ratio_unmet(
     model: Model,
     *,
@@ -2339,34 +2464,16 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         error_count=error_count,
     )
 
-    # Degradations are what "up but worse than asked for" is expressed with,
-    # so they coexist with RUNNING by construction — `derive_model_state`
-    # looks at neither the cache nor the ratio. Two of the reasons come out
-    # of this scan; `bandwidth_degraded` and `pd_ineffective` come from the
-    # PD observer, which reads counters this scan has no access to, and
-    # `no_atomic_admission` is not derivable from either.
-    reasons: List[str] = []
-
-    if _ratio_unmet(model, ready_replicas=ready_replicas, role_status=role_status):
-        reasons.append(DegradationReasonEnum.RATIO_UNMET.value)
-
-    if cache_not_injected:
-        # A resolved cache the instance could not attach to only makes it
-        # slower (D10), so it is a marker and never a lifecycle value.
-        reasons.append(DegradationReasonEnum.CACHE_NOT_INJECTED.value)
-        detail = "shared cache not injected"
-        if cache_reason:
-            detail = f"{detail}: {cache_reason}"
-        state_message = "; ".join(m for m in (state_message, detail) if m) or None
-
-    if instances and placement_drifted(
+    reasons, state_message = await _degradation_reasons(
+        session,
+        model,
         instances,
-        await resolve_workload_namespace(
-            session, model.owner_principal_id, model.cluster_id
-        ),
-    ):
-        reasons.append(DegradationReasonEnum.PLACEMENT_DRIFTED.value)
-
+        ready_replicas=ready_replicas,
+        role_status=role_status,
+        cache_not_injected=cache_not_injected,
+        cache_reason=cache_reason,
+        state_message=state_message,
+    )
     degradations = reasons or None
 
     # `stale`: the running members predate the config they are shown with.

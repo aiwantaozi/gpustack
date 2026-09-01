@@ -710,6 +710,10 @@ class DegradationReasonEnum(str, Enum):
     # labelled and over a network path that handles tunnelled hosts. A marker
     # on the row would be a second, staler copy of that answer.
     RATIO_UNMET = "ratio_unmet"
+    # No prefill and decode member share a host, so no request's KV can avoid
+    # the network. Placement-only and knowable at admission, unlike the
+    # bandwidth markers above which need traffic to have happened.
+    PAIRING_REMOTE = "pairing_remote"
     NO_ATOMIC_ADMISSION = "no_atomic_admission"
 
     PLACEMENT_DRIFTED = "placement_drifted"

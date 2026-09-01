@@ -296,7 +296,22 @@ async def get_model_dashboard(
     model = await _get_model(session=session, ctx=ctx, id=id)
 
     cfg = get_global_config()
-    if not cfg.get_grafana_url() or not cfg.grafana_model_dashboard_uid:
+
+    # 🔴 A disaggregated group goes to the PD dashboard, not the model one.
+    #
+    # Decided here rather than in the caller because the caller has a model id
+    # and this has the model: whether a deployment is a group, which connector
+    # it runs, and therefore which role owns its transfer counters are all
+    # server-side facts, and the last one is not even on the model — it comes
+    # from the mode catalog.
+    #
+    # The model dashboard is not merely less specific for these, it is wrong in
+    # one place: every request traverses both roles, so its request counters
+    # double under PD. Sending a group there hands the user a number that is
+    # 2x reality with nothing saying so.
+    pd = bool(model.disaggregation)
+    uid = cfg.grafana_pd_dashboard_uid if pd else cfg.grafana_model_dashboard_uid
+    if not cfg.get_grafana_url() or not uid:
         raise InternalServerErrorException(
             message="Grafana dashboard settings are not configured"
         )
@@ -309,14 +324,36 @@ async def get_model_dashboard(
     if cluster is not None:
         query_params["var-cluster_name"] = cluster.name
     query_params["var-model_name"] = model.name
+    if pd:
+        # Which role's transfer counter is authoritative for this connector --
+        # decode where it pulls (NIXL), prefill where it pushes (SGLang). The
+        # dashboard's default is `decode`, so leaving it unset would show an
+        # SGLang group a flat zero for the panels that matter most.
+        query_params["var-counted_role"] = _counted_role(model)
 
     grafana_base = resolve_grafana_base_url(cfg, request)
-    slug = "gpustack-model"
-    dashboard_url = f"{grafana_base}/d/{cfg.grafana_model_dashboard_uid}/{slug}"
+    slug = "gpustack-pd" if pd else "gpustack-model"
+    dashboard_url = f"{grafana_base}/d/{uid}/{slug}"
     if query_params:
         dashboard_url = f"{dashboard_url}?{urlencode(query_params)}"
 
     return RedirectResponse(url=dashboard_url, status_code=302)
+
+
+def _counted_role(model: Model) -> str:
+    """The role whose KV transfer counters this model's connector populates.
+
+    `decode` when the catalog cannot say, matching the dashboard's own default:
+    the two-hop connectors are the common case, and a wrong guess here shows an
+    empty panel rather than a wrong number.
+    """
+    mode_name = getattr(model.disaggregation.mode, "value", None) or str(
+        model.disaggregation.mode
+    )
+    mode = get_pd_mode(mode_name)
+    if mode and mode.transfer_metrics and mode.transfer_metrics.read_from_role:
+        return mode.transfer_metrics.read_from_role
+    return "decode"
 
 
 async def _get_model(

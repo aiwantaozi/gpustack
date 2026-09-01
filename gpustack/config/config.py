@@ -193,6 +193,8 @@ class Config(WorkerConfig, BaseSettings):
         grafana_url: Base URL for Grafana UI used by redirects and proxying. When unset, defaults to the embedded Grafana URL unless builtin observability is disabled.
         grafana_worker_dashboard_uid: Grafana dashboard UID for worker dashboard.
         grafana_model_dashboard_uid: Grafana dashboard UID for model dashboard.
+        grafana_pd_dashboard_uid: Grafana dashboard UID for the prefill/decode dashboard,
+            which a disaggregated model's monitoring link goes to instead of the model one.
         grafana_cache_service_dashboard_uid: Grafana dashboard UID for cache service dashboard.
         gateway_plugin_server_url: URL to fetch gateway plugin manifest for embedded gateway.
         shuihua_api_base_url: Base URL of the Shuihua API. Has no default; Shuihua clusters
@@ -333,6 +335,7 @@ class Config(WorkerConfig, BaseSettings):
     grafana_url: Optional[str] = None
     grafana_worker_dashboard_uid: Optional[str] = "gpustack-worker"
     grafana_model_dashboard_uid: Optional[str] = "gpustack-model"
+    grafana_pd_dashboard_uid: Optional[str] = "gpustack-pd"
     grafana_cache_service_dashboard_uid: Optional[str] = "gpustack-cache-service"
 
     # Server-wide default for the GPUStack Operator image. Cluster-level

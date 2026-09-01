@@ -456,21 +456,35 @@ def test_kv_lease_windows_are_per_connector():
     assert mooncake.gpustack_default == 60
     assert mooncake.expired_metric is None
 
-    # MoRIIO: a hardcoded constant, 120x NIXL's window. On the record even
-    # though no shipped mode uses it and nothing can be injected.
+    # MoRIIO: the window that reclaims prefill's blocks is `defer_timeout`
+    # and it IS settable. The 3600 read-abort constant is a different
+    # deadline; tracking that one instead read as "an hour, unshortenable",
+    # which was wrong on both halves.
     moriio = leases["moriio"]
-    assert moriio.engine_default == 3600
-    assert moriio.settable is False
-    assert moriio.inject_to == PDKVLeaseTargetEnum.NONE
+    assert moriio.param == "defer_timeout"
+    assert moriio.inject_to == PDKVLeaseTargetEnum.CONNECTOR_EXTRA_CONFIG
+    assert moriio.engine_default == 60
+    assert moriio.settable is True
+    # No shipped mode uses MoRIIO, so nothing is injected and no platform
+    # default is claimed.
     assert moriio.gpustack_default is None
     assert all(mode.kv_lease is not moriio for mode in load_pd_modes())
 
-    # SGLang's nixl backend has no reclaim timeout at all: a cancelled
-    # request strands its KV until the instance restarts.
-    sglang_nixl = leases["sglang-nixl"]
-    assert sglang_nixl.param is None
-    assert sglang_nixl.settable is False
-    assert sglang_nixl.expired_metric is None
+    # Both SGLang backends share one window, because the timeout lives in
+    # the base both extend: nixl/conn.py and mooncake/conn.py each call
+    # CommonKVSender._check_bootstrap_timeout(). Declaring only one of them
+    # as settable was the error this asserts against.
+    for name in ("sglang-mooncake", "sglang-nixl"):
+        lease = leases[name]
+        assert lease.param == "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", name
+        assert lease.inject_to == PDKVLeaseTargetEnum.ENV, name
+        assert lease.settable is True, name
+        assert lease.engine_default == 300, name
+        # Deliberately unset: this is not a lease but "how long prefill
+        # waits for decode's KV indices", so compressing it to the vLLM
+        # connectors' 60s would fail healthy requests whose decode queued.
+        assert lease.gpustack_default is None, name
+        assert lease.expired_metric is None, name
 
 
 def test_modes_resolve_their_connector_window():
@@ -771,24 +785,44 @@ def test_the_two_vllm_router_recipes_declare_the_same_membership_shape():
     assert nixl.role_values == {"prefill": "prefill", "decode": "decode"}
 
 
-def test_declared_is_not_the_same_as_usable_today():
+def test_declared_and_usable_move_together_once_the_flag_is_launched():
     """🔴 The distinction the whole capability turns on.
 
-    `--enable-igw` is read from upstream source, not measured on hardware
-    (open-questions F12), so the recipes deliberately do not launch with it.
-    That makes the API declared-but-not-reachable, and a consumer must get
-    False rather than try the call and read the failure as a broken group.
+    `membership_api_usable` is not "upstream serves this API"; it is "this
+    recipe launches the process in the mode where the API works". The two were
+    apart for as long as `--enable-igw` was read from source rather than
+    measured, and the recipes deliberately did not launch it.
 
-    This assertion is expected to flip to True once the flag is verified and
-    added to the recipe's `command` — that is the only change it should need.
+    Verified on a real 1P1D 2026-08-28 (open-questions F12) and the flag is now
+    in both vLLM recipes, so the two agree again — but the *rule* is what this
+    asserts, not today's answer: a recipe that declares the API and launches
+    every argument it requires is usable, and one that does not is not.
+    Writing it as a rule is what kept the last flip to a one-line change.
     """
     for mode in load_pd_modes():
         router = mode.router
-        if router.membership_api.available:
-            assert router.membership_api.requires_args == ["--enable-igw"]
+        if not router.membership_api.available:
             assert not router.membership_api_usable, mode.name
-        else:
-            assert not router.membership_api_usable, mode.name
+            continue
+        launched = set(str(token) for token in (router.command or []))
+        required = set(router.membership_api.requires_args or [])
+        assert router.membership_api_usable == required.issubset(launched), mode.name
+
+
+def test_the_vllm_recipes_launch_what_their_membership_api_requires():
+    """The measured half of F12: without the flag there is no membership API
+    at all (`POST /workers` -> 400), so a recipe that declares one and omits it
+    promises a scale-out that will fail on first use."""
+    seen = 0
+    for mode in load_pd_modes():
+        router = mode.router
+        if not router.membership_api.available:
+            continue
+        seen += 1
+        assert router.membership_api.requires_args == ["--enable-igw"]
+        assert "--enable-igw" in [str(t) for t in (router.command or [])], mode.name
+        assert router.membership_api_usable, mode.name
+    assert seen == 2, "both vLLM-family recipes declare a membership API"
 
 
 def test_the_sglang_recipes_leave_membership_undeclared_rather_than_guessed():

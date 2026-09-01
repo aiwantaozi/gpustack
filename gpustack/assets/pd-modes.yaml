@@ -67,6 +67,15 @@ kv_leases:
       the request is queued and stops renewing when it aborts, so the hold
       is bounded rather than leaked. The only window with a Prometheus
       counter.
+      A second window lives on the same connector and is deliberately NOT
+      an entry here: `engine_ttl` (also connector_extra_config, engine
+      default 3600) evicts stale *remote engine state* -- the agent entries
+      a restarted peer leaves behind, reaped by _evict_stale_engines(). It
+      is engine-metadata GC, not a per-request KV hold, so it does not
+      belong in a registry whose unit is "how long prefill holds KV". Left
+      at the engine default; it is the mechanism behind the agent-entry
+      accumulation measured after repeated prefill restarts, so a
+      high-restart deployment is where it would need lowering.
   - connector: mooncake
     param: VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
     inject_to: env
@@ -83,38 +92,66 @@ kv_leases:
       blocks for 8 minutes with nothing to alert on. Configured through an
       env var, not the connector config.
   - connector: moriio
-    param: VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT
-    inject_to: none
-    settable: false
-    engine_default: 3600
+    param: defer_timeout
+    inject_to: connector_extra_config
+    engine_default: 60
     expired_metric: null
     description: >-
-      A hardcoded constant in the connector, not an env var or a config
-      field: one hour, 120x NIXL's window, and there is no way to shorten
-      it. Recorded for the accounting; no shipped mode uses MoRIIO (ROCm
-      only).
+      The window that actually reclaims prefill's blocks, and it is
+      settable: a deferred send whose finished_sending notification never
+      arrives is reaped after defer_timeout and its blocks force-freed, so
+      the scheduler does not hang waiting for a free that never comes.
+      Engine default 60s, overridable through kv_connector_extra_config.
+      A sibling `transfer_timeout` (default 30s, same entry point) bounds
+      the wait for a transfer to complete.
+      ⚠️ Not to be confused with VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT --
+      that one IS a hardcoded MoRIIOConstants class attribute (3600, no env
+      override; the connector logs that env vars for it are deprecated and
+      ignored), but it is a read-abort deadline, not the block-reclaim
+      window. Reading it as "MoRIIO holds KV for an hour and it cannot be
+      shortened" is wrong on both halves.
+      No shipped mode uses MoRIIO (ROCm only), so nothing is injected today
+      and no platform default is claimed; the engine default is already
+      60s.
   - connector: sglang-mooncake
     param: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
     inject_to: env
-    # The engine default is not in the measured record, so nothing is
-    # injected and no platform default is claimed.
-    engine_default: null
+    # Measured: environ.py declares EnvInt(300). Recording it changes no
+    # behaviour -- the env injection path applies gpustack_default only and
+    # never falls back to engine_default -- but it makes the window
+    # auditable instead of unknown.
+    engine_default: 300
+    # Deliberately null, and not 60 like the vLLM connectors. This is not a
+    # lease: it is how long prefill waits for decode to send the KV indices,
+    # so shortening it kills healthy requests whose decode simply queued for
+    # a while. The engine's own log tells operators to raise it to 600 when
+    # mean TTFT is high, which says the field pressure is toward longer, not
+    # shorter. A platform value needs a measurement first.
     gpustack_default: null
     expired_metric: null
     description: >-
       SGLang has no lease: prefill aborts the request and frees its tree
-      cache when the bootstrap wait times out.
+      cache when the bootstrap wait times out. Enforced in the shared base
+      (CommonKVSender._check_bootstrap_timeout), so every SGLang transfer
+      backend inherits it -- see sglang-nixl.
   - connector: sglang-nixl
-    param: null
-    inject_to: none
-    settable: false
+    param: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+    inject_to: env
+    engine_default: 300
+    gpustack_default: null
     expired_metric: null
     description: >-
-      SGLang's nixl backend has neither a prefill-side release
-      notification nor a prefill-side reclaim timeout. A request cancelled
-      before decode starts the transfer strands its KV on prefill until the
-      instance restarts — there is nothing to inject and nothing to
-      scrape, which is the whole reason this field is declarable.
+      Same window as sglang-mooncake, and for the same reason: the timeout
+      is enforced in the shared base, and NixlKVManager/NixlKVSender extend
+      CommonKVManager/CommonKVSender, so nixl/conn.py calls
+      _check_bootstrap_timeout() exactly as mooncake/conn.py does.
+      ⚠️ This entry previously claimed the backend had "neither a
+      prefill-side release notification nor a prefill-side reclaim
+      timeout". The second half was wrong -- it has the shared bootstrap
+      timeout. What it still lacks is the *release notification*: nothing
+      tells prefill that decode aborted, so a request cancelled before the
+      transfer starts holds its KV for the full window rather than being
+      freed early the way NIXL's empty-block-list notify does.
 
 # Per-connector KV-transfer counters (X2 §3.1 / §3.2), keyed by the same
 # connector id kv_leases uses — the transport decides both the lease window
@@ -234,6 +271,28 @@ modes:
         - { name: prometheus, count: 1, inject_to: args }
       command:
         - vllm-router
+        # Verified on a real 1P1D 2026-08-28 (F12): two-hop orchestration
+        # unchanged, `POST /workers` with `worker_type` enters the registry and
+        # takes traffic, `vllm_router_pd_*` metric names and labels identical,
+        # and DELETE removes a member in 18ms even with a request in flight.
+        # This flag is what makes `membership_api_usable` true, i.e. what makes
+        # a ratio change something other than a full-group outage.
+        #
+        # ⚠️ The peers below are REQUIRED to start -- without `--prefill` the
+        # router refuses to launch.
+        #
+        # 🔄 Corrected 2026-09-01 on 910B2 (`vllm-router` shipped with vLLM
+        # 0.20.2): the CLI peers DO enter the registry under igw. A 1P1D
+        # started with `--enable-igw --prefill ... --decode ...` reports both
+        # members in `GET /workers` with the right `worker_type`, answers
+        # `/v1/models` 200, and serves a two-hop request. An earlier note here
+        # claimed `total: 0` and a 503 window until the membership API had
+        # registered everyone -- what was actually observed was the startup
+        # transient, before the router finished probing its peers. Whether the
+        # older reading holds on a newer router build is unverified; treat the
+        # registry contents as version-dependent and read `GET /workers`
+        # rather than assuming either way.
+        - --enable-igw
         - --vllm-pd-disaggregation
         - --kv-connector
         - nixl
@@ -360,6 +419,45 @@ modes:
         # failover — it converts "slow" into "dead". Upstream has
         # `--disable-circuit-breaker`; whether to use it per-role is
         # open-questions F20.
+        # 🔬 MEASURED 2026-09-01, and it changes what these two flags mean
+        # *on this recipe*. Single-variable rig: two HTTP stubs, prefill
+        # returning 500 to everything, decode returning 200; the same
+        # `vllm-router` 0.1.15 this catalog ships; `--cb-failure-threshold 2`
+        # both arms.
+        #
+        #   with --vllm-pd-disaggregation : 12/12 requests returned 200,
+        #     prefill was hit 12 times and failed 12 times, circuit never
+        #     opened, and no error metric moved at all.
+        #   without it (plain router)     : request 1-2 returned 500, and
+        #     request 3 onward returned 503 "No available workers (all
+        #     circuits open or unhealthy)" in 0.2ms.
+        #
+        # The breaker is *read* on the PD path (`get_healthy_worker_indices`
+        # tests `circuit_breaker().can_execute()`) but never written:
+        # `record_outcome()` has exactly one caller in the whole crate,
+        # `routers/http/router.rs:603`, which is the non-PD router. So on this
+        # recipe the value below is inert -- neither the 2 that caused the
+        # outage nor the 10 that fixed it would do anything here.
+        #
+        # 🔴 The failure that justified raising it was on **SGLang** 1P1D
+        # (`smg_worker_health` is sgl-model-gateway's metric), and there the
+        # breaker *is* fed -- `pd_router.rs` calls `record_outcome` in six
+        # places. The reasoning above is sound and the value is right; it just
+        # belongs to the sglang recipes. It is kept here so the two stay in
+        # step, and because an inert flag costs nothing -- but do not debug a
+        # vLLM PD outage by tuning it, and do not assume this recipe has
+        # request-path failure detection. It has none.
+        #
+        # 🔴 Worse, and the reason this matters beyond the flag: the router
+        # never checks prefill's HTTP status at all. `vllm_pd_router.rs:1258`
+        # only treats a *transport* error as a prefill failure; a 500 lands in
+        # the Ok branch, gets logged at `debug!`, and the request proceeds to
+        # decode and returns 200. In the rig above,
+        # `vllm_router_pd_prefill_requests_total` read **12** for twelve
+        # prefills that all failed. ⇒ the PD-effectiveness *denominator*
+        # counts failures as successes, the same class of fault as the
+        # numerator drift in open-questions §1.9d. Detection has to come from
+        # GPUStack, not from this flag.
         - --cb-failure-threshold
         - "10"
         - --retry-max-retries
@@ -798,6 +896,28 @@ modes:
       image: "{{runner_image}}"
       command:
         - vllm-router
+        # Verified on a real 1P1D 2026-08-28 (F12): two-hop orchestration
+        # unchanged, `POST /workers` with `worker_type` enters the registry and
+        # takes traffic, `vllm_router_pd_*` metric names and labels identical,
+        # and DELETE removes a member in 18ms even with a request in flight.
+        # This flag is what makes `membership_api_usable` true, i.e. what makes
+        # a ratio change something other than a full-group outage.
+        #
+        # ⚠️ The peers below are REQUIRED to start -- without `--prefill` the
+        # router refuses to launch.
+        #
+        # 🔄 Corrected 2026-09-01 on 910B2 (`vllm-router` shipped with vLLM
+        # 0.20.2): the CLI peers DO enter the registry under igw. A 1P1D
+        # started with `--enable-igw --prefill ... --decode ...` reports both
+        # members in `GET /workers` with the right `worker_type`, answers
+        # `/v1/models` 200, and serves a two-hop request. An earlier note here
+        # claimed `total: 0` and a 503 window until the membership API had
+        # registered everyone -- what was actually observed was the startup
+        # transient, before the router finished probing its peers. Whether the
+        # older reading holds on a newer router build is unverified; treat the
+        # registry contents as version-dependent and read `GET /workers`
+        # rather than assuming either way.
+        - --enable-igw
         - --vllm-pd-disaggregation
         # 🔴 `nixl`, on a mode whose transport backend is Mooncake, and that is
         # not a mistake: this flag names the *wire protocol shape*, not the
@@ -847,6 +967,45 @@ modes:
         # failover — it converts "slow" into "dead". Upstream has
         # `--disable-circuit-breaker`; whether to use it per-role is
         # open-questions F20.
+        # 🔬 MEASURED 2026-09-01, and it changes what these two flags mean
+        # *on this recipe*. Single-variable rig: two HTTP stubs, prefill
+        # returning 500 to everything, decode returning 200; the same
+        # `vllm-router` 0.1.15 this catalog ships; `--cb-failure-threshold 2`
+        # both arms.
+        #
+        #   with --vllm-pd-disaggregation : 12/12 requests returned 200,
+        #     prefill was hit 12 times and failed 12 times, circuit never
+        #     opened, and no error metric moved at all.
+        #   without it (plain router)     : request 1-2 returned 500, and
+        #     request 3 onward returned 503 "No available workers (all
+        #     circuits open or unhealthy)" in 0.2ms.
+        #
+        # The breaker is *read* on the PD path (`get_healthy_worker_indices`
+        # tests `circuit_breaker().can_execute()`) but never written:
+        # `record_outcome()` has exactly one caller in the whole crate,
+        # `routers/http/router.rs:603`, which is the non-PD router. So on this
+        # recipe the value below is inert -- neither the 2 that caused the
+        # outage nor the 10 that fixed it would do anything here.
+        #
+        # 🔴 The failure that justified raising it was on **SGLang** 1P1D
+        # (`smg_worker_health` is sgl-model-gateway's metric), and there the
+        # breaker *is* fed -- `pd_router.rs` calls `record_outcome` in six
+        # places. The reasoning above is sound and the value is right; it just
+        # belongs to the sglang recipes. It is kept here so the two stay in
+        # step, and because an inert flag costs nothing -- but do not debug a
+        # vLLM PD outage by tuning it, and do not assume this recipe has
+        # request-path failure detection. It has none.
+        #
+        # 🔴 Worse, and the reason this matters beyond the flag: the router
+        # never checks prefill's HTTP status at all. `vllm_pd_router.rs:1258`
+        # only treats a *transport* error as a prefill failure; a 500 lands in
+        # the Ok branch, gets logged at `debug!`, and the request proceeds to
+        # decode and returns 200. In the rig above,
+        # `vllm_router_pd_prefill_requests_total` read **12** for twelve
+        # prefills that all failed. ⇒ the PD-effectiveness *denominator*
+        # counts failures as successes, the same class of fault as the
+        # numerator drift in open-questions §1.9d. Detection has to come from
+        # GPUStack, not from this flag.
         - --cb-failure-threshold
         - "10"
         - --retry-max-retries

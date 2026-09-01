@@ -66,6 +66,18 @@ class KVTransferBudgetRequest(BaseModel):
     the model config — it depends on the accelerator — so when it is absent the
     transfer gets a fixed share of the budget instead."""
 
+    transfer_budget_ms: Optional[float] = Field(default=None, gt=0)
+    """The transfer's window, stated directly instead of derived.
+
+    Wins over `ttft_budget_ms` and `prefill_ms`, and exists because deriving
+    the window costs a caller two assumptions to state one number. "Move this
+    KV within 200 ms" is a single premise a reader can accept or reject; "a
+    500 ms TTFT target, of which the transfer gets a third" is the same 167 ms
+    arrived at through a share the caller did not choose and cannot see.
+
+    The derived path stays for the caller that genuinely has a TTFT budget and
+    a prefill measurement, where subtracting is the right arithmetic."""
+
     measured_bandwidth_bytes_per_second: Optional[float] = Field(default=None, gt=0)
     """The slot baseline probing will fill. Present now so the response shape
     does not change when it lands."""
@@ -182,11 +194,15 @@ async def estimate_kv_transfer_budget(
             )
         )
 
-    budget_seconds = transfer_budget_seconds(
-        ttft_budget_seconds=request.ttft_budget_ms / 1000.0,
-        prefill_seconds=(
-            request.prefill_ms / 1000.0 if request.prefill_ms is not None else None
-        ),
+    budget_seconds = (
+        request.transfer_budget_ms / 1000.0
+        if request.transfer_budget_ms is not None
+        else transfer_budget_seconds(
+            ttft_budget_seconds=request.ttft_budget_ms / 1000.0,
+            prefill_seconds=(
+                request.prefill_ms / 1000.0 if request.prefill_ms is not None else None
+            ),
+        )
     )
     if budget_seconds is None:
         raise BadRequestException(

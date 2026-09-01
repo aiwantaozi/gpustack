@@ -193,3 +193,30 @@ async def test_exactly_one_of_id_or_source_is_required(body):
     alongside a fresh source and get an answer about neither."""
     with pytest.raises(BadRequestException):
         await _estimate(**body)
+
+
+@pytest.mark.asyncio
+async def test_a_stated_transfer_window_wins_over_the_derived_one():
+    """The panel states the window directly, and it has to be the window used.
+
+    Derived, the same 200 ms would take a TTFT target and a share to express,
+    and a reader can only argue with premises they can see.
+    """
+    stated = await _estimate(transfer_budget_ms=200)
+    assert stated.transfer_budget_ms == pytest.approx(200.0)
+    assert stated.required_bandwidth_bytes_per_second == pytest.approx(
+        stated.bytes_per_request / 0.2
+    )
+
+    # Supplied alongside the derived inputs it still wins, rather than the two
+    # silently averaging into a third number that is neither.
+    both = await _estimate(transfer_budget_ms=200, ttft_budget_ms=500, prefill_ms=100)
+    assert both.transfer_budget_ms == pytest.approx(200.0)
+
+
+@pytest.mark.asyncio
+async def test_the_derived_window_still_works_without_a_stated_one():
+    """The TTFT-minus-prefill path is the right arithmetic for a caller that
+    has both, so it survives the addition."""
+    derived = await _estimate(ttft_budget_ms=500, prefill_ms=200)
+    assert derived.transfer_budget_ms == pytest.approx(300.0)

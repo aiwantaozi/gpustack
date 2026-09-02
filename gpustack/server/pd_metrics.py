@@ -49,6 +49,20 @@ traffic does not. What matters is the order of magnitude — a working pair
 transfers about once per request, so anything near zero is a different
 regime, not a worse one."""
 
+DEGRADED_RATIO = 0.8
+"""Below this, KV is crossing for some requests and not for others.
+
+The band `AGGREGATED_RATIO` alone cannot see. Measured against a 3P1D group
+with one prefill's connector broken, the ratio sits near 0.67 — two thirds of
+the traffic disaggregating perfectly — and a single "is it above 0.01" test
+calls that healthy. It is the shape the comparison report found across five of
+the six orchestrators: a capability that stops working for part of the traffic
+while the deployment keeps serving and nothing says so.
+
+🔴 Only applied to a ratio whose healthy value is known to be 1.0, which is
+why `judge` takes it as an argument instead of reading it here. See the
+`degraded_below` parameter."""
+
 _COLLECT_DEADLINE_SECONDS = 15.0
 
 
@@ -171,6 +185,11 @@ class PDMetricsPublic(BaseModel):
     """The verdict:
 
     - `effective` — KV is crossing in proportion to the requests routed.
+    - `degraded` — 🟠 KV is crossing for some of the traffic and not for the
+      rest. One member of a pool has stopped participating while the others
+      still work, so the group serves correctly at a fraction of the benefit.
+      Only ever reported where the healthy ratio is known to be 1.0; see
+      `judge`.
     - `aggregated` — 🔴 requests are being routed and effectively no KV is
       crossing. Disaggregation has silently collapsed: the deployment still
       answers correctly, logs nothing and shows every instance running, so
@@ -233,8 +252,30 @@ def _selectors(model_id: int, counted_role: str) -> dict:
     }
 
 
-def judge(transfers: Optional[float], requests: Optional[float]) -> str:
+def judge(
+    transfers: Optional[float],
+    requests: Optional[float],
+    degraded_below: Optional[float] = None,
+) -> str:
     """The verdict, and the three ways it can decline to give one.
+
+    🔴 `degraded_below` is passed by exactly one caller, and the asymmetry is
+    the point. A partial-degradation band needs a ratio whose healthy value is
+    a known constant, and only the token ratio has one: vLLM guarantees
+    `local_compute + local_cache_hit + external_kv_transfer = total`, so a
+    fully disaggregating group reads exactly 1.0 and any shortfall is the
+    share of prompt tokens that had to be recomputed.
+
+    The transfer ratio has no such baseline. Its numerator counts transfer
+    *operations* and its denominator counts requests, and how many operations
+    one request costs is a property of the connector — the ratio runs above
+    1.0 in practice. So the same 0.8 would read a healthy connector that
+    averages 0.9 transfers per request as degraded, and would miss a third of
+    the traffic failing on one that averages 1.4. Worse, the two operands come
+    from different exporters scraped at different moments, where 20% is inside
+    the noise. A band there would be a number with no meaning, fired at
+    deployments that are fine — which is the failure mode this whole endpoint
+    exists to avoid.
 
     - no denominator at all -> `unmeasurable`. An idle group and one that has
       degraded to aggregated serving are indistinguishable without knowing
@@ -256,8 +297,11 @@ def judge(transfers: Optional[float], requests: Optional[float]) -> str:
         return "unmeasurable"
     if requests <= 0:
         return "idle" if transfers <= 0 else "unmeasurable"
-    if transfers / requests < AGGREGATED_RATIO:
+    ratio = transfers / requests
+    if ratio < AGGREGATED_RATIO:
         return "aggregated"
+    if degraded_below is not None and ratio < degraded_below:
+        return "degraded"
     return "effective"
 
 
@@ -297,11 +341,18 @@ def _fill_verdict(result: PDMetricsPublic, values: dict) -> None:
 
     **Per token (`engine_tokens`).** vLLM splits every prompt token by origin
     and guarantees `local_compute + local_cache_hit + external_kv_transfer =
-    total`, so the external share is already a ratio. Both operands come from
-    the same engine in the same window, which removes the whole class of
-    problems the other form has: no router counter to be missing or coarse, no
+    total`. The ratio is taken over the first and third only — of the tokens
+    decode could not get from its own cache, the share that arrived over the
+    wire rather than being computed a second time. Both operands come from the
+    same engine in the same window, which removes the whole class of problems
+    the other form has: no router counter to be missing or coarse, no
     two-counter skew, and a partially-transferred prompt shows up as a
     fraction instead of counting as one transfer.
+
+    ⚠️ `local_cache_hit` is excluded from the denominator on purpose. Those
+    tokens were never going to cross, so counting them as a shortfall blames
+    the connector for decode's prefix cache doing its job — measured at 0.70
+    on a healthy group whose decode recomputed nothing.
 
     **Per transfer (`router_*`).** Transfers over requests the router
     dispatched. The only form available where the engine does not break prompt
@@ -314,13 +365,20 @@ def _fill_verdict(result: PDMetricsPublic, values: dict) -> None:
     tell which they are looking at.
     """
     external = values.get("external_tokens")
-    prompt = values.get("receiving_role_prompt_tokens")
-    if external is not None and prompt is not None and prompt > 0:
-        result.routed_request_count = prompt
-        result.request_count_source = "engine_tokens"
-        result.kv_transfers_per_request = external / prompt
-        result.status = judge(external, prompt)
-        return
+    recomputed = values.get("recomputed_tokens")
+    if external is not None and recomputed is not None:
+        # Deliberately not the prompt total: decode's own prefix-cache hits are
+        # the third source, and those tokens were never going to cross. Falling
+        # through when this is zero is the honest answer for a window whose
+        # every token came from that cache -- PD was not exercised, so there is
+        # nothing here to judge, and the transfer counters below may still know.
+        boundary = external + recomputed
+        if boundary > 0:
+            result.routed_request_count = boundary
+            result.request_count_source = "engine_tokens"
+            result.kv_transfers_per_request = external / boundary
+            result.status = judge(external, boundary, degraded_below=DEGRADED_RATIO)
+            return
 
     if values["requests_per_worker"] is not None:
         result.routed_request_count = values["requests_per_worker"]

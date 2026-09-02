@@ -170,7 +170,7 @@ def test_no_counter_at_all_is_unmeasurable():
 def _values(**over):
     base = {
         "external_tokens": None,
-        "receiving_role_prompt_tokens": None,
+        "recomputed_tokens": None,
         "requests_per_worker": None,
         "requests_total": None,
     }
@@ -190,7 +190,7 @@ def test_the_engines_own_token_split_wins_over_the_router_counter():
     second counter to be missing, coarse, or scraped at a different moment."""
     r = _verdict(
         external_tokens=440.0,
-        receiving_role_prompt_tokens=440.0,
+        recomputed_tokens=0.0,
         requests_per_worker=8.0,
         transfers=8.0,
     )
@@ -204,16 +204,69 @@ def test_a_prompt_decode_had_to_recompute_lowers_the_ratio():
     itself, and they landed in `local_compute`. That is the silent degradation
     — 200 OK, correct answer, no error anywhere — and this is the first signal
     that catches it without a router counter to compare against."""
-    r = _verdict(external_tokens=0.0, receiving_role_prompt_tokens=32.0)
+    r = _verdict(external_tokens=0.0, recomputed_tokens=32.0)
     assert r.request_count_source == "engine_tokens"
     assert r.kv_transfers_per_request == 0.0
     assert r.status == "aggregated"
 
 
+def test_one_member_of_a_pool_dropping_out_is_caught_as_degraded():
+    """The gap the 0.01 threshold left open. A 3P1D group with one prefill's
+    connector broken transfers two thirds of its traffic perfectly, and a
+    single "is it above 0.01" test called that healthy — the exact shape the
+    orchestrator comparison found in five of six competitors: a capability
+    that stops working for part of the traffic while the deployment keeps
+    serving and nothing says so."""
+    r = _verdict(external_tokens=67.0, recomputed_tokens=33.0)
+    assert r.status == "degraded"
+    assert r.kv_transfers_per_request == 0.67
+
+
+def test_the_band_does_not_swallow_the_silent_collapse():
+    """`degraded` is a milder alarm, so it must not absorb the loud one."""
+    assert _verdict(external_tokens=0.0, recomputed_tokens=100.0).status == (
+        "aggregated"
+    )
+
+
+def test_a_fully_disaggregating_group_is_still_effective():
+    """The healthy ratio is exactly 1.0 by the engine's own invariant, so the
+    band must not fire on a group that is working."""
+    assert _verdict(external_tokens=100.0, recomputed_tokens=0.0).status == "effective"
+
+
+def test_a_warm_decode_prefix_cache_is_not_a_degradation():
+    """🔴 The false positive the denominator exists to avoid. Measured
+    2026-09-02 on a healthy 1P1D, three requests sharing a prefix: decode read
+    local_compute=0, local_cache_hit=64.1, external=152.8. Over the prompt
+    total that is 0.70 — inside the band — on a group where decode recomputed
+    nothing at all. Over external+local_compute it is 1.0, which is the truth.
+    """
+    r = _verdict(external_tokens=152.8, recomputed_tokens=0.0)
+    assert r.status == "effective"
+    assert r.kv_transfers_per_request == 1.0
+
+
+def test_the_transfer_ratio_is_never_banded():
+    """🔴 The band needs a ratio whose healthy value is a known constant, and
+    only the token ratio has one. Transfers-over-requests counts operations
+    over requests, and how many operations a request costs is a connector
+    property that runs above 1.0 — so the same 0.8 would call a connector
+    averaging 0.9 transfers per request degraded while it is fine."""
+    r = _verdict(requests_per_worker=100.0, transfers=67.0)
+    assert r.request_count_source == "router_per_worker"
+    assert r.status == "effective"
+
+
+def test_the_band_is_opt_in_at_the_judge_level():
+    assert judge(transfers=0.67, requests=1.0) == "effective"
+    assert judge(transfers=0.67, requests=1.0, degraded_below=0.8) == "degraded"
+
+
 def test_a_partial_transfer_is_a_fraction_not_a_whole_transfer():
     """What the per-transfer form cannot express: half a prompt arriving over
     the wire counts as one transfer there and as 0.5 here."""
-    r = _verdict(external_tokens=220.0, receiving_role_prompt_tokens=440.0)
+    r = _verdict(external_tokens=220.0, recomputed_tokens=220.0)
     assert r.kv_transfers_per_request == 0.5
 
 
@@ -230,9 +283,7 @@ def test_a_zero_prompt_total_does_not_claim_the_stronger_form():
     """An idle window has no tokens to attribute; falling through to the
     router counter is what distinguishes "nobody called it" from "it was
     called and nothing crossed"."""
-    r = _verdict(
-        external_tokens=0.0, receiving_role_prompt_tokens=0.0, requests_total=3.0
-    )
+    r = _verdict(external_tokens=0.0, recomputed_tokens=0.0, requests_total=3.0)
     assert r.request_count_source == "router_total"
 
 
@@ -241,7 +292,7 @@ def test_a_zero_prompt_total_does_not_claim_the_stronger_form():
 
 def test_the_token_ratio_is_declared_over_the_receiving_role():
     declared = _declared()
-    for key in ("external_tokens", "receiving_role_prompt_tokens"):
+    for key in ("external_tokens", "recomputed_tokens"):
         assert key in declared, key
         assert declared[key].counter_increase.scope is QueryScopeEnum.RECEIVING_ROLE
 
@@ -257,14 +308,17 @@ def test_the_receiving_role_stays_decode_when_the_counting_role_is_prefill():
     assert 'role="prefill"' not in q
 
 
-def test_only_the_numerator_narrows_to_the_external_source():
-    """The denominator must stay the whole prompt: narrowing both would make
-    the ratio 1.0 by construction and it would never be able to fall."""
+def test_the_two_operands_name_the_two_sources_they_mean():
+    """Both narrow, and to different sources. The third — `local_cache_hit` —
+    is in neither, which is the whole design: it is not a shortfall, so it
+    belongs in no part of a ratio measuring shortfall."""
     declared = _declared()
     assert declared["external_tokens"].counter_increase.labels == {
         "source": "external_kv_transfer"
     }
-    assert declared["receiving_role_prompt_tokens"].counter_increase.labels is None
+    assert declared["recomputed_tokens"].counter_increase.labels == {
+        "source": "local_compute"
+    }
 
 
 def test_the_source_narrowing_reaches_the_query():

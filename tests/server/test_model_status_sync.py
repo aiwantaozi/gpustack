@@ -817,3 +817,63 @@ def test_the_migration_only_writes_values_the_writer_produces():
         f"the backfill writes {sorted(produced - reachable)}, which "
         f"derive_model_state never produces for a role-less model"
     )
+
+
+# --- readiness: any_per_role vs all ----------------------------------------- #
+
+
+def _readiness_state(readiness, ready, desired=4):
+    """A 4P1D group with `ready` prefills up, judged under one policy."""
+    from gpustack.schemas.models import DisaggregationSpec, PDModeEnum
+
+    model = _model(replicas=1, roles=_pd_roles(prefill=desired))
+    if readiness is not None:
+        model.disaggregation = DisaggregationSpec(
+            mode=PDModeEnum.VLLM_NIXL, readiness=readiness
+        )
+    role_status = {
+        "prefill": SimpleNamespace(desired=desired, ready=ready),
+        "decode": SimpleNamespace(desired=1, ready=1),
+        "router": SimpleNamespace(desired=1, ready=1),
+    }
+    with patch(
+        "gpustack.server.controllers.upstream_registration_ready", return_value=True
+    ):
+        return derive_model_state(
+            model,
+            ready_replicas=ready + 2,
+            instance_count=desired + 2,
+            role_status=role_status,
+            error_count=0,
+        )
+
+
+def test_the_default_serves_a_group_that_is_short_of_its_ratio():
+    """Unchanged behaviour, and the reason it is the default: requiring full
+    staffing would make every scale-up an outage for its whole duration."""
+    state, _ = _readiness_state("any_per_role", ready=3)
+    assert state == ModelStateEnum.RUNNING
+
+
+def test_readiness_all_withholds_a_group_that_is_short_of_its_ratio():
+    """Measured 2026-09-01: `readiness="all"` was accepted, stored and read
+    back while the judgement stayed hard-coded to the other policy — a 3/4
+    prefill group reported RUNNING with `ready_targets=1`, byte for byte what
+    `any_per_role` produces. A setting that reads back but changes nothing is
+    worse than an absent one."""
+    state, message = _readiness_state("all", ready=3)
+    assert state == ModelStateEnum.PARTIAL
+    assert "prefill" in message
+
+
+def test_readiness_all_serves_once_every_member_is_up():
+    state, _ = _readiness_state("all", ready=4)
+    assert state == ModelStateEnum.RUNNING
+
+
+def test_a_group_with_no_disaggregation_block_uses_the_default():
+    """Role-only orchestration has no `disaggregation` at all, and a row
+    written before the field existed deserialises without it. Both must read
+    as the forgiving policy rather than raise."""
+    state, _ = _readiness_state(None, ready=3)
+    assert state == ModelStateEnum.RUNNING

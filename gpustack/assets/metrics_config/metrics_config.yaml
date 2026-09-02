@@ -342,13 +342,25 @@ metric_queries:
           scope: receiving_role
           labels:
             source: external_kv_transfer
-      # Deliberately NOT named `prompt_tokens`: that key already exists below
-      # as a per-role group figure, and one name for two different scopes is
-      # how a query silently starts answering a question nobody asked.
-      receiving_role_prompt_tokens:
+      # 🔴 The denominator is external + this, NOT the prompt total. The third
+      # source, `local_cache_hit`, is decode's own prefix cache doing its job:
+      # those tokens were never going to cross, so counting them as a shortfall
+      # blames the connector for a cache hit. Measured 2026-09-02 on a healthy
+      # 1P1D, three requests sharing a prefix: decode read local_compute=0,
+      # local_cache_hit=64.1, external=152.8 -- external/total = 0.70, which the
+      # partial-degradation band would have called degraded on a group where
+      # nothing was recomputed at all.
+      #
+      # Against this denominator the ratio is exactly what the verdict claims:
+      # of the tokens decode could not get from its own cache, the share that
+      # arrived over the wire instead of being computed a second time. Healthy
+      # is 1.0 by construction, which is what makes a fixed band meaningful.
+      recomputed_tokens:
         counter_increase:
           metric: gpustack:pd_prompt_tokens_by_source_total
           scope: receiving_role
+          labels:
+            source: local_compute
       # `_count` of the seconds histogram IS the transfer count, so the
       # numerator needs no separate counter. Read from the SECONDS family and
       # not the bytes one: SGLang 0.5.15 dropped its bytes histogram, and the

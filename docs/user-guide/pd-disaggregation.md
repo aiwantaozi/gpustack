@@ -221,10 +221,17 @@ save time rather than at run time:
 ## Limitations
 
 - The router runs as a single replica.
-- **A `custom` router is deployed exactly as written.** The built-in modes
-  narrow the upstream router's circuit breaker so a dead role member is taken
-  out of rotation after two failed requests rather than ten; a router you
-  supply keeps whatever defaults it ships with.
+- **A `custom` router is deployed exactly as written.** The built-in modes set
+  the upstream router's circuit breaker to its default threshold of ten failed
+  requests; a router you supply keeps whatever defaults it ships with.
+- **On the vLLM modes, a prefill member that returns errors is not taken out
+  of rotation.** The upstream router treats only a transport error as a
+  prefill failure, so an HTTP 500 from prefill is logged and the request
+  proceeds to decode and returns 200 — measured with a stub prefill failing
+  every one of twelve requests, none of which opened the circuit. The SGLang
+  modes do feed the breaker. Either way, the **PD Effectiveness** figure in
+  the group's panel is what detects a member that has stopped contributing;
+  the router's own request counters will not show it.
 - **A member that dies while the group is idle is noticed on the next request,
   not before it.** Detection rides the request path, so with no traffic there
   is nothing to detect on; the router's background sweep runs once a minute.
@@ -233,4 +240,8 @@ save time rather than at run time:
 - All members of a group must use the same GPU type; a group mixing card types
   cannot be admitted atomically.
 - Roles are limited to prefill, decode and router.
-- Prefix-aware routing is not available; the router balances round-robin.
+- **Prefix-aware routing is used to pick prefill, and not to pick decode.**
+  Prefill is where a shared prefix pays off, so the built-in modes route it by
+  approximate prefix match; decode holds a request for its whole generation,
+  so it is balanced round-robin to keep the load even. The `vllm-ascend-mooncake`
+  mode keeps the router's own defaults for both.

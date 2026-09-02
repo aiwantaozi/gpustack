@@ -2409,6 +2409,25 @@ def _ratio_unmet(
     return ready_replicas < model.replicas
 
 
+def _requires_every_member(model: Model) -> bool:
+    """Whether this group is servable only at full staffing.
+
+    ⚠️ Read defensively rather than as `model.disaggregation.readiness`. The
+    column is JSON, so a row written before the field existed deserialises
+    without it, and a role-only deployment (multi-role orchestration with no
+    PD) has no `disaggregation` at all. Both must mean the default, not raise.
+
+    Not exposed in the deployment form yet. The semantics live here so that
+    the value a user can already set through the API is the value the group
+    is judged by -- a stored setting that changes nothing is worse than an
+    absent one, because it reads back as if it took effect.
+    """
+    disaggregation = getattr(model, "disaggregation", None)
+    if disaggregation is None:
+        return False
+    return getattr(disaggregation, "readiness", None) == "all"
+
+
 def derive_model_state(
     model: Model,
     *,
@@ -2445,8 +2464,19 @@ def derive_model_state(
         # make a 2P3D deployment unservable for the whole duration of a
         # scale-up (F7 3.1). Falling short of the declared ratio while every
         # role is covered is a degradation, not a lifecycle value.
+        #
+        # `readiness: all` is the other answer to the same question, for a
+        # deployment sized so that a partial group is worse than no group --
+        # a ratio tuned to a known load degrades into queueing rather than
+        # into reduced throughput. It moves the shortfall from `degradations`
+        # into `state`, which is a real behaviour change: the endpoint stops
+        # accepting traffic during a scale-up instead of serving through it.
+        # Hence per-deployment and defaulting to the forgiving one.
+        require_full = _requires_every_member(model)
         roles_missing = sorted(
-            name for name, status in role_status.items() if status.ready == 0
+            name
+            for name, status in role_status.items()
+            if (status.ready < status.desired if require_full else status.ready == 0)
         )
         if not roles_missing and upstream_registration_ready(model):
             return ModelStateEnum.RUNNING, None

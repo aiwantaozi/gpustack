@@ -357,8 +357,16 @@ def test_a_warning_does_not_get_reported_as_the_cause_of_a_fatal_error():
 
     The rule stands *within* a cascade of derived errors, which is what it was
     written for. A warning is not part of that cascade; it merely comes first.
+
+    The memory-sizing failure now has a signature of its own, so this log
+    resolves to it rather than to silence. What the test still pins is the
+    property the regression was about: whatever comes back, it is not the RDMA
+    warning.
     """
-    assert diagnose(_REAL_SGLANG_PREFILL_LOG) is None
+    result = diagnose(_REAL_SGLANG_PREFILL_LOG)
+    assert result is not None
+    assert result.signature == "no memory left for kv cache"
+    assert "--mem-fraction-static" in result.line
 
 
 def test_a_warning_is_still_reported_when_nothing_fatal_is_hiding_behind_it():
@@ -396,3 +404,65 @@ def test_the_word_error_on_a_line_outranks_the_word_warning():
     assert _is_warning("WARNING: rdma_create_event_channel failed")
     assert not _is_warning("ERROR: warning threshold exceeded, rdma_create_id failed")
     assert not _is_warning("E0828 01:41:15 nixl] NIXL_ERR_BACKEND")
+
+
+# --- running out of accelerator memory ------------------------------------- #
+
+
+def test_an_oom_exit_is_explained_instead_of_reported_as_exit_code_1():
+    """Measured 2026-09-01: a 2P1D group was admitted against 20.6 GB the
+    accounting said was free, the decode member died, and its `state_message`
+    read `Error (exit code 1)` with the reason only in the log. The router's
+    `exit 127` beside it carried a paragraph of actionable text, which is what
+    made the gap visible: OOM is the commonest deployment failure there is and
+    it was the one explained least."""
+    log = (
+        "INFO 09-01 11:20:03 [gpu_worker.py:298] Starting to load model...\n"
+        "torch.OutOfMemoryError: GPU 0 has a total capacity of 47.37 GiB of "
+        "which 147.50 MiB is free.\n"
+    )
+    result = diagnose(log)
+    assert result is not None
+    assert result.signature == "accelerator out of memory"
+    assert "147.50 MiB is free" in result.line
+
+
+def test_the_oom_summary_names_what_pd_does_to_the_arithmetic():
+    """Not a restatement of the error. The reason this failure keeps happening
+    on PD specifically is that each role's --gpu-memory-utilization is a
+    fraction of the whole card, so two roles both left at the default 0.9
+    over-commit it — and a group puts three to five processes where a plain
+    deployment puts one."""
+    result = diagnose("torch.OutOfMemoryError: CUDA out of memory.\n")
+    assert "gpu-memory-utilization" in result.summary
+
+
+def test_the_npu_form_is_recognised_too():
+    """The Ascend deployments are where a group is most likely to be packed
+    onto shared cards, and the engine words it differently there."""
+    result = diagnose("RuntimeError: NPU out of memory. Tried to allocate 2.00 GiB\n")
+    assert result is not None
+    assert result.signature == "accelerator out of memory"
+
+
+def test_weights_that_leave_no_room_for_kv_is_the_same_shortage_one_step_earlier():
+    """It surfaces as a ValueError, which reads like a configuration mistake
+    and is in fact a sizing one — so it gets its own summary rather than being
+    folded into the OOM text."""
+    result = diagnose(
+        "ValueError: No available memory for the cache blocks. Try increasing "
+        "gpu_memory_utilization when initializing the engine.\n"
+    )
+    assert result is not None
+    assert result.signature == "no memory left for kv cache"
+
+
+def test_a_handshake_failure_still_outranks_a_later_oom():
+    """Earliest-match-wins is not weakened by adding these. A connector that
+    failed to hand shake and then died of memory is a handshake failure; the
+    OOM is downstream of it."""
+    log = (
+        "ERROR 09-01 11:20:03 NIXL_ERR_BACKEND creating backend\n"
+        "torch.OutOfMemoryError: CUDA out of memory.\n"
+    )
+    assert diagnose(log).signature == "NIXL_ERR_BACKEND"

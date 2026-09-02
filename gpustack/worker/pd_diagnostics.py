@@ -152,6 +152,36 @@ _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
         "the router role an image of its own that carries it.",
     ),
     (
+        "accelerator out of memory",
+        r"torch\.(cuda\.)?OutOfMemoryError|torch_npu.*OutOfMemoryError|"
+        r"CUDA out of memory|NPU out of memory|"
+        r"RuntimeError: NPU error, error code is 507899|"
+        r"out of memory\. Tried to allocate",
+        "The accelerator ran out of memory while this member was starting. "
+        "🔑 Read the group's total, not this member's: a disaggregated "
+        "deployment puts three to five processes on the cards a single "
+        "deployment would put one on, and each role's "
+        "--gpu-memory-utilization is a fraction of the WHOLE card, not of "
+        "what is left. Two roles both left at the default 0.9 means the one "
+        "that starts first takes almost everything and the second gets this. "
+        "Give each role an explicit fraction that sums to under 1.0 across "
+        "the members sharing a card, or place the roles on separate cards.",
+    ),
+    (
+        "no memory left for kv cache",
+        r"Loaded weights leave no (GPU|NPU) memory for the KV cache|"
+        r"No available memory for the cache blocks|"
+        r"Free memory on device .* is less than desired GPU memory "
+        r"utilization",
+        "The weights loaded but nothing was left for the KV cache, so the "
+        "engine cannot serve a single request. This is the same shortage as "
+        "an out-of-memory kill, caught one step earlier and reported as a "
+        "ValueError rather than a crash — which is why it reads as a "
+        "configuration error and is in fact a sizing one. Either this role's "
+        "share of the card is too small, or the members sharing the card "
+        "over-committed it between them.",
+    ),
+    (
         "kv connector conflict",
         r"kv[-_]transfer[-_]config.*(specified|duplicate|already)|"
         r"multiple.*kv_connector",
@@ -223,7 +253,10 @@ def diagnose(
             # "Earliest match wins" is right *within* a cascade of errors; a
             # warning is not part of that cascade, it just happens to come
             # first, and returning it renamed a memory-sizing failure as an
-            # RDMA problem.
+            # RDMA problem. That memory failure now has a signature of its
+            # own, so the same log resolves to it rather than to silence —
+            # but the rule still carries the case, because the next benign
+            # startup warning will sit in front of something unrecognised.
             if warned is None:
                 warned = found
             break

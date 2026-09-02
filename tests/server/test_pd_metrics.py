@@ -18,6 +18,8 @@ from gpustack.server.pd_metrics import (
     PDMetricsPublic,
     PDRoleMetrics,
     _derive_role_rates,
+    _fill_verdict,
+    _selectors,
     judge,
 )
 from gpustack.utils.metrics import get_builtin_metrics_config
@@ -157,3 +159,113 @@ def test_no_counter_at_all_is_unmeasurable():
     assert judge(transfers=None, requests=None) == "unmeasurable"
     assert judge(transfers=5.0, requests=None) == "unmeasurable"
     assert judge(transfers=None, requests=5.0) == "unmeasurable"
+
+
+# --- which ratio answers, and why -----------------------------------------
+
+
+def _values(**over):
+    base = {
+        "external_tokens": None,
+        "counted_role_prompt_tokens": None,
+        "requests_per_worker": None,
+        "requests_total": None,
+    }
+    base.update(over)
+    return base
+
+
+def _verdict(**over) -> PDMetricsPublic:
+    result = PDMetricsPublic(available=True)
+    result.kv_transfer.count = over.pop("transfers", None)
+    _fill_verdict(result, _values(**over))
+    return result
+
+
+def test_the_engines_own_token_split_wins_over_the_router_counter():
+    """Both operands then come from one engine in one window, so there is no
+    second counter to be missing, coarse, or scraped at a different moment."""
+    r = _verdict(
+        external_tokens=440.0,
+        counted_role_prompt_tokens=440.0,
+        requests_per_worker=8.0,
+        transfers=8.0,
+    )
+    assert r.request_count_source == "engine_tokens"
+    assert r.kv_transfers_per_request == 1.0
+    assert r.status == "effective"
+
+
+def test_a_prompt_decode_had_to_recompute_lowers_the_ratio():
+    """Measured 2026-09-01: bypassing the router made decode prefill 32 tokens
+    itself, and they landed in `local_compute`. That is the silent degradation
+    — 200 OK, correct answer, no error anywhere — and this is the first signal
+    that catches it without a router counter to compare against."""
+    r = _verdict(external_tokens=0.0, counted_role_prompt_tokens=32.0)
+    assert r.request_count_source == "engine_tokens"
+    assert r.kv_transfers_per_request == 0.0
+    assert r.status == "aggregated"
+
+
+def test_a_partial_transfer_is_a_fraction_not_a_whole_transfer():
+    """What the per-transfer form cannot express: half a prompt arriving over
+    the wire counts as one transfer there and as 0.5 here."""
+    r = _verdict(external_tokens=220.0, counted_role_prompt_tokens=440.0)
+    assert r.kv_transfers_per_request == 0.5
+
+
+def test_an_engine_without_the_breakdown_falls_back_to_the_router_counter():
+    """SGLang exports no per-source split, so the transfer/request form is the
+    only one available there and must keep working untouched."""
+    r = _verdict(requests_per_worker=5.0, transfers=5.0)
+    assert r.request_count_source == "router_per_worker"
+    assert r.kv_transfers_per_request == 1.0
+    assert r.status == "effective"
+
+
+def test_a_zero_prompt_total_does_not_claim_the_stronger_form():
+    """An idle window has no tokens to attribute; falling through to the
+    router counter is what distinguishes "nobody called it" from "it was
+    called and nothing crossed"."""
+    r = _verdict(
+        external_tokens=0.0, counted_role_prompt_tokens=0.0, requests_total=3.0
+    )
+    assert r.request_count_source == "router_total"
+
+
+# --- the declaration ------------------------------------------------------
+
+
+def test_the_token_ratio_is_declared_over_the_receiving_role():
+    declared = _declared()
+    for key in ("external_tokens", "counted_role_prompt_tokens"):
+        assert key in declared, key
+        assert declared[key].counter_increase.scope is QueryScopeEnum.COUNTED_ROLE
+
+
+def test_only_the_numerator_narrows_to_the_external_source():
+    """The denominator must stay the whole prompt: narrowing both would make
+    the ratio 1.0 by construction and it would never be able to fall."""
+    declared = _declared()
+    assert declared["external_tokens"].counter_increase.labels == {
+        "source": "external_kv_transfer"
+    }
+    assert declared["counted_role_prompt_tokens"].counter_increase.labels is None
+
+
+def test_the_source_narrowing_reaches_the_query():
+    declared = _declared()
+    q = build_query(declared["external_tokens"], _selectors(7, "decode"), "15m")
+    assert 'model_id="7"' in q
+    assert 'role="decode"' in q
+    assert 'source="external_kv_transfer"' in q
+
+
+def test_the_transfer_count_comes_from_the_duration_histogram():
+    """Not the bytes one: SGLang 0.5.15 dropped its bytes histogram, and the
+    duration histogram is the only family both engines still export."""
+    declared = _declared()
+    assert (
+        declared["transfers"].counter_increase.metric
+        == "gpustack:pd_kv_transfer_seconds_count"
+    )

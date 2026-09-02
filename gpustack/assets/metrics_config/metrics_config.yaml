@@ -158,6 +158,10 @@ gpustack_metrics:
     type: Counter
     description: "Requests the router dispatched to a decode worker."
 
+  gpustack:pd_prompt_tokens_by_source:
+    type: Counter
+    description: "Prompt tokens split by where they came from, on the `source` label: `local_compute` (this engine prefilled them), `local_cache_hit` (its own prefix cache), `external_kv_transfer` (they arrived from a KV connector). vLLM guarantees the three sum to the prompt total, which is what makes the external share a ratio rather than a count."
+
   gpustack:pd_router_requests:
     type: Counter
     description: "Requests the router handled, aggregated by route. The coarse denominator, used when no per-worker counter exists."
@@ -205,6 +209,11 @@ runtime_mapping:
       vllm_router_pd_decode_requests: gpustack:pd_router_decode_requests
       vllm_router_pd_requests: gpustack:pd_router_requests
       vllm:spec_decode_num_draft_tokens: gpustack:spec_decode_draft_tokens
+      # PD effectiveness, per token rather than per transfer. The engine
+      # itself says how much of each prompt it did NOT compute, so this needs
+      # no connector counter and no router denominator -- see the
+      # `external_token_share` query below.
+      vllm:prompt_tokens_by_source: gpustack:pd_prompt_tokens_by_source
     "<0.11.1":
       vllm:num_requests_swapped: gpustack:num_requests_swapped
     "<0.11.0":
@@ -306,11 +315,45 @@ runtime_mapping:
 metric_queries:
   pd:
     "*":
-      # `_count` of the bytes histogram IS the transfer count, so the
-      # numerator needs no separate counter.
+      # 🔑 The strongest effectiveness signal, where the engine reports it.
+      #
+      # vLLM splits every prompt token by origin and guarantees
+      # `local_compute + local_cache_hit + external_kv_transfer = total`, so
+      # the external share IS the ratio -- no connector counter, no router
+      # denominator, and both operands come from the same engine.
+      #
+      # Measured 2026-09-01 on three deployments: Ascend/Mooncake 0.20.2,
+      # x86/NIXL 0.27.1, and the same x86 group with the router bypassed. In
+      # the first two decode read `external=total, local_compute=0`; in the
+      # third the 32 tokens decode had to recompute landed in `local_compute`
+      # and the ratio fell. That third case is the silent degradation this
+      # whole endpoint exists to catch, and it is the first signal that
+      # catches it without a router counter to compare against.
+      #
+      # ⚠️ Always on the RECEIVING side, which is decode whether the connector
+      # pulls or pushes -- unlike the transfer counters, whose owning role is
+      # a connector property. `counted_role` is still used because it is
+      # decode for every mode that has this metric.
+      external_tokens:
+        counter_increase:
+          metric: gpustack:pd_prompt_tokens_by_source_total
+          scope: counted_role
+          labels:
+            source: external_kv_transfer
+      # Deliberately NOT named `prompt_tokens`: that key already exists below
+      # as a per-role group figure, and one name for two different scopes is
+      # how a query silently starts answering a question nobody asked.
+      counted_role_prompt_tokens:
+        counter_increase:
+          metric: gpustack:pd_prompt_tokens_by_source_total
+          scope: counted_role
+      # `_count` of the seconds histogram IS the transfer count, so the
+      # numerator needs no separate counter. Read from the SECONDS family and
+      # not the bytes one: SGLang 0.5.15 dropped its bytes histogram, and the
+      # duration histogram is the only one both engines still export.
       transfers:
         counter_increase:
-          metric: gpustack:pd_kv_transfer_bytes_count
+          metric: gpustack:pd_kv_transfer_seconds_count
           scope: counted_role
       bytes:
         counter_increase:

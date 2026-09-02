@@ -42,6 +42,17 @@ class MetricTerm(BaseModel):
     metric: str
     scope: QueryScopeEnum = QueryScopeEnum.GROUP
 
+    labels: Optional[Dict[str, str]] = None
+    """Extra equality matchers, ANDed with the scope's own.
+
+    For a metric that carries its answer in a label rather than in its name —
+    vLLM's `prompt_tokens_by_source` splits one counter three ways on `source`,
+    and only one of the three says "this arrived over the wire".
+
+    ⚠️ It can only ever *narrow*. The scope is applied first and decides which
+    series the caller is allowed to see, so a declaration cannot use this to
+    reach a model it was not given."""
+
 
 class HistogramQuantile(BaseModel):
     """A quantile of a histogram's observed values."""
@@ -142,17 +153,26 @@ def build_query(
     if query.group_by:
         by = f" by ({', '.join(query.group_by)})"
 
+    def selector(value) -> str:
+        """The scope's matchers, narrowed by the term's own if it has any."""
+        base = selectors[value.scope]
+        extra = getattr(value, "labels", None)
+        if not extra:
+            return base
+        matchers = ",".join(f'{k}="{v}"' for k, v in sorted(extra.items()))
+        # The scope always renders as `{...}`, so the narrowing is spliced in
+        # before the close rather than concatenated as a second selector —
+        # PromQL has no way to AND two brace groups.
+        return base[:-1] + "," + matchers + "}"
+
     def term(value: MetricTerm) -> str:
-        return f"sum{by}(increase({value.metric}{selectors[value.scope]}[{window}]))"
+        return f"sum{by}(increase({value.metric}{selector(value)}[{window}]))"
 
     if query.counter_increase:
         return term(query.counter_increase)
     if query.gauge_avg:
         value = query.gauge_avg
-        return (
-            f"avg{by}(avg_over_time({value.metric}"
-            f"{selectors[value.scope]}[{window}]))"
-        )
+        return f"avg{by}(avg_over_time({value.metric}" f"{selector(value)}[{window}]))"
     if query.gauge_last:
         value = query.gauge_last
         # Averaged across series exactly as `gauge_avg` is, so switching a
@@ -160,10 +180,7 @@ def build_query(
         # move to `sum` would silently redefine a role's queue from "how deep
         # per replica" to "how deep in total", which is a different number on
         # any group wider than 1P1D.
-        return (
-            f"avg{by}(last_over_time({value.metric}"
-            f"{selectors[value.scope]}[{window}]))"
-        )
+        return f"avg{by}(last_over_time({value.metric}" f"{selector(value)}[{window}]))"
     if query.histogram_quantile:
         value = query.histogram_quantile
         # `le` must survive the aggregation or there is no histogram left to
@@ -171,7 +188,7 @@ def build_query(
         labels = ["le"] + list(query.group_by or [])
         return (
             f"histogram_quantile({value.quantile}, sum by ({', '.join(labels)}) "
-            f"(rate({value.metric}_bucket{selectors[value.scope]}[{window}])))"
+            f"(rate({value.metric}_bucket{selector(value)}[{window}])))"
         )
     numerator = term(query.ratio_increase["numerator"])
     denominator = term(query.ratio_increase["denominator"])

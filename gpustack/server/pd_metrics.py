@@ -182,6 +182,9 @@ class PDMetricsPublic(BaseModel):
     request_count_source: Optional[str] = None
     """Where `routed_request_count` came from:
 
+    - `engine_tokens` — the engine's own prompt-token breakdown. The strongest
+      form: both operands come from one engine, so there is no second counter
+      to be missing, coarse, or scraped at a different moment.
     - `router_per_worker` — per-worker counters, so a low ratio points at one
       decode rather than at "the group".
     - `router_total` — the route aggregate. Still answers "did anything get
@@ -265,13 +268,38 @@ def _fill_transfer(result: PDMetricsPublic, values: dict) -> None:
 
 
 def _fill_verdict(result: PDMetricsPublic, values: dict) -> None:
-    """The ratio, its denominator, and where that denominator came from.
+    """The ratio, what it was taken over, and how good that denominator is.
 
-    Per-worker counters are preferred because a low ratio then points at one
-    decode rather than at "the group". Which one was used is reported rather
-    than inferred: the aggregate is a much weaker signal and a reader has to
-    be able to tell which they have.
+    🔑 Two ratios can answer the same question, and the better one wins when
+    the engine offers it.
+
+    **Per token (`engine_tokens`).** vLLM splits every prompt token by origin
+    and guarantees `local_compute + local_cache_hit + external_kv_transfer =
+    total`, so the external share is already a ratio. Both operands come from
+    the same engine in the same window, which removes the whole class of
+    problems the other form has: no router counter to be missing or coarse, no
+    two-counter skew, and a partially-transferred prompt shows up as a
+    fraction instead of counting as one transfer.
+
+    **Per transfer (`router_*`).** Transfers over requests the router
+    dispatched. The only form available where the engine does not break prompt
+    tokens down, which today is SGLang.
+
+    `request_count_source` says which was used, and that is not bookkeeping:
+    the forms differ in what a low value localises. Per-worker router counters
+    point at one decode; the route aggregate points at "the group"; the token
+    ratio points at the counted role as a whole. A reader has to be able to
+    tell which they are looking at.
     """
+    external = values.get("external_tokens")
+    prompt = values.get("counted_role_prompt_tokens")
+    if external is not None and prompt is not None and prompt > 0:
+        result.routed_request_count = prompt
+        result.request_count_source = "engine_tokens"
+        result.kv_transfers_per_request = external / prompt
+        result.status = judge(external, prompt)
+        return
+
     if values["requests_per_worker"] is not None:
         result.routed_request_count = values["requests_per_worker"]
         result.request_count_source = "router_per_worker"

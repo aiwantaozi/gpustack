@@ -646,10 +646,35 @@ class GatherSpec(BaseModel):
 
 class DisaggregationSpec(BaseModel):
     mode: PDModeEnum
+
     readiness: Literal["any_per_role", "all"] = "any_per_role"
+    """Whether every role member has to be ready, or one per role is enough.
+
+    `all` is for a deployment sized to a known load, where a partial group
+    degrades into queueing rather than into reduced throughput — it moves the
+    shortfall out of `degradations` and into `state`, so the endpoint stops
+    taking traffic during a scale-up instead of serving through it. Judged in
+    `derive_model_state`; not surfaced in the deployment form yet.
+    """
+
     kv_load_failure_policy: Literal["fail", "recompute"] = "fail"
-    router_kind: Optional[str] = None
-    """None derives it from `mode`."""
+    """What decode does when the KV it was promised does not load.
+
+    Only `vllm-nixl` renders it — SGLang has no equivalent concept and
+    Mooncake's connector does not read the key — so a non-default value is
+    refused at admission on the other modes rather than stored and ignored.
+
+    `recompute` degrades silently by design, so choosing it means committing
+    to watch decode's recompute share; the PD-effectiveness ratio is where
+    that shows.
+    """
+
+    # `router_kind` was here: an escape hatch for swapping the router
+    # implementation out of a mode's bundle. Both things that would have used
+    # it arrived instead -- the `custom` mode, and per-role image/run_command
+    # overrides -- and either expresses more than a name ever could. What was
+    # left accepted any string, changed nothing, and appeared in every PD
+    # model's API response, which reads as an offer to swap routers there.
 
 
 class ModelStateEnum(str, Enum):

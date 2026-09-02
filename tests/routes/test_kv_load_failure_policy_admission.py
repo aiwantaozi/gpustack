@@ -75,3 +75,20 @@ def test_the_rule_is_read_off_the_recipe_not_a_list_of_names():
         except BadRequestException:
             accepted = False
         assert accepted is renders, mode.value
+
+
+def test_an_old_row_carrying_router_kind_still_loads():
+    """`router_kind` was dropped, and `disaggregation` is a JSON column — rows
+    written while the field existed still carry the key. Deserialising must
+    ignore it rather than raise, which is what makes the removal need no
+    migration."""
+    spec = DisaggregationSpec.model_validate(
+        {
+            "mode": "vllm-nixl",
+            "readiness": "all",
+            "kv_load_failure_policy": "fail",
+            "router_kind": "sgl-router",
+        }
+    )
+    assert "router_kind" not in spec.model_dump()
+    assert spec.readiness == "all"

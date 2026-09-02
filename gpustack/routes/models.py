@@ -583,6 +583,7 @@ def validate_roles(  # noqa: C901
         )
 
     _reject_cache_under_a_hand_written_mode(field, roles, disaggregation)
+    _reject_a_policy_the_mode_cannot_apply(disaggregation)
 
     # A recipe injects one engine's connector configuration into every role,
     # so a role on a different engine would receive settings it cannot read.
@@ -600,6 +601,65 @@ def validate_roles(  # noqa: C901
                         f"connection parameters are yours to supply."
                     )
                 )
+
+
+_KV_LOAD_FAILURE_PLACEHOLDER = "{{kv_load_failure_policy}}"
+
+
+def _reject_a_policy_the_mode_cannot_apply(disaggregation) -> None:
+    """`kv_load_failure_policy` is a vLLM/NIXL setting, not a platform one.
+
+    Only `vllm-nixl` renders it. The SGLang modes have no equivalent concept
+    at all -- their KV lifecycle is a bootstrap timeout that aborts the
+    request, not a load that can fail and be retried -- and Mooncake's
+    connector does not read the key. So there is nothing to implement on the
+    other three; what there is, is a value the user weighed and set that then
+    quietly does nothing.
+
+    🔑 Which is why this rejects rather than warns, and only for a non-default
+    value. `fail` is what an engine that never sees the setting does anyway,
+    so refusing it would break every group on those modes to no purpose;
+    `recompute` is the deliberate choice -- trade a 500 for a silent
+    recomputation -- and a user who made it and got neither is worse off than
+    one who was told the mode cannot honour it.
+
+    Derived from the recipe rather than a list of mode names: a mode that
+    starts rendering the placeholder is accepted the moment it does, with
+    nothing here to remember to update.
+    """
+    from gpustack.schemas.models import DisaggregationSpec
+
+    policy = getattr(disaggregation, "kv_load_failure_policy", None)
+    default = DisaggregationSpec.model_fields["kv_load_failure_policy"].default
+    if policy is None or policy == default:
+        return
+
+    mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
+    mode = get_pd_mode(mode_name)
+    if mode is None or _KV_LOAD_FAILURE_PLACEHOLDER in mode.model_dump_json():
+        return
+
+    if disaggregation.mode == PDModeEnum.CUSTOM:
+        # The one mode where the setting may well be reachable, just not from
+        # here: `custom` injects nothing, so every connector key is the user's
+        # to write. Pointing them at another mode would be the wrong advice.
+        raise BadRequestException(
+            message=(
+                f"pd mode 'custom' injects no connector configuration, so "
+                f"kv_load_failure_policy='{policy}' would be stored and never "
+                f"reach the engine. Set it inside your own "
+                f"--kv-transfer-config instead."
+            )
+        )
+
+    raise BadRequestException(
+        message=(
+            f"pd mode '{mode_name}' cannot apply kv_load_failure_policy="
+            f"'{policy}': its KV connector has no such setting, so the value "
+            f"would be stored and never reach the engine. Leave it at "
+            f"'{default}', or use a mode whose connector reads it."
+        )
+    )
 
 
 def _reject_cache_under_a_hand_written_mode(field, roles, disaggregation) -> None:

@@ -95,19 +95,28 @@ def test_the_converted_histogram_is_internally_consistent():
 
 
 def test_the_shipped_config_declares_the_conversions_it_needs():
-    """Both PD histograms come from SGLang in non-base units. A missing scale
-    is silent — it produces a plausible number 1048576x too small — so the
-    declaration is asserted rather than trusted."""
+    """SGLang's PD histograms come in non-base units on every version it has
+    used. A missing scale is silent — it produces a plausible number 1048576x
+    too small — so the declaration is asserted rather than trusted."""
     config = get_builtin_metrics_config()
 
+    # 0.5.15: duration only. `kv_transfer_total_mb` was dropped upstream and
+    # nothing replaced it, so bandwidth is genuinely unavailable here.
     name, scale = get_unified_metric_family_name(
-        config, "sglang:kv_transfer_total_mb", "SGLang", None
+        config, "sglang:kv_transfer_bootstrap_ms", "SGLang", "0.5.15.post1"
+    )
+    assert name == "gpustack:pd_kv_transfer_seconds"
+    assert scale == 0.001
+
+    # 0.5.12: the pre-rename pair.
+    name, scale = get_unified_metric_family_name(
+        config, "sglang:kv_transfer_total_mb", "SGLang", "0.5.12.post1"
     )
     assert name == "gpustack:pd_kv_transfer_bytes"
     assert scale == MB
 
     name, scale = get_unified_metric_family_name(
-        config, "sglang:kv_transfer_latency_ms", "SGLang", None
+        config, "sglang:kv_transfer_latency_ms", "SGLang", "0.5.12.post1"
     )
     assert name == "gpustack:pd_kv_transfer_seconds"
     assert scale == 0.001
@@ -139,3 +148,41 @@ def test_no_unit_bearing_name_is_mapped_without_a_scale():
                     if scale == 1.0:
                         offenders.append(f"{runtime}:{raw}")
     assert not offenders, f"mapped without a unit conversion: {offenders}"
+
+
+def test_a_renamed_upstream_metric_keeps_its_old_version_range():
+    """🔴 The failure this pins down, measured 2026-09-01.
+
+    SGLang renamed its PD transfer metrics between 0.5.12 and 0.5.15
+    (`kv_transfer_total_mb` / `kv_transfer_latency_ms` ->
+    `kv_transfer_bootstrap_ms` / `kv_transfer_alloc_ms`). The mapping kept
+    pointing at the old names, so on 0.5.15 it resolved to series the engine
+    does not export: the ratio got no numerator and the endpoint reported
+    `unmeasurable` — which reads exactly like "this connector exports no
+    counters". PD effectiveness had been silently unmeasurable on every SGLang
+    group since the upgrade, and nothing anywhere said so.
+
+    Both directions are asserted, because deleting the old entry would break
+    the older engine just as quietly as leaving it broke the newer one.
+    """
+    config = get_builtin_metrics_config()
+
+    new_only = get_unified_metric_family_name(
+        config, "sglang:kv_transfer_bootstrap_ms", "SGLang", "0.5.15.post1"
+    )
+    assert new_only[0] == "gpustack:pd_kv_transfer_seconds"
+
+    # The new name must not be the only one a 0.5.12 engine can offer, and the
+    # old one must not leak forward as the sole source on 0.5.15.
+    old_on_old = get_unified_metric_family_name(
+        config, "sglang:kv_transfer_latency_ms", "SGLang", "0.5.12.post1"
+    )
+    assert old_on_old[0] == "gpustack:pd_kv_transfer_seconds"
+
+    # Two other mappings went stale in the same upgrade.
+    assert (
+        get_unified_metric_family_name(
+            config, "sglang:num_retracted_reqs", "SGLang", "0.5.15.post1"
+        )[0]
+        == "gpustack:request_preemptions"
+    )

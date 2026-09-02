@@ -215,19 +215,31 @@ runtime_mapping:
        vllm:gpu_cache_usage_perc: gpustack:kv_cache_usage_ratio
 
   SGLang:
-    "*": # 0.5.12.post1
-      # PD: NOT in base units. SGLang reports transfer volume in MEGABYTES
-      # and duration in MILLISECONDS where vLLM reports bytes and seconds
-      # (measured on a live 1P1D: total_mb_sum=189.0, latency_ms_sum=214.15
-      # over the same 83 transfers). Mapping them without `scale` would put
-      # two units under one name, which is worse than two names because a
-      # reader can no longer tell which they have.
-      sglang:kv_transfer_total_mb:
-        name: gpustack:pd_kv_transfer_bytes
-        scale: 1048576
-      sglang:kv_transfer_latency_ms:
+    "*": # 0.5.15.post1
+      # PD: NOT in base units. SGLang reports duration in MILLISECONDS where
+      # vLLM reports seconds, so `scale` is not optional -- two units under one
+      # name is worse than two names, because a reader can no longer tell which
+      # they have.
+      #
+      # 🔴 Renamed upstream between 0.5.12 and 0.5.15. The old names are kept in
+      # the `<0.5.13` range below rather than deleted: a mapping that points at
+      # a series the engine no longer exports resolves to nothing, the ratio
+      # gets no numerator, and the endpoint reports `unmeasurable` -- which
+      # reads exactly like "this connector exports no counters". Measured
+      # 2026-09-01 on 0.5.15.post1: `kv_transfer_total_mb` and
+      # `kv_transfer_latency_ms` are both absent, and PD effectiveness had been
+      # silently unmeasurable on every SGLang group since the upgrade.
+      #
+      # `bootstrap` is the transfer, not the handshake before it: its `_count`
+      # tracks requests 1:1 (measured -- 5 requests moved both roles' counters
+      # by exactly 5), which is what makes it the numerator.
+      sglang:kv_transfer_bootstrap_ms:
         name: gpustack:pd_kv_transfer_seconds
         scale: 0.001
+      # ⚠️ No bytes counter on 0.5.15. `kv_transfer_total_mb` is gone and
+      # nothing replaced it, so `gpustack:pd_kv_transfer_bytes` is simply
+      # absent here -- bandwidth is unavailable for SGLang, and saying so by
+      # omission is better than mapping a name that resolves to nothing.
       # This gateway exports no per-worker dispatch counter, only the route
       # aggregate. Declaring the coarse one is honest; inventing the per-worker
       # names from the shared fork ancestry is how the `smg_` vs
@@ -235,17 +247,27 @@ runtime_mapping:
       smg_router_requests: gpustack:pd_router_requests
       sglang:num_running_reqs: gpustack:num_requests_running
       sglang:num_queue_reqs: gpustack:num_requests_waiting
-      sglang:num_retracted_requests: gpustack:request_preemptions
+      sglang:num_retracted_reqs: gpustack:request_preemptions
       sglang:cache_hit_rate: gpustack:prefix_cache_hit_rate
       sglang:token_usage: gpustack:kv_cache_usage_ratio
       sglang:prompt_tokens: gpustack:prompt_tokens
-      sglang:cached_tokens: gpustack:prompt_tokens_cached
       sglang:generation_tokens: gpustack:generation_tokens
       sglang:time_to_first_token_seconds: gpustack:time_to_first_token_seconds
       sglang:e2e_request_latency_seconds: gpustack:e2e_request_latency_seconds
       sglang:queue_time_seconds: gpustack:request_queue_time_seconds
       sglang:inter_token_latency_seconds: gpustack:inter_token_latency_seconds
       sglang:spec_accept_rate: gpustack:spec_decode_accept_rate
+    "<0.5.13":
+      # The pre-rename PD names, measured on 0.5.12.post1: total_mb_sum=189.0
+      # and latency_ms_sum=214.15 over the same 83 transfers.
+      sglang:kv_transfer_total_mb:
+        name: gpustack:pd_kv_transfer_bytes
+        scale: 1048576
+      sglang:kv_transfer_latency_ms:
+        name: gpustack:pd_kv_transfer_seconds
+        scale: 0.001
+      sglang:num_retracted_requests: gpustack:request_preemptions
+      sglang:cached_tokens: gpustack:prompt_tokens_cached
     "<=0.4.4":
       sglang:time_per_output_token_seconds: gpustack:time_per_output_token_seconds
       

@@ -182,10 +182,11 @@ kv_transfer_metrics:
     read_from_role: decode
 
   # 🔴 vLLM's mooncake/stats.py exports ZERO Prometheus counters where NIXL
-  # exports fifteen. So PD effectiveness is not decidable from metrics on this
-  # connector at all, and the diagnostic path is log scanning (X2 3.6).
-  # Declaring that beats a ratio that reads zero because the counter was never
-  # there -- which is indistinguishable from the failure it should catch.
+  # exports fifteen, so nothing here can be timed. Effectiveness still is:
+  # vllm:prompt_tokens_by_source comes from the engine, not the connector, and
+  # measured on Ascend/Mooncake 0.20.2 it splits prompt tokens across
+  # external_kv_transfer / local_cache_hit / local_compute exactly as it does
+  # under NIXL. False therefore withholds the speed figures only.
   - connector: mooncake
     read_from_role: decode
     observable: false

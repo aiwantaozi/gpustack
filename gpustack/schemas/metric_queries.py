@@ -35,6 +35,16 @@ class QueryScopeEnum(str, Enum):
     Resolved by the caller from the catalog, never named here: it is a
     property of the connector, not of the query."""
 
+    RECEIVING_ROLE = "receiving_role"
+    """Always decode, whichever side moves the bytes.
+
+    🔑 Not a synonym for COUNTED_ROLE even though the two coincide on NIXL.
+    They part on a pushing connector: SGLang's byte counters live on prefill
+    because prefill writes them, but a token that arrived over the wire is
+    counted where it *arrived*, which is decode either way. Selecting the
+    engine's token accounting on prefill would read the sending side's own
+    prompt tokens and call it evidence of transfer."""
+
 
 class MetricTerm(BaseModel):
     """One counter and the series it is taken over."""

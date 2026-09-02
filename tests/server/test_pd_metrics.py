@@ -15,10 +15,13 @@ from gpustack.schemas.metric_queries import (
     resolve_queries,
 )
 from gpustack.server.pd_metrics import (
+    PDKVTransferMetrics,
     PDMetricsPublic,
     PDRoleMetrics,
     _derive_role_rates,
+    _fill_transfer,
     _fill_verdict,
+    _preflight,
     _selectors,
     judge,
 )
@@ -167,7 +170,7 @@ def test_no_counter_at_all_is_unmeasurable():
 def _values(**over):
     base = {
         "external_tokens": None,
-        "counted_role_prompt_tokens": None,
+        "receiving_role_prompt_tokens": None,
         "requests_per_worker": None,
         "requests_total": None,
     }
@@ -187,7 +190,7 @@ def test_the_engines_own_token_split_wins_over_the_router_counter():
     second counter to be missing, coarse, or scraped at a different moment."""
     r = _verdict(
         external_tokens=440.0,
-        counted_role_prompt_tokens=440.0,
+        receiving_role_prompt_tokens=440.0,
         requests_per_worker=8.0,
         transfers=8.0,
     )
@@ -201,7 +204,7 @@ def test_a_prompt_decode_had_to_recompute_lowers_the_ratio():
     itself, and they landed in `local_compute`. That is the silent degradation
     — 200 OK, correct answer, no error anywhere — and this is the first signal
     that catches it without a router counter to compare against."""
-    r = _verdict(external_tokens=0.0, counted_role_prompt_tokens=32.0)
+    r = _verdict(external_tokens=0.0, receiving_role_prompt_tokens=32.0)
     assert r.request_count_source == "engine_tokens"
     assert r.kv_transfers_per_request == 0.0
     assert r.status == "aggregated"
@@ -210,7 +213,7 @@ def test_a_prompt_decode_had_to_recompute_lowers_the_ratio():
 def test_a_partial_transfer_is_a_fraction_not_a_whole_transfer():
     """What the per-transfer form cannot express: half a prompt arriving over
     the wire counts as one transfer there and as 0.5 here."""
-    r = _verdict(external_tokens=220.0, counted_role_prompt_tokens=440.0)
+    r = _verdict(external_tokens=220.0, receiving_role_prompt_tokens=440.0)
     assert r.kv_transfers_per_request == 0.5
 
 
@@ -228,7 +231,7 @@ def test_a_zero_prompt_total_does_not_claim_the_stronger_form():
     router counter is what distinguishes "nobody called it" from "it was
     called and nothing crossed"."""
     r = _verdict(
-        external_tokens=0.0, counted_role_prompt_tokens=0.0, requests_total=3.0
+        external_tokens=0.0, receiving_role_prompt_tokens=0.0, requests_total=3.0
     )
     assert r.request_count_source == "router_total"
 
@@ -238,9 +241,20 @@ def test_a_zero_prompt_total_does_not_claim_the_stronger_form():
 
 def test_the_token_ratio_is_declared_over_the_receiving_role():
     declared = _declared()
-    for key in ("external_tokens", "counted_role_prompt_tokens"):
+    for key in ("external_tokens", "receiving_role_prompt_tokens"):
         assert key in declared, key
-        assert declared[key].counter_increase.scope is QueryScopeEnum.COUNTED_ROLE
+        assert declared[key].counter_increase.scope is QueryScopeEnum.RECEIVING_ROLE
+
+
+def test_the_receiving_role_stays_decode_when_the_counting_role_is_prefill():
+    """The scopes agree on NIXL and part on a pushing connector. Reading this
+    counter on prefill would tally the *sender's* own prompt tokens — every one
+    of them local, so a healthy pair would report a ratio of zero."""
+    declared = _declared()
+    on_prefill = _selectors(7, "prefill")
+    q = build_query(declared["external_tokens"], on_prefill, "15m")
+    assert 'role="decode"' in q
+    assert 'role="prefill"' not in q
 
 
 def test_only_the_numerator_narrows_to_the_external_source():
@@ -250,7 +264,7 @@ def test_only_the_numerator_narrows_to_the_external_source():
     assert declared["external_tokens"].counter_increase.labels == {
         "source": "external_kv_transfer"
     }
-    assert declared["counted_role_prompt_tokens"].counter_increase.labels is None
+    assert declared["receiving_role_prompt_tokens"].counter_increase.labels is None
 
 
 def test_the_source_narrowing_reaches_the_query():
@@ -269,3 +283,63 @@ def test_the_transfer_count_comes_from_the_duration_histogram():
         declared["transfers"].counter_increase.metric
         == "gpustack:pd_kv_transfer_seconds_count"
     )
+
+
+# --- a connector with no counters of its own ------------------------------
+
+
+def _mode(observable: bool, read_from_role: str = "decode"):
+    from gpustack.schemas.pd_modes import PDMode, PDTransferMetrics
+
+    return PDMode(
+        name="vllm-ascend-mooncake",
+        transfer_metrics=PDTransferMetrics(
+            connector="mooncake",
+            read_from_role=read_from_role,
+            observable=observable,
+        ),
+    )
+
+
+def _transfer(observable: bool) -> PDMetricsPublic:
+    result = PDMetricsPublic(
+        available=True, kv_transfer=PDKVTransferMetrics(counted_on_role="decode")
+    )
+    _fill_transfer(result, _transfer_values(), _mode(observable))
+    return result
+
+
+def _transfer_values() -> dict:
+    return {
+        "transfers": None,
+        "failed": None,
+        "expired": None,
+        "kv_transfer_bytes_avg": None,
+        "kv_transfer_seconds_p50": None,
+        "kv_transfer_seconds_p95": None,
+        "kv_transfer_seconds_p99": None,
+        "seconds": None,
+        "bytes": None,
+    }
+
+
+def test_a_mode_without_transfer_counters_is_no_longer_refused_outright():
+    """It used to return `available=False` before running a single query, which
+    was right only while effectiveness *was* the transfer ratio. The token
+    split comes from the engine, so Mooncake now gets a verdict like any other
+    mode — and refusing here would withhold the one signal it does have."""
+    refusal, _, counted_role, declared = _preflight(_mode(observable=False))
+    assert refusal is None
+    assert counted_role == "decode"
+    assert "external_tokens" in declared
+
+
+def test_the_missing_speed_figures_say_so_instead_of_reading_as_zero():
+    assert _transfer(observable=False).kv_transfer.rates_unavailable_reason
+
+
+def test_an_idle_window_on_a_measurable_connector_stays_silent():
+    """The distinction the flag has to be declared for: NIXL over a window with
+    no traffic produces exactly the same empty values, and calling that "cannot
+    be measured" would hide a connector that is working."""
+    assert _transfer(observable=True).kv_transfer.rates_unavailable_reason is None

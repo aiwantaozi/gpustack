@@ -217,7 +217,13 @@ class PDTransferMetrics(BaseModel):
     Get it backwards and a healthy pair reports "no KV ever moved" — the exact
     failure this metric exists to detect, fired at a deployment that is fine.
     The default is ``decode`` only because NIXL came first, not because it is
-    the normal case."""
+    the normal case.
+
+    ⚠️ This governs the **connector's own** counters and nothing else. The
+    engine's token accounting is read on the receiving side unconditionally
+    (``QueryScopeEnum.RECEIVING_ROLE``), because a token is counted where it
+    arrived no matter who moved it. The two scopes coincide here only because
+    every connector that exports the token split happens to pull."""
 
     observable: bool = True
     """Whether this connector exports any transfer counter at all.
@@ -228,10 +234,14 @@ class PDTransferMetrics(BaseModel):
     — vLLM's `mooncake/stats.py` exports **zero** Prometheus counters where
     NIXL exports fifteen.
 
-    False means PD effectiveness is not decidable from metrics for this
-    connector, and saying that out loud is the point: the alternative is a
-    ratio that reads zero because the counter was never there, which is
-    indistinguishable from the failure it is supposed to catch."""
+    🔑 False costs the **speed** figures — bytes/s, p50/p95/p99, transfer
+    count — and nothing else. It used to cost the whole endpoint, which was
+    right only while effectiveness was a transfer ratio. It is now taken from
+    `vllm:prompt_tokens_by_source`, which the engine exports for every V1
+    connector regardless of what the connector itself publishes, so a mode
+    with no counters still gets a verdict. What False must still prevent is
+    silence: an unmeasurable rate is reported as unmeasurable, never as
+    zero."""
 
 
 class PDPortSpec(BaseModel):

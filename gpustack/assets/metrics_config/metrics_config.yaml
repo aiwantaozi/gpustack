@@ -330,23 +330,25 @@ metric_queries:
       # whole endpoint exists to catch, and it is the first signal that
       # catches it without a router counter to compare against.
       #
-      # ⚠️ Always on the RECEIVING side, which is decode whether the connector
-      # pulls or pushes -- unlike the transfer counters, whose owning role is
-      # a connector property. `counted_role` is still used because it is
-      # decode for every mode that has this metric.
+      # ⚠️ `receiving_role`, not `counted_role`: a token that came over the
+      # wire is counted where it ARRIVED, which is decode whether the
+      # connector pulls or pushes. The two scopes agree on NIXL and would part
+      # on a pushing connector, where `counted_role` is prefill -- and reading
+      # this counter on prefill would tally the sender's own prompt tokens and
+      # call it evidence of transfer.
       external_tokens:
         counter_increase:
           metric: gpustack:pd_prompt_tokens_by_source_total
-          scope: counted_role
+          scope: receiving_role
           labels:
             source: external_kv_transfer
       # Deliberately NOT named `prompt_tokens`: that key already exists below
       # as a per-role group figure, and one name for two different scopes is
       # how a query silently starts answering a question nobody asked.
-      counted_role_prompt_tokens:
+      receiving_role_prompt_tokens:
         counter_increase:
           metric: gpustack:pd_prompt_tokens_by_source_total
-          scope: counted_role
+          scope: receiving_role
       # `_count` of the seconds histogram IS the transfer count, so the
       # numerator needs no separate counter. Read from the SECONDS family and
       # not the bytes one: SGLang 0.5.15 dropped its bytes histogram, and the

@@ -135,6 +135,17 @@ class PDKVTransferMetrics(BaseModel):
     """Transfer duration percentiles. The tail is where a degrading path shows
     up first and where a mean is guaranteed to hide it."""
 
+    rates_unavailable_reason: Optional[str] = None
+    """Why the speed figures below are empty, when the ratio above is not.
+
+    🔑 The two answer different questions and one can be available without the
+    other. "Is KV crossing" now comes from the engine's own token accounting,
+    which every V1 connector produces; "how fast" needs the connector's own
+    byte and duration counters, which some export and some do not. Before this
+    field the whole endpoint refused when the second was missing, and a reader
+    could not tell "we cannot measure this mode" from "nothing is crossing".
+    """
+
     failures: Optional[float] = None
     """Transfers the engine reported as failed."""
 
@@ -218,6 +229,7 @@ def _selectors(model_id: int, counted_role: str) -> dict:
     return {
         QueryScopeEnum.GROUP: "{" + model + "}",
         QueryScopeEnum.COUNTED_ROLE: "{" + model + "," + role + "}",
+        QueryScopeEnum.RECEIVING_ROLE: "{" + model + ',role="decode"}',
     }
 
 
@@ -249,9 +261,19 @@ def judge(transfers: Optional[float], requests: Optional[float]) -> str:
     return "effective"
 
 
-def _fill_transfer(result: PDMetricsPublic, values: dict) -> None:
+def _fill_transfer(result: PDMetricsPublic, values: dict, mode=None) -> None:
     """The transfer figures, straight across."""
     transfer = result.kv_transfer
+    if mode and mode.transfer_metrics and not mode.transfer_metrics.observable:
+        # Declared, not inferred from the values being empty: a healthy NIXL
+        # pair over an idle window also reports nothing, and the two must not
+        # be told apart by guessing.
+        transfer.rates_unavailable_reason = (
+            f"The '{mode.name}' mode's KV connector exports no transfer "
+            "counters, so transfer speed and duration cannot be measured. "
+            "Whether KV is crossing is answered from the engine's own token "
+            "accounting instead."
+        )
     transfer.count = values["transfers"]
     transfer.failures = values["failed"]
     transfer.leases_expired = values["expired"]
@@ -292,7 +314,7 @@ def _fill_verdict(result: PDMetricsPublic, values: dict) -> None:
     tell which they are looking at.
     """
     external = values.get("external_tokens")
-    prompt = values.get("counted_role_prompt_tokens")
+    prompt = values.get("receiving_role_prompt_tokens")
     if external is not None and prompt is not None and prompt > 0:
         result.routed_request_count = prompt
         result.request_count_source = "engine_tokens"
@@ -378,23 +400,6 @@ def _preflight(mode: Optional[PDMode]):
 
     counted_role = "decode"
     if mode and mode.transfer_metrics:
-        if not mode.transfer_metrics.observable:
-            return (
-                PDMetricsPublic(
-                    available=False,
-                    reason=(
-                        f"The '{mode.name}' mode's KV connector exports no "
-                        "transfer counters, so whether KV is crossing cannot "
-                        "be decided from metrics for this mode."
-                    ),
-                    kv_transfer=PDKVTransferMetrics(
-                        counted_on_role=mode.transfer_metrics.read_from_role
-                    ),
-                ),
-                None,
-                None,
-                None,
-            )
         counted_role = mode.transfer_metrics.read_from_role or "decode"
 
     declared = resolve_queries(get_builtin_metrics_config(), "pd")
@@ -463,7 +468,7 @@ async def collect_pd_metrics(
                 else:
                     values[key] = instant_value(rows[0]) if rows else None
 
-            _fill_transfer(result, values)
+            _fill_transfer(result, values, mode)
             _fill_verdict(result, values)
             _fill_roles(result, by_role)
             _derive_role_rates(result, window_seconds)

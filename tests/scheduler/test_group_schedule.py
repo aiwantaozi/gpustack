@@ -306,13 +306,9 @@ async def test_fewer_rows_than_the_solve_waits_rather_than_placing_part():
 async def test_an_invalid_cluster_topology_refuses_with_the_reason():
     """An operator error, not a capacity one — and refusing beats placing the
     group against a tree built from a guess."""
-    bad = ClusterTopology.model_validate(
-        {
-            "layers": [
-                {"name": "Rack", "labelKeys": [RACK]},
-                {"name": "Zone", "labelKeys": ["z"]},
-            ]
-        }
+    bad = SimpleNamespace(
+        layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
+        accelerator_domain=None,
     )
     by_instance, messages = await _run(
         GroupPlacement(layer="Rack", domain="rack-a", assignments={}), topology=bad

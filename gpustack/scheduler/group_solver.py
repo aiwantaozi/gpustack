@@ -21,9 +21,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from gpustack.scheduler.topology import NODE_LAYER, TopologyNode, nodes_at_layer
+from gpustack.scheduler.topology import (
+    NODE_LAYER,
+    ROOT_LAYER,
+    TopologyNode,
+    nodes_at_layer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,32 @@ class GatherRequest:
 
     layer: Optional[str] = None
     must: bool = False
+
+
+@dataclass
+class GatherScope:
+    """One rung of the search: a name and the candidate domains at that rung.
+
+    The tree's layers each yield one scope (the domains at that layer) and the
+    accelerator domain yields another (its flat groups) — different sources,
+    the same shape, and the solver does not care which is which. Scopes are
+    ordered by communication cost, not by containment: a domain may span
+    racks and still come before the rack scope, because inside it the transfer
+    runs over the accelerator fabric rather than the network.
+    """
+
+    name: str
+    domains: List[TopologyNode]
+
+
+def tree_scopes(root: TopologyNode, layers: Sequence[str]) -> List[GatherScope]:
+    """The tree's layers as scopes, leaf first, without the cluster root.
+
+    ``layers`` is root-to-leaf, as ``layer_names`` returns it.
+    """
+    return [
+        GatherScope(layer, nodes_at_layer(root, layer)) for layer in reversed(layers)
+    ]
 
 
 @dataclass
@@ -118,18 +149,29 @@ async def solve_group_placement(
     root: TopologyNode,
     roles: Sequence[RoleDemand],
     capacity: CapacityFn,
-    layers: Sequence[str],
+    scopes: Sequence[Union[GatherScope, str]],
     gather: GatherRequest = GatherRequest(),
 ) -> object:
     """Place the group, or say why not.
 
-    ``layers`` is root-to-leaf. The search runs leaf-to-root: the first layer
-    with a domain that holds the whole group is the tightest one, and the
-    tightest domain is the one whose members are closest together.
+    ``scopes`` is tightest first: the first scope with a domain that holds the
+    whole group wins, and inside it the tightest fitting domain. A sequence of
+    layer names is accepted too, root-to-leaf as ``layer_names`` returns it,
+    and read as the tree's layers alone.
+
+    ``MustGather(X)`` means "transfer quality at least that of X": the search
+    stops after scope ``X``. Since a domain scope precedes the rack scope, a
+    group may satisfy "at least the same rack" by landing in one accelerator
+    domain that spans two racks — which is faster, not looser.
     """
     total = sum(r.replicas for r in roles)
     if total <= 0:
         return GroupPlacement(layer=NODE_LAYER, domain="", assignments={})
+
+    if scopes and isinstance(scopes[0], str):
+        scopes = tree_scopes(root, list(scopes))  # type: ignore[arg-type]
+    scopes = list(scopes)  # type: ignore[arg-type]
+    names = [s.name for s in scopes]
 
     ordered_roles = sorted(roles, key=lambda r: (-r.weight, r.role))
     # Decided once, and used for both the ceiling and the root fallback below.
@@ -137,8 +179,8 @@ async def solve_group_placement(
     # this requirement" and then refuse the deployment in its name: the ceiling
     # honoured the unknown layer by standing down, while the fallback still saw
     # `must` set and stayed switched off.
-    enforced = _enforced_gather(layers, gather)
-    ceiling = layers.index(enforced.layer) if enforced.layer else 0
+    enforced = _enforced_gather(names, gather)
+    ceiling = names.index(enforced.layer) if enforced.layer else len(scopes) - 1
     best: Optional[GroupInfeasible] = None
 
     # Every domain is sized by the hungriest role with nothing placed, which
@@ -148,24 +190,25 @@ async def solve_group_placement(
     # to a group whose first role needs whole cards.
     sizing = await capacity(ordered_roles[0].role, root.descendant_worker_ids(), [])
 
-    # Leaf-to-root. Stopping at `ceiling` is the whole of MustGather: without
+    # Tightest first. Stopping at `ceiling` is the whole of MustGather: without
     # it the walk continues widening until the cluster root, which always fits
     # and is exactly the outcome the operator asked not to get.
-    for index in range(len(layers) - 1, ceiling - 1, -1):
-        layer = layers[index]
-        domains = _gatherable_domains(root, layer)
+    for scope in scopes[: ceiling + 1]:
+        domains = _gatherable_domains(scope.domains)
         # Tightest fitting domain first, off the one sizing pass above.
         sized = []
         for d in domains:
             members = d.descendant_worker_ids()
             sized.append((sum(sizing.get(w, 0) for w in members), d.name, d))
         for _size, _name, domain in sorted(sized, key=lambda t: (t[0], t[1])):
-            placement = await _fit_in_domain(domain, layer, ordered_roles, capacity)
+            placement = await _fit_in_domain(
+                domain, scope.name, ordered_roles, capacity
+            )
             if isinstance(placement, GroupPlacement):
                 return placement
-            # `>=` so a tie is won by the later, wider layer. With `>` the
+            # `>=` so a tie is won by the later, wider scope. With `>` the
             # refusal for a rack-level requirement could name a single host,
-            # since the leaf layer is examined first and its domains are just
+            # since the leaf scope is examined first and its domains are just
             # as short of room — a message that contradicts itself.
             if best is None or placement.available >= best.available:
                 best = placement
@@ -204,7 +247,7 @@ async def solve_group_placement(
     return best
 
 
-def _enforced_gather(layers: Sequence[str], gather: GatherRequest) -> GatherRequest:
+def _enforced_gather(names: Sequence[str], gather: GatherRequest) -> GatherRequest:
     """The requirement as it will actually be applied.
 
     A `must` naming a layer this cluster no longer declares is dropped
@@ -219,7 +262,7 @@ def _enforced_gather(layers: Sequence[str], gather: GatherRequest) -> GatherRequ
     """
     if not gather.must or not gather.layer:
         return GatherRequest(layer=None, must=False)
-    if gather.layer not in layers:
+    if gather.layer not in names:
         logger.warning(
             "Ignoring a gather requirement on unknown topology layer %r; "
             "the group will be placed as if none had been asked for.",
@@ -229,8 +272,8 @@ def _enforced_gather(layers: Sequence[str], gather: GatherRequest) -> GatherRequ
     return gather
 
 
-def _gatherable_domains(root: TopologyNode, layer: str) -> List[TopologyNode]:
-    """Domains at ``layer`` that mean something to gather into.
+def _gatherable_domains(domains: Sequence[TopologyNode]) -> List[TopologyNode]:
+    """The domains of one scope that mean something to gather into.
 
     The unclassified bucket is excluded, and that is not a detail. It holds the
     workers whose position is *unknown*; gathering a group into it would be
@@ -239,7 +282,7 @@ def _gatherable_domains(root: TopologyNode, layer: str) -> List[TopologyNode]:
     the two have to agree — otherwise the solver would gather onto a domain
     that the distance function says does not exist.
     """
-    return [d for d in nodes_at_layer(root, layer) if not d.is_unclassified]
+    return [d for d in domains if not d.is_unclassified and d.layer != ROOT_LAYER]
 
 
 async def _fit_in_domain(

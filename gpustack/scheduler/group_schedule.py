@@ -47,12 +47,8 @@ from gpustack.scheduler.group_solver import (
     RoleDemand,
     solve_group_placement,
 )
-from gpustack.scheduler.topology import (
-    TopologyError,
-    TopologyLayerSpec,
-    build_topology,
-    layer_names,
-)
+from gpustack.scheduler.topology import TopologyError
+from gpustack.scheduler.topology_view import build_view
 
 logger = logging.getLogger(__name__)
 
@@ -124,17 +120,8 @@ async def schedule_group(
     cluster = (
         await Cluster.one_by_id(session, model.cluster_id) if model.cluster_id else None
     )
-    specs = [
-        TopologyLayerSpec(
-            layer=layer.name,
-            label_keys=list(layer.label_keys or []),
-            parent_layer=layer.parent_layer,
-        )
-        for layer in ((cluster.topology.layers if cluster and cluster.topology else []))
-    ]
     try:
-        root = build_topology(specs, workers)
-        names = layer_names(specs)
+        view = build_view(cluster.topology if cluster else None, workers)
     except TopologyError as e:
         # A declaration that cannot become a tree is an operator error, not a
         # capacity one. Refusing the group with the reason beats placing it
@@ -147,7 +134,7 @@ async def schedule_group(
 
     capacity = GroupCapacity(config, model, workers, model_instances)
     placement = await solve_group_placement(
-        root, demands, capacity, names, _gather_request(model, cluster)
+        view.root, demands, capacity, view.scopes(), _gather_request(model, cluster)
     )
     if not isinstance(placement, GroupPlacement):
         return None, [getattr(placement, "reason", "The group does not fit.")]

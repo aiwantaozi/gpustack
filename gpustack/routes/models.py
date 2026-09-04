@@ -101,6 +101,8 @@ from gpustack.routes.model_common import (
 from gpustack.config.config import get_global_config
 from gpustack.server.pd_metrics import PDMetricsPublic, collect_pd_metrics
 from gpustack.server.pd_mode_catalog import get_pd_mode
+from gpustack.server.pd_mode_resolver import resolve_pd_mode
+from gpustack.server.cluster_accelerators import cluster_vendors
 from gpustack.server.prometheus_query import parse_window
 from gpustack.utils.grafana import resolve_grafana_base_url
 from gpustack.utils.lora_model_source import lora_route_name_for
@@ -510,6 +512,27 @@ def validate_roles(  # noqa: C901
             raise BadRequestException(
                 message="The router role runs exactly one replica."
             )
+        # Refused rather than ignored. Prefill and decode get CPU and memory
+        # from sizing — the weights and the parallelism decide them — so a
+        # hand-written value here would be a second source for the same number
+        # that silently disagrees with the estimate.
+        if role.resources is not None and role.name != RoleNameEnum.ROUTER.value:
+            raise BadRequestException(
+                message=(
+                    f"Role '{role.name}' cannot declare CPU or memory: only the "
+                    "router does, because it holds no weights. Every other "
+                    "role's footprint is derived from the model."
+                )
+            )
+        if role.resources is not None:
+            if role.resources.cpu is not None and role.resources.cpu <= 0:
+                raise BadRequestException(
+                    message="The router's CPU request must be greater than zero."
+                )
+            if role.resources.memory is not None and role.resources.memory <= 0:
+                raise BadRequestException(
+                    message="The router's memory request must be greater than zero."
+                )
 
     # `dependencies` is a start order, so a cycle is a deployment that never
     # starts. Reject it here rather than letting the controller spin.
@@ -584,6 +607,7 @@ def validate_roles(  # noqa: C901
 
     _reject_cache_under_a_hand_written_mode(field, roles, disaggregation)
     _reject_a_policy_the_mode_cannot_apply(disaggregation)
+    _reject_router_params_the_platform_owns(roles, disaggregation)
 
     # A recipe injects one engine's connector configuration into every role,
     # so a role on a different engine would receive settings it cannot read.
@@ -601,6 +625,54 @@ def validate_roles(  # noqa: C901
                         f"connection parameters are yours to supply."
                     )
                 )
+
+
+def _reject_router_params_the_platform_owns(roles, disaggregation) -> None:
+    """A router parameter that would collide with an injected one.
+
+    The router's tunable flags are meant to be overridden — appending them is
+    last-wins, verified against both shipped wheels. The connection flags are
+    not, and refusing them is not tidiness:
+
+    - ``--prefill`` / ``--decode`` are ``action="append"`` in both routers, so
+      a second one does not replace the injected peer. It adds one the router
+      then forwards to and cannot reach, and the only symptom is a member that
+      quietly never gets traffic.
+    - ``--host`` / ``--port`` / ``--prometheus-*`` are last-wins, which is
+      worse in a different way: the router comes up bound somewhere the
+      gateway and the metrics scraper are not looking.
+
+    The list is read off the recipe rather than written here, so adding a mode
+    cannot forget to extend it.
+    """
+    router = next(
+        (
+            r
+            for r in roles
+            if r.name == RoleNameEnum.ROUTER.value and r.backend_parameters
+        ),
+        None,
+    )
+    if router is None:
+        return
+    mode = get_pd_mode(disaggregation.mode.value)
+    if mode is None or mode.router is None:
+        return
+    owned = set(mode.router.platform_owned_flags)
+    if not owned:
+        return
+    for param in router.backend_parameters:
+        # Both spellings a user can write: `--flag value` and `--flag=value`.
+        name = str(param).split("=", 1)[0].strip()
+        if name in owned:
+            raise BadRequestException(
+                message=(
+                    f"'{name}' on the router is set by GPUStack from where the "
+                    f"group was placed, so it cannot be given here. Adjustable "
+                    f"router flags for this mode: "
+                    f"{', '.join(a.flag for a in mode.router.tunable_args) or 'none'}."
+                )
+            )
 
 
 _KV_LOAD_FAILURE_PLACEHOLDER = "{{kv_load_failure_policy}}"
@@ -880,6 +952,9 @@ async def validate_model_in(
     # send. Absent on create, where there is nothing to merge.
     validate_roles(model_in, stored=stored)
     validate_role_pairing(model_in, stored=stored)
+    await validate_pd_mode_runtime(
+        session, model_in, cluster_id=cluster_id, stored=stored
+    )
 
     if getattr(model_in, "gpu_type_selector", None) is not None:
         await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
@@ -1002,6 +1077,69 @@ def validate_and_normalize_lora_list(
                 message=f"Duplicate lora_name '{short_name}' in lora_list."
             )
         seen.add(short_name)
+
+
+async def validate_pd_mode_runtime(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    *,
+    cluster_id: Optional[int] = None,
+    stored: Optional[Model] = None,
+):
+    """Reject a pd mode no accelerator in the cluster can run.
+
+    Every built-in recipe is accelerator-specific: `vllm-ascend-mooncake`
+    injects an Ascend-only connector plus HCCL variables, and the NVIDIA
+    recipes inject connectors no other runtime can read. Injecting one into
+    the wrong accelerator fails inside the connector rather than at submit
+    time. `PDModeRuntimeFilter` also drops the mismatched workers during
+    scheduling; this check exists so the answer is a readable refusal instead
+    of an empty candidate list.
+
+    🔴 `custom` is never rejected -- it declares no `gpu_filters`, so an
+    unsupported engine × accelerator pair means "no built-in recipe", never
+    "no PD".
+
+    Shares `resolve_pd_mode` with the resolve endpoint the form reads, so the
+    API cannot refuse a combination the form just told the user was fine.
+
+    Accelerator-less clusters are left to scheduling: a cluster whose workers
+    have not reported devices yet must not be judged as unable to run
+    anything.
+    """
+    disaggregation = getattr(model_in, "disaggregation", None)
+    if disaggregation is None and stored is not None:
+        if "disaggregation" not in getattr(model_in, "model_fields_set", set()):
+            disaggregation = getattr(stored, "disaggregation", None)
+    if not disaggregation:
+        return
+
+    mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
+    mode = get_pd_mode(mode_name)
+    if mode is None or mode.gpu_filters is None or not mode.gpu_filters.vendor:
+        return
+
+    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
+    vendors = await cluster_vendors(session, effective_cluster_id)
+    if not vendors:
+        return
+
+    backend = getattr(model_in, "backend", None) or (
+        getattr(stored, "backend", None) if stored else None
+    )
+    resolution = resolve_pd_mode(
+        backend, vendors, vendor=getattr(disaggregation, "vendor", None)
+    )
+    verdict = next(
+        (option for option in resolution.options if option.name == mode_name), None
+    )
+    if verdict is not None and not verdict.eligible:
+        raise BadRequestException(
+            message=(
+                f"pd mode '{mode_name}' cannot run here: "
+                f"{verdict.ineligible_reason}"
+            )
+        )
 
 
 async def validate_gpu_type_selector(

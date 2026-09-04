@@ -318,14 +318,24 @@ def apply_managed_router(
         # produced already-separated tokens, so nothing here has to guess at
         # quoting.
         projected.run_command = " ".join(plan.command)
-    # The group's engine parameters are not the router's. They are inherited
-    # by projection like every other Model-level field, and the custom backend
-    # appends them to whatever command it is given — which put
-    # `--max-model-len=8192` on a vllm-router invocation that has no such flag.
-    # The catalog's command is complete by construction, so there is nothing
-    # for a user parameter to add here; a router that needs its own takes the
-    # user-provided branch, where the whole command is theirs.
-    projected.backend_parameters = []
+    # Two different things arrive in this field and only one of them belongs
+    # to the router.
+    #
+    # *Inherited* parameters are the group's engine parameters, projected here
+    # like every other Model-level field — and the custom backend appends them
+    # to whatever command it is given, which put `--max-model-len=8192` on a
+    # `vllm-router` invocation that has no such flag. Those are dropped.
+    #
+    # Parameters the deployment wrote *on the router role* are the opposite
+    # case: someone asked for a specific routing policy or breaker threshold.
+    # Appending them works because every tunable flag is last-wins — verified
+    # against both shipped wheels, `--decode-policy round_robin
+    # --decode-policy cache_aware` parses to `cache_aware`. The flags the
+    # platform renders from placement facts are refused at admission instead,
+    # because `--prefill` and `--decode` are `action="append"` there and a
+    # second one adds a phantom peer rather than replacing the injected one.
+    declared = role.backend_parameters if role else None
+    projected.backend_parameters = list(declared) if declared is not None else []
 
     # Environment goes the other way round from image and command: the
     # catalog's entries are what the binary needs in order to come up at all,

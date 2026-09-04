@@ -741,3 +741,68 @@ def test_a_router_env_placeholder_is_rendered_not_passed_through():
     plan = render_router(mode, VARIABLES, PEERS)
 
     assert plan.env["ADVERTISE"] == "192.168.50.15"
+
+
+def test_the_routers_own_parameters_are_appended_and_the_groups_are_not():
+    """Two different things arrive in `backend_parameters` and only one is the
+    router's.
+
+    Inherited engine parameters put `--max-model-len=8192` on a `vllm-router`
+    invocation that has no such flag, which is why they are dropped. Parameters
+    written *on the router role* are the opposite case — someone asked for a
+    routing policy — and appending them works because every tunable flag is
+    last-wins in both shipped routers.
+    """
+    from gpustack.schemas.models import (
+        DisaggregationSpec,
+        Model,
+        PDModeEnum,
+        RoleSpec,
+        SourceEnum,
+    )
+    from gpustack.worker.pd_router import apply_managed_router
+
+    def _model(router_params):
+        return Model(
+            name="m",
+            source=SourceEnum.HUGGING_FACE,
+            huggingface_repo_id="org/repo",
+            backend_parameters=["--max-model-len=8192"],
+            disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
+            roles=[
+                RoleSpec(name="prefill", replicas=1),
+                RoleSpec(name="decode", replicas=1),
+                RoleSpec(name="router", replicas=1, backend_parameters=router_params),
+            ],
+        )
+
+    peers = {
+        "prefill": [PeerAddress(ip="10.0.0.1", port=8000)],
+        "decode": [PeerAddress(ip="10.0.0.2", port=8000)],
+    }
+    variables = {
+        "worker_ip": "10.0.0.9",
+        "port": 8080,
+        "ports": {"prometheus": 40001},
+        "runner_image": "img",
+    }
+
+    def _params(router_params):
+        applied = apply_managed_router(
+            _model(router_params), "router", peers=peers, variables=variables
+        )
+        return applied.backend_parameters
+
+    # Nothing declared on the role: what is there is the group's, and it is
+    # dropped rather than appended to a command line that cannot read it.
+    assert _params(None) == []
+
+    # Declared on the role: kept, so it lands after the catalog's own flags.
+    assert _params(["--decode-policy", "cache_aware"]) == [
+        "--decode-policy",
+        "cache_aware",
+    ]
+
+    # An explicitly empty list is a statement too, and it must not resurrect
+    # the group's parameters.
+    assert _params([]) == []

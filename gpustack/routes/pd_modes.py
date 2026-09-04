@@ -5,9 +5,12 @@ from fastapi import APIRouter
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.schemas.common import PaginatedList, Pagination
+from gpustack.schemas.pd_mode_resolution import PDModeResolution
 from gpustack.schemas.pd_modes import PDMode
+from gpustack.server.cluster_accelerators import cluster_vendors
 from gpustack.server.pd_mode_catalog import get_pd_mode, get_pd_modes
-from gpustack.server.deps import ListParamsDep
+from gpustack.server.pd_mode_resolver import resolve_pd_mode
+from gpustack.server.deps import ListParamsDep, SessionDep
 
 router = APIRouter()
 
@@ -58,6 +61,28 @@ async def list_pd_modes(
     )
 
     return PaginatedList[PDMode](items=paginated_items, pagination=pagination)
+
+
+@router.get("/resolve", response_model=PDModeResolution)
+async def resolve(
+    session: SessionDep,
+    cluster_id: Optional[int] = None,
+    backend: Optional[str] = None,
+    vendor: Optional[str] = None,
+):
+    """Which recipe this deployment gets, and why every other one is out.
+
+    Declared before ``/{name}`` on purpose: FastAPI matches in order, so the
+    path parameter would otherwise swallow ``/resolve``.
+
+    The judgement lives here rather than in the client because the deciding
+    fact -- which accelerators the cluster's ready workers report -- is not in
+    the deploy form. What the client has is the cluster's ``provider``
+    (Docker / Kubernetes), which is the infrastructure provider, not the
+    accelerator vendor.
+    """
+    vendors = await cluster_vendors(session, cluster_id)
+    return resolve_pd_mode(backend, vendors, vendor=vendor)
 
 
 @router.get("/{name}", response_model=PDMode)

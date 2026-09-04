@@ -17,6 +17,7 @@ from gpustack.server.pd_mode_catalog import (
     get_kv_lease,
     get_kv_leases,
     get_pd_mode,
+    get_pd_modes,
     get_transfer_metrics,
     load_pd_mode_catalog,
     load_pd_modes,
@@ -103,6 +104,127 @@ def test_backends_mismatch_fails_the_load():
     message = str(excinfo.value)
     assert "PD_MODE_BACKENDS" in message
     assert "vllm-nixl" in message
+
+
+def test_every_built_in_recipe_declares_its_accelerator():
+    """The shipped catalog must not contain a recipe that would be offered on
+    every accelerator. This is the assertion that keeps the AMD case closed:
+    phase 1 ships no AMD recipe, so an unconstrained NVIDIA recipe would be
+    selectable there and fail inside the connector."""
+    for mode in get_pd_modes():
+        injects = bool(mode.roles) or (
+            mode.router is not None and mode.router.protocol.value != "user_provided"
+        )
+        if injects:
+            assert (
+                mode.gpu_filters is not None and mode.gpu_filters.vendor
+            ), f"{mode.name} injects configuration but names no accelerator"
+
+
+def test_every_built_in_recipe_names_its_transport():
+    """The derived one-liner shows the transport alone — the engine is already
+    named in the field above it, so "vLLM + NIXL" next to a "Backend: vLLM"
+    field repeats itself. `display_name` keeps the engine because the picker
+    lists several engines' recipes side by side and there it has to say *which*
+    NIXL."""
+    for mode in get_pd_modes():
+        injects = bool(mode.roles) or (
+            mode.router is not None and mode.router.protocol.value != "user_provided"
+        )
+        if injects:
+            assert mode.transport, f"{mode.name} names no transport"
+            assert mode.transport not in mode.display_name.split(" + ")[0], (
+                f"{mode.transport} should be the transport alone, not the "
+                f"engine-qualified name"
+            )
+
+
+def test_transport_is_unique_per_engine_accelerator_pair():
+    """The picker labels rows by transport alone, and it hides recipes that do
+    not fit the chosen engine and accelerator. So two recipes in one cell with
+    the same transport would render as two identical, indistinguishable rows.
+
+    Holds today because SGLang-on-NVIDIA is the only cell with two candidates
+    and they use different transports — this is the guard that keeps a third
+    recipe from breaking it silently."""
+    from collections import defaultdict
+
+    cells = defaultdict(list)
+    for mode in get_pd_modes():
+        if not mode.transport:
+            continue
+        for backend in mode.backends:
+            for vendor in mode.gpu_filters.vendor if mode.gpu_filters else []:
+                cells[(backend, vendor, mode.transport)].append(mode.name)
+    for cell, names in cells.items():
+        assert len(names) == 1, f"{cell} is claimed by {names}"
+
+
+def test_custom_names_no_transport():
+    """It has none of its own: the user supplies the connector."""
+    assert get_pd_mode(PDModeEnum.CUSTOM.value).transport is None
+
+
+def test_custom_declares_no_accelerator_constraint():
+    """🔴 `custom` is the escape hatch for every engine × accelerator pair we
+    ship no recipe for. Constraining it would turn "no built-in recipe" into
+    "no PD"."""
+    custom = get_pd_mode(PDModeEnum.CUSTOM.value)
+    assert custom.gpu_filters is None or not custom.gpu_filters.vendor
+    assert not custom.backends
+
+
+def test_an_undeclared_accelerator_fails_the_load():
+    """A recipe that injects a connector but names no accelerator would be
+    offered on every one of them -- exactly how three NVIDIA-only recipes came
+    to be selectable on Ascend."""
+    document = _document(
+        [
+            {
+                "name": PDModeEnum.VLLM_NIXL.value,
+                "backends": [BackendEnum.VLLM.value],
+                "roles": {"prefill": {}, "decode": {}},
+            }
+        ]
+    )
+    with pytest.raises(PDModeCatalogError) as excinfo:
+        parse_pd_mode_catalog(document)
+    assert "gpu_filters" in str(excinfo.value)
+    assert "vllm-nixl" in str(excinfo.value)
+
+
+def test_constraining_custom_fails_the_load():
+    """The other half: `custom` injects nothing, so a constraint on it only
+    removes the escape hatch."""
+    document = _document(
+        [
+            {
+                "name": PDModeEnum.CUSTOM.value,
+                "backends": [],
+                "gpu_filters": {"vendor": "nvidia"},
+            }
+        ]
+    )
+    with pytest.raises(PDModeCatalogError) as excinfo:
+        parse_pd_mode_catalog(document)
+    assert "custom" in str(excinfo.value)
+
+
+def test_exactly_one_recipe_is_preferred_per_engine_accelerator_pair():
+    """`preferred` is the tie-break for a cell with more than one candidate.
+    Two preferred recipes in one cell would make the derived answer depend on
+    catalog order."""
+    from collections import defaultdict
+
+    cells = defaultdict(list)
+    for mode in get_pd_modes():
+        if not mode.preferred:
+            continue
+        for backend in mode.backends:
+            for vendor in mode.gpu_filters.vendor if mode.gpu_filters else []:
+                cells[(backend, vendor)].append(mode.name)
+    for cell, names in cells.items():
+        assert len(names) == 1, f"{cell} has multiple preferred recipes: {names}"
 
 
 def test_backends_use_the_backend_enum_spelling():
@@ -845,3 +967,50 @@ def test_membership_api_round_trips_through_serialization():
         assert PDMode.model_validate(dumped).router.membership_api == (
             mode.router.membership_api
         )
+
+
+def test_every_shipped_router_classifies_its_invocation():
+    """The refusal list is derived, so an unclassified router permits everything.
+
+    Not a style rule. `platform_owned_flags` reads `connection_args`, and a
+    router that declared its whole invocation as a bare `command` would expose
+    an empty list — which turns "you may not set --prefill" into "you may".
+    Both shipped routers declare `--prefill` as `action="append"`, so a second
+    one does not replace the injected peer: it adds one the router forwards to
+    and cannot reach.
+    """
+    from gpustack.schemas.pd_modes import PDRouterProtocolEnum
+
+    for mode in load_pd_modes():
+        router = mode.router
+        if router is None or router.protocol == PDRouterProtocolEnum.USER_PROVIDED:
+            continue
+        assert router.entrypoint, f"{mode.name}: no entrypoint"
+        assert router.connection_args, f"{mode.name}: no connection_args"
+        # The flags a deployment may not set, and the ones it may, must be
+        # disjoint — the model validator enforces it, this asserts the shipped
+        # catalog actually exercises both sides.
+        owned = set(router.platform_owned_flags)
+        tunable = {arg.flag for arg in router.tunable_args}
+        assert owned, f"{mode.name}: derived refusal list is empty"
+        assert not (owned & tunable), f"{mode.name}: {owned & tunable} on both sides"
+
+
+def test_the_composed_command_is_the_three_parts_in_order():
+    """`command` stays readable as the whole invocation, so every existing
+    consumer — the renderer, the read-only view — keeps seeing one list.
+
+    Order is the contract, not an accident: a deployment's own parameters are
+    appended after all of these, and appending only overrides a tunable
+    default because repeated flags are last-wins.
+    """
+    from gpustack.schemas.pd_modes import PDRouterProtocolEnum
+
+    for mode in load_pd_modes():
+        router = mode.router
+        if router is None or router.protocol == PDRouterProtocolEnum.USER_PROVIDED:
+            continue
+        expected = list(router.entrypoint) + list(router.connection_args)
+        for arg in router.tunable_args:
+            expected.extend(arg.tokens)
+        assert router.command == expected, mode.name

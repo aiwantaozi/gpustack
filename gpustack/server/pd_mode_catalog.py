@@ -10,6 +10,7 @@ from gpustack.schemas.pd_modes import (
     PDMode,
     PDModeCatalog,
     PDTransferMetrics,
+    PDRouterProtocolEnum,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,8 @@ def parse_pd_mode_catalog(raw: Any) -> PDModeCatalog:
     _assert_names_match_enum(modes)
     _assert_backends_match_table(modes)
     _assert_expired_metric_agrees(modes)
+    _assert_gpu_filters_declared(modes)
+    _assert_router_invocation_is_classified(modes)
     return PDModeCatalog(
         kv_leases=leases, kv_transfer_metrics=transfer_metrics, modes=modes
     )
@@ -207,6 +210,98 @@ def _assert_backends_match_table(modes: List[PDMode]) -> None:
             "PD_MODE_BACKENDS is a copy of this catalog's `backends` kept for "
             "request validation, and the two disagree: " + "; ".join(disagreements)
         )
+
+
+def _assert_router_invocation_is_classified(modes: List[PDMode]) -> None:
+    """A shipped router declares its invocation in the three classified parts.
+
+    ``PDRouter`` accepts a bare ``command`` too — that is what keeps the type
+    usable outside the catalog — so the requirement that *our* recipes classify
+    theirs belongs here, where the subject is what we ship.
+
+    Two things depend on the classification, and both fail silently without it:
+
+    - The deploy form cannot tell a user which router flags they may change.
+      Falling back to "the whole command, read-only" is a usable degradation,
+      so this alone would not justify raising.
+    - **The refusal list is read off ``connection_args``.** An unclassified
+      router has an empty one, which turns "you may not set ``--prefill``"
+      into "you may", and a second ``--prefill`` does not replace the injected
+      peer — both shipped routers declare it ``action="append"``, so it adds
+      one the router forwards to and cannot reach. That is the half that has
+      to be caught at load time rather than at deploy time.
+    """
+    problems = []
+    for mode in modes:
+        router = mode.router
+        if router is None:
+            continue
+        if router.protocol == PDRouterProtocolEnum.USER_PROVIDED:
+            continue
+        if not router.entrypoint:
+            problems.append(
+                f"'{mode.name}': router declares no entrypoint — say which "
+                f"executable inside the image runs"
+            )
+        if not router.connection_args:
+            problems.append(
+                f"'{mode.name}': router declares no connection_args — the "
+                f"flags a deployment may not override are read from there, so "
+                f"an empty list silently permits all of them"
+            )
+    if problems:
+        raise PDModeCatalogError("; ".join(problems))
+
+
+def _assert_gpu_filters_declared(modes: List[PDMode]) -> None:
+    """Every recipe that injects something must say which accelerators it fits;
+    the one that injects nothing must not.
+
+    Both halves are load-bearing and neither is obvious:
+
+    - **A built-in recipe without `gpu_filters` is offered everywhere.** That
+      is how three NVIDIA-only recipes came to be selectable on Ascend and on
+      AMD -- the earlier `runtime` field left "unconstrained" and "not
+      declared" spelled the same way, so forgetting the constraint looked
+      exactly like meaning "any accelerator".
+    - **`custom` must stay unconstrained.** It injects nothing, so it is the
+      only way to run PD on an engine × accelerator pair we ship no recipe
+      for. Giving it a filter would turn "no built-in recipe" into "no PD".
+
+    Keyed off `roles`/`router` rather than a name list so a fourth built-in
+    recipe is caught by the same rule instead of needing an edit here.
+    """
+    problems = []
+    for mode in modes:
+        injects = bool(mode.roles) or (
+            mode.router is not None
+            and mode.router.protocol is not PDRouterProtocolEnum.USER_PROVIDED
+        )
+        declared = mode.gpu_filters is not None and bool(mode.gpu_filters.vendor)
+        if injects and not declared:
+            problems.append(
+                f"'{mode.name}' injects configuration but declares no "
+                "gpu_filters.vendor, so it would be offered on every "
+                "accelerator"
+            )
+        if injects and not mode.transport:
+            problems.append(
+                f"'{mode.name}' injects configuration but names no "
+                "transport, so the derived one-liner has nothing to show"
+            )
+        if not injects and mode.transport:
+            problems.append(
+                f"'{mode.name}' injects nothing, so it has no transport of "
+                "its own to name"
+            )
+        if not injects and declared:
+            problems.append(
+                f"'{mode.name}' injects nothing, so a gpu_filters constraint "
+                "would only remove the escape hatch for accelerators we ship "
+                "no recipe for"
+            )
+    if problems:
+        raise PDModeCatalogError("; ".join(problems))
 
 
 def _assert_expired_metric_agrees(modes: List[PDMode]) -> None:

@@ -1,8 +1,10 @@
 import re
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Union
 
 from pydantic import BaseModel, model_validator
+
+from gpustack.schemas.gpu_filters import GPUFilters
 
 _PLACEHOLDER_OCCURRENCE = re.compile(r"\{\{.*?\}\}")
 """Any {{...}} run, valid or not — the validator's discovery pass."""
@@ -438,15 +440,84 @@ class PDMembershipAPI(BaseModel):
         return bool(self.add and self.probe)
 
 
+class PDTunableArg(BaseModel):
+    """One router flag the deployment may legitimately change.
+
+    Declared rather than inferred because the alternative — a hardcoded list
+    of "flags a user may touch" — has to be edited in Python every time a
+    recipe is added, which is the thing the catalog exists to avoid.
+
+    ``options`` and ``min`` / ``max`` are for rendering, not enforcement: they
+    let a form offer a select or a bounded number field instead of a bare text
+    box. A value outside them is still submitted — the two shipped routers
+    disagree about their own strategy sets between wheel and repository at the
+    same version number, so a closed list here would forbid a flag the
+    installed binary accepts.
+    """
+
+    flag: str
+    """Long form with the dashes, e.g. ``--decode-policy``."""
+    default: Optional[str] = None
+    """What the catalog passes when the deployment says nothing. Rendered into
+    the command, so it is also what the read-only view shows."""
+    options: List[str] = []
+    """Known-good values, for a select. Advisory — see the class docstring."""
+    value_type: Literal["string", "int", "float"] = "string"
+    min: Optional[float] = None
+    max: Optional[float] = None
+    description: Optional[str] = None
+
+    @property
+    def tokens(self) -> List[str]:
+        """The flag and its default, as command tokens. Empty when there is no
+        default: a declared knob with nothing to pass is a knob, not an
+        argument."""
+        return [self.flag, self.default] if self.default is not None else []
+
+
 class PDRouter(BaseModel):
     """The router role of a mode. There is no universal router — the
-    catalog format is what generalizes, not the binary."""
+    catalog format is what generalizes, not the binary.
+
+    🔑 **The invocation is declared in three parts, not one string.** They mean
+    three different things to the deployment, and a single ``command`` list
+    could not say which was which:
+
+    ``entrypoint``
+        Which executable inside the image. Same image as the model's — the
+        difference between a router and an engine is the binary, not the
+        image — so this is the one line that says what actually runs.
+    ``connection_args``
+        Addresses, ports and the transport handshake. **The platform owns
+        these**: they are rendered from placement facts the deployment does not
+        have, and a user value here is refused at admission rather than merged.
+        Measured why it must be refused: ``--prefill`` and ``--decode`` are
+        ``action="append"`` in both shipped routers, so a second one does not
+        replace the injected peer — it adds a phantom one the router then
+        forwards to.
+    ``tunable_args``
+        Strategy and resilience defaults. Overridable, because repeated flags
+        are last-wins for every one of them (verified against both wheels:
+        ``--decode-policy round_robin --decode-policy cache_aware`` parses to
+        ``cache_aware``). A deployment's own parameters are appended after
+        these, which is what makes "append" and "override" the same gesture.
+
+    ``command`` stays readable as the whole invocation — it is composed from
+    the three parts at load time, so every existing consumer (the renderer, the
+    read-only view) keeps seeing one list.
+    """
 
     protocol: PDRouterProtocolEnum
 
     image: Optional[str] = None
     ports: List[PDPortSpec] = []
+    entrypoint: List[str] = []
+    connection_args: List[str] = []
+    tunable_args: List[PDTunableArg] = []
     command: List[str] = []
+    """The full invocation. Composed from the three parts above unless given
+    directly; giving both is refused at load time, because then two places
+    would describe the same command line and only one of them would be read."""
     env: Dict[str, str] = {}
     """Environment a router needs in order to start at all.
 
@@ -495,6 +566,75 @@ class PDRouter(BaseModel):
     health_path: Optional[str] = None
     """None means the router serves no health endpoint, so readiness falls
     back to process liveness."""
+
+    @property
+    def platform_owned_flags(self) -> List[str]:
+        """The flag names a deployment may not set — the blacklist, derived.
+
+        Read off the declaration rather than listed in Python, so adding a
+        recipe cannot forget to extend it. Only long-form tokens count: a value
+        that happens to start with ``--`` would be a value, not a flag, and
+        ``connection_args`` never carries one (its values are addresses and
+        ports).
+
+        🔴 **The peer flags belong here even though they are not in
+        ``connection_args``.** They live in ``peers`` because the renderer
+        appends one per member after the declared command, and leaving them out
+        of this list was the whole gap: ``--prefill`` and ``--decode`` are
+        ``action="append"`` in both shipped routers, so a user value does not
+        replace the injected peers — it adds one the router forwards to and
+        cannot reach, and the member simply never gets traffic.
+        """
+        flags = [
+            token
+            for token in self.connection_args
+            if token.startswith("--") and "{{" not in token
+        ]
+        if self.peers is not None:
+            for spec in (self.peers.prefill, self.peers.decode):
+                for key in ("flag", "host_flag", "port_flag"):
+                    value = spec.get(key)
+                    if value and value.startswith("--"):
+                        flags.append(value)
+        return flags
+
+    @model_validator(mode="after")
+    def compose_command(self) -> "PDRouter":
+        """Build ``command`` from the three declared parts.
+
+        Runs before ``check_user_provided`` reads ``command``, which is why the
+        composition lives in its own validator rather than inside that one:
+        field validators run in declaration order, and the check needs a
+        composed value to check.
+        """
+        parts = self.entrypoint + self.connection_args
+        for arg in self.tunable_args:
+            parts.extend(arg.tokens)
+        # Equal is not "both": `model_dump()` emits the parts *and* the
+        # composed command, and the endpoint serves that dump back — so
+        # re-validating one's own output has to be a no-op. Only a `command`
+        # that disagrees with the parts is two descriptions of one command
+        # line, and only that is worth refusing.
+        if parts and self.command and self.command != parts:
+            raise ValueError(
+                "a router's `command` disagrees with its entrypoint / "
+                "connection_args / tunable_args — declare the invocation in "
+                "one place, because only one of the two would be read"
+            )
+        if parts:
+            self.command = parts
+        flags = [arg.flag for arg in self.tunable_args]
+        duplicates = sorted({flag for flag in flags if flags.count(flag) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate tunable flags on the router: {duplicates}")
+        overlap = sorted(set(flags) & set(self.platform_owned_flags))
+        if overlap:
+            raise ValueError(
+                f"flags declared both platform-owned and tunable: {overlap} — "
+                "a flag the platform renders from placement facts cannot also "
+                "be offered for editing"
+            )
+        return self
 
     @model_validator(mode="after")
     def check_user_provided(self) -> "PDRouter":
@@ -561,9 +701,42 @@ class PDMode(BaseModel):
     """Human-readable compatible version range. Informational, like a cache
     provider's ``versions``."""
 
-    runtime: Optional[str] = None
-    """Accelerator runtime this recipe requires (e.g. "ascend" for CANN
-    plus the Ascend docker runtime). None means no constraint."""
+    gpu_filters: Optional[GPUFilters] = None
+    """Which accelerators this recipe may be injected into.
+
+    Replaces the earlier ``runtime`` string, whose ``None`` meant both
+    "unconstrained" and "not declared" -- so it could express "Ascend only"
+    but not "NVIDIA only". Phase 1 does not ship an AMD recipe, which turns
+    that gap into a real defect: three NVIDIA recipes would be offered on AMD
+    clusters. A positive declaration is the only shape that expresses both
+    directions.
+
+    ``None`` is reserved for ``custom``, which injects nothing and must stay
+    selectable on every accelerator -- an unsupported pair means "no built-in
+    recipe", never "no PD".
+    """
+
+    transport: Optional[str] = None
+    """The KV transport this recipe uses, e.g. "NIXL" or "Mooncake".
+
+    Separate from ``display_name`` because the two are read in different
+    places. The picker lists recipes for several engines side by side, so
+    there it has to say *which* NIXL ("vLLM + NIXL" vs "SGLang + NIXL"). The
+    derived one-liner is shown after the engine has already been chosen and
+    named, so repeating it there is noise -- the only new fact is the
+    transport.
+
+    None for ``custom``, which has no transport of its own: the user supplies
+    the connector.
+    """
+
+    preferred: bool = False
+    """Pick this one when several recipes fit the same engine and accelerator.
+
+    Exactly one cell needs it today: SGLang on NVIDIA, where Mooncake and NIXL
+    both work and Mooncake is the answer. Keeping the tie-break in the catalog
+    means neither the API nor the UI has to hold a "which one is better" rule.
+    """
 
     roles: Dict[str, PDModeRole] = {}
     """Engine roles by name. Empty injects nothing (``custom``). Role names

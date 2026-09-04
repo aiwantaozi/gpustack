@@ -305,8 +305,44 @@ class TopologyLayer(BaseModel):
     )
 
 
+class AcceleratorDomainSpec(BaseModel):
+    """Where a worker's accelerator domain (NVLink / HCCS / UB reach) is read from.
+
+    Beside the layers rather than among them: the domain nests in no fixed
+    place in the tree — inside a host on an 8-card server, across sixteen racks
+    on a CloudMatrix384 — so the solver consults it as a candidate set of its
+    own rather than as a rung.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    label_keys: List[str] = PydanticField(
+        default_factory=list,
+        alias="labelKeys",
+        description=(
+            "Any-of, first present wins. Empty means the built-in keys "
+            "(`topology.gpustack.ai/accelerator-domain`, `nvidia.com/gpu.clique`)."
+        ),
+    )
+    sub_domain_keys: List[str] = PydanticField(
+        default_factory=list,
+        alias="subDomainKeys",
+        description=(
+            "Any-of keys of a tier *inside* the domain (Atlas 950: the compute "
+            "cabinet, whose bandwidth to a neighbour is twice that across "
+            "cabinets). Usually the rack field's own keys. Empty means no tier."
+        ),
+    )
+
+
 class ClusterTopology(BaseModel):
     """How far apart this cluster's workers are, for the group scheduler.
+
+    The layers are a fixed vocabulary (region, zone, room, row, rack, access
+    switch, host — see `scheduler.topology_vocabulary`); a cluster fills in
+    values, it does not declare layers. `layers` is therefore empty in the
+    common case. A non-empty `layers` is the Advanced panel's work: an entry
+    named after a vocabulary field replaces that field's label keys, and any
+    other entry is a custom layer placed by its `parent_layer`.
 
     Only the root and the leaf are built in. The leaf takes the worker's name
     rather than a label, so a cluster that declares nothing still gets a usable
@@ -318,9 +354,14 @@ class ClusterTopology(BaseModel):
     layers: List[TopologyLayer] = PydanticField(
         default_factory=list,
         description=(
-            "Layers between the cluster root and the worker, as a parent "
-            "chain. May be empty."
+            "Key overrides for vocabulary fields and custom layers, as a "
+            "parent chain. Empty means the vocabulary as-is."
         ),
+    )
+    accelerator_domain: Optional[AcceleratorDomainSpec] = PydanticField(
+        default=None,
+        alias="acceleratorDomain",
+        description="Where the accelerator domain is read from. None means the built-in keys.",
     )
     default_gather_strategy: Optional[GatherStrategyEnum] = PydanticField(
         default=None,
@@ -680,40 +721,32 @@ class ClusterUpdate(SQLModel):
     def validate_topology(cls, v: Optional[ClusterTopology]):
         """Refuse a declaration that cannot become a tree.
 
-        Only the declaration is validated, never the data: a cycle or a
-        dangling parent means the operator's intent is unknowable, while a
-        worker missing a label is a normal state the tree already has a place
-        for. Rejecting the second would make labelling a precondition for
-        saving, which is exactly backwards — the labels are edited *after*
-        the layers exist, using the tree to see who is still missing.
+        Only the declaration is validated, never the data: a custom layer
+        naming a parent that does not exist, or taking a vocabulary id as its
+        name, means the operator's intent is unknowable, while a worker missing
+        a label is a normal state the tree already has a place for. Rejecting
+        the second would make labelling a precondition for saving, which is
+        exactly backwards — values are filled in *after*, using the tree to see
+        who is still missing.
         """
         if v is None:
             return v
 
-        from gpustack.scheduler.topology import (
-            NODE_LAYER,
-            TopologyError,
-            TopologyLayerSpec,
-            layer_names,
+        from gpustack.scheduler.topology import NODE_LAYER, TopologyError
+        from gpustack.scheduler.topology_vocabulary import (
+            gather_layer_names,
+            validate_declaration,
         )
 
-        specs = [
-            TopologyLayerSpec(
-                layer=layer.name,
-                label_keys=tuple(layer.label_keys or ()),
-                parent_layer=layer.parent_layer,
-            )
-            for layer in v.layers or []
-        ]
         try:
-            names = layer_names(specs)
+            names = gather_layer_names(validate_declaration(v))
         except TopologyError as e:
             raise ValueError(str(e)) from e
 
         if v.default_gather_layer and v.default_gather_layer not in names:
             raise ValueError(
                 f"default_gather_layer {v.default_gather_layer!r} is not a "
-                f"declared layer. Available: {', '.join(names)}."
+                f"known layer. Available: {', '.join(names)}."
             )
         if v.default_gather_strategy and not v.default_gather_layer:
             raise ValueError(

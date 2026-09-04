@@ -37,6 +37,12 @@ RESERVED_LAYERS = frozenset({ROOT_LAYER, NODE_LAYER})
 # needs something to hang "20 workers are missing this label" off.
 UNCLASSIFIED = "<unclassified>"
 
+# The accelerator domain is not a layer of the tree; it is its own flat grouping
+# (see ``group_by_domain``). Named here so a ``TopologyNode`` can say which
+# grouping it belongs to.
+ACCELERATOR_DOMAIN_LAYER = "accelerator_domain"
+ACCELERATOR_SUB_DOMAIN_LAYER = "accelerator_sub_domain"
+
 
 @dataclass(frozen=True)
 class TopologyLayerSpec:
@@ -175,6 +181,20 @@ def order_layers(specs: Sequence[TopologyLayerSpec]) -> List[TopologyLayerSpec]:
     return ordered
 
 
+def effective_topology_labels(worker) -> Dict[str, str]:
+    """What a worker's position is read from.
+
+    The worker's own labels laid over what its runtime discovered
+    (``status.topology_facts``). The order is the whole policy: a hand-filled
+    value overrides a discovered one, and clearing the hand-filled key uncovers
+    the discovered one again.
+    """
+    status = getattr(worker, "status", None)
+    facts = getattr(status, "topology_facts", None) or {}
+    labels = getattr(worker, "labels", None) or {}
+    return {**facts, **labels}
+
+
 def _domain_of(labels: Mapping[str, str], spec: TopologyLayerSpec):
     """The domain a worker belongs to at one layer, and the key that said so.
 
@@ -206,7 +226,7 @@ def build_topology(
         worker_id = getattr(worker, "id", None)
         if worker_id is None:
             continue
-        labels = getattr(worker, "labels", None) or {}
+        labels = effective_topology_labels(worker)
 
         parent = root
         for spec in ordered:
@@ -235,6 +255,55 @@ def _child(
     )
     parent.children.append(node)
     return node
+
+
+def group_by_domain(
+    workers: Iterable,
+    label_keys: Sequence[str],
+    sub_domain_keys: Sequence[str] = (),
+) -> List[TopologyNode]:
+    """Group workers by accelerator domain, flat, beside the tree.
+
+    A domain is the set of workers whose accelerators can address each other's
+    memory (NVLink, HCCS, UB). It nests nowhere fixed in the tree — inside a
+    host on an 8-card server, across sixteen racks on a CloudMatrix384 — so it
+    is not a layer of it. Each returned node is one domain holding leaf nodes
+    for its workers; workers with no domain value are collected under the
+    unclassified bucket, which the solver excludes like any other.
+
+    With ``sub_domain_keys`` the grouping is by *(domain, sub-domain)* pair
+    instead, and only workers carrying both values take part. The pair, not
+    the sub-domain value alone: a rack named ``R1`` may exist in two super pods,
+    and only the one inside the same domain is "closer".
+    """
+    layer = (
+        ACCELERATOR_SUB_DOMAIN_LAYER if sub_domain_keys else ACCELERATOR_DOMAIN_LAYER
+    )
+    root = TopologyNode(layer=ROOT_LAYER, name=ROOT_LAYER)
+    domain_spec = TopologyLayerSpec(layer=layer, label_keys=tuple(label_keys))
+    sub_spec = TopologyLayerSpec(layer=layer, label_keys=tuple(sub_domain_keys))
+
+    for worker in workers:
+        worker_id = getattr(worker, "id", None)
+        if worker_id is None:
+            continue
+        labels = effective_topology_labels(worker)
+        name, matched = _domain_of(labels, domain_spec)
+        if name is not None and sub_domain_keys:
+            sub_name, _ = _domain_of(labels, sub_spec)
+            if sub_name is None:
+                # No sub-domain value: this worker is not "closer" to anyone
+                # at this scope. It still counts at the domain scope.
+                continue
+            name = f"{name}/{sub_name}"
+        if name is None:
+            name = UNCLASSIFIED
+        domain = _child(root, layer, name, matched)
+        leaf_name = getattr(worker, "name", None) or str(worker_id)
+        leaf = _child(domain, NODE_LAYER, leaf_name, None)
+        leaf.worker_ids.append(worker_id)
+
+    return root.children
 
 
 def layer_names(specs: Sequence[TopologyLayerSpec]) -> List[str]:

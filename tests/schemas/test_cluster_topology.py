@@ -75,7 +75,7 @@ def test_a_layer_may_declare_no_label_keys():
         ),
         (
             {"layers": [{"name": "A"}, {"name": "B"}]},
-            "hangs off the cluster root",
+            "share a parent",
         ),
         (
             {
@@ -84,7 +84,7 @@ def test_a_layer_may_declare_no_label_keys():
                     {"name": "B", "parentLayer": "A"},
                 ]
             },
-            "hangs off the cluster root",
+            "not reachable",
         ),
         (
             {
@@ -94,11 +94,11 @@ def test_a_layer_may_declare_no_label_keys():
                     {"name": "B", "parentLayer": "Z"},
                 ]
             },
-            "more than one child",
+            "share a parent",
         ),
         (
-            {"layers": [{"name": "ClusterTopologyLayer"}]},
-            "implicit root",
+            {"layers": [{"name": "accelerator_domain"}]},
+            "reserved",
         ),
         (
             {"layers": [{"name": "A"}, {"name": "A", "parentLayer": "A"}]},
@@ -139,7 +139,7 @@ def test_the_builtin_node_layer_is_selectable_without_declaring_anything():
 
 
 def test_a_gather_layer_that_names_nothing_is_refused():
-    with pytest.raises(ValueError, match="is not a declared layer"):
+    with pytest.raises(ValueError, match="is not a known layer"):
         cluster({"layers": [{"name": "Rack"}], "defaultGatherLayer": "Zone"})
 
 
@@ -147,6 +147,46 @@ def test_a_strategy_without_a_layer_is_refused():
     """ "Must gather" has to say must gather *where*."""
     with pytest.raises(ValueError, match="needs default_gather_layer"):
         cluster({"layers": [{"name": "Rack"}], "defaultGatherStrategy": "MustGather"})
+
+
+def test_a_custom_layer_may_hang_under_a_vocabulary_field():
+    """The vocabulary is the chain; a custom layer names the rung it sits
+    under, which is how a fabric with a tier the vocabulary lacks is spelled."""
+    c = cluster(
+        {
+            "layers": [{"name": "Pod", "parentLayer": "zone", "labelKeys": ["dc/pod"]}],
+            "defaultGatherLayer": "Pod",
+        }
+    )
+
+    assert c.topology.layers[0].parent_layer == "zone"
+
+
+def test_the_accelerator_domain_is_a_selectable_gather_layer():
+    """It is not a rung of the tree, but it is a scope the solver walks, so a
+    cluster may make "same domain" its default."""
+    c = cluster(
+        {
+            "defaultGatherStrategy": "MustGather",
+            "defaultGatherLayer": "accelerator_domain",
+        }
+    )
+
+    assert c.topology.default_gather_layer == "accelerator_domain"
+
+
+def test_vocabulary_keys_can_be_overridden_by_naming_the_field():
+    c = cluster(
+        {
+            "layers": [{"name": "rack", "labelKeys": ["dc.example.com/rack"]}],
+            "acceleratorDomain": {"labelKeys": ["ds.coreweave.com/nvlink.domain"]},
+        }
+    )
+
+    assert c.topology.layers[0].label_keys == ["dc.example.com/rack"]
+    assert c.topology.accelerator_domain.label_keys == [
+        "ds.coreweave.com/nvlink.domain"
+    ]
 
 
 def test_a_layer_without_a_strategy_is_allowed():

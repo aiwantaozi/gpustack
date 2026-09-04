@@ -20,6 +20,7 @@ from gpustack.policies.utils import (
     estimate_model_vram,
 )
 from gpustack.schemas.models import (
+    ROUTER_DEFAULT_MEMORY,
     ComputedResourceClaim,
     Model,
     ModelInstance,
@@ -70,6 +71,7 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
         model: Model,
         model_instances: List[ModelInstance],
         cpu_only: bool = False,
+        ram_claim: Optional[int] = None,
     ):
         super().__init__(cfg, model, model_instances)
         self._event_collector = EventCollector(model, logger)
@@ -85,6 +87,12 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
         # GPU paths must not be tried, because a candidate found on one would
         # be a router holding a card it will never use.
         self._cpu_only = cpu_only
+
+        # The accelerator-free role's declared memory, resolved by the caller
+        # because `resources` is a role-OWN field and this selector is handed a
+        # model that has already been projected. None means "nothing declared",
+        # and the router floor applies.
+        self._declared_ram_claim = ram_claim
 
         # None when the model declares no such parameter, which is the case
         # this must not disturb: a custom backend that is neither vLLM nor
@@ -182,7 +190,7 @@ class CustomBackendResourceFitSelector(ScheduleCandidatesSelector):
             # not merely wasted work: it is what made a router ask for the
             # weights' worth of VRAM and sit unschedulable on a full host.
             self._vram_claim = 0
-            self._ram_claim = 2 * 1024**3
+            self._ram_claim = self._declared_ram_claim or ROUTER_DEFAULT_MEMORY
         else:
             # Estimate VRAM requirements using actual model weight
             self._vram_claim = await estimate_model_vram(

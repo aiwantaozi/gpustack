@@ -325,7 +325,20 @@ def test_a_role_that_takes_no_accelerator_claims_no_slice():
             _model_instance=SimpleNamespace(role=role),
             _get_vgpu_configured_resources=lambda r: "asked-for-a-slice",
         )
+        # The real one, bound: what the router asks for *instead* of a slice is
+        # the other half of this test's subject.
+        fake._get_accelerator_free_resources = (
+            lambda r: InferenceServer._get_accelerator_free_resources(fake, r)
+        )
         return InferenceServer._get_configured_resources(fake)
 
-    assert _resources("router") != "asked-for-a-slice"
+    router = _resources("router")
+    assert router != "asked-for-a-slice"
     assert _resources("prefill") == "asked-for-a-slice"
+
+    # Not merely "no slice": a Pod with no requests at all is invisible to
+    # kubelet admission, so the router declares the floor it actually needs.
+    from gpustack.schemas.models import ROUTER_DEFAULT_CPU, ROUTER_DEFAULT_MEMORY
+
+    assert router["cpu"] == ROUTER_DEFAULT_CPU
+    assert router["memory"] == ROUTER_DEFAULT_MEMORY

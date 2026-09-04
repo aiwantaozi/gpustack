@@ -171,10 +171,18 @@ def test_nested_override_objects_are_projected():
 def test_every_role_override_field_is_projected():
     # Derived, not listed, so adding an override to RoleSpec cannot silently
     # fail to be projected. This test is what makes that claim true.
+    #
+    # Reads the production set rather than restating it: a copy here has to be
+    # edited every time a role-own field is added, and the edit is indis-
+    # tinguishable from the mistake this guards against. Importing it keeps the
+    # coverage — a new field nobody declared as role-own still arrives in the
+    # override set and still has to find a Model field — while dropping the
+    # duplication that made the test fail for a correct change.
+    from gpustack.schemas.models import _ROLE_OWN_FIELDS
+
     role_fields = set(RoleSpec.model_fields)
-    own = {"name", "dependencies", "cpu_only"}
     model_fields = set(Model.model_fields)
-    for field in role_fields - own:
+    for field in role_fields - _ROLE_OWN_FIELDS:
         assert field in model_fields, f"RoleSpec.{field} has no Model field to override"
 
 

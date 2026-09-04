@@ -26,7 +26,7 @@ from unittest.mock import patch
 import pytest
 
 from gpustack.schemas.models import ComputedResourceClaim, Model, RoleSpec
-from gpustack.scheduler.group_capacity import GroupCapacity
+from gpustack.scheduler.group_capacity import GroupCapacity, _RoleProjection
 from gpustack.scheduler.group_solver import _Committed
 
 CLAIM = ComputedResourceClaim(vram={0: 36 * 1024**3}, ram=0)
@@ -72,7 +72,9 @@ def _capacity(workers):
     cap = GroupCapacity(SimpleNamespace(), _model(), workers, [])
     # Both stubbed: the real ones need model metadata off the network, and what
     # is under test is the translation between them.
-    cap._selector = lambda model, instances, cpu_only: _FakeSelector(instances)
+    cap._selector = lambda model, instances, cpu_only, ram_claim=None: _FakeSelector(
+        instances
+    )
     return cap
 
 
@@ -92,8 +94,8 @@ async def test_a_solver_commit_reaches_the_accounting_with_a_claim():
         eligible.return_value = {1: workers[0]}
         cap._eligible["prefill"] = {1: workers[0]}
         cap._eligible["decode"] = {1: workers[0]}
-        cap._projected["prefill"] = (_model(), False)
-        cap._projected["decode"] = (_model(), False)
+        cap._projected["prefill"] = _RoleProjection(_model(), False)
+        cap._projected["decode"] = _RoleProjection(_model(), False)
 
         # First role: this is where the claim is learned.
         first = await cap(role="prefill", worker_ids=[1], already_placed=[])

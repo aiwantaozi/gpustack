@@ -43,6 +43,7 @@ from gpustack.schemas.runner_source import (
 )
 from gpustack.schemas.models import (
     get_backend,
+    role_container_resources,
     role_takes_no_accelerator,
     BackendEnum,
     Model,
@@ -926,20 +927,25 @@ class InferenceServer(ABC):
             If the GPUs assigned to the model instance are of different types.
         """
         resources = ContainerResources()
+        # Ahead of both device paths, because this role declares CPU and memory
+        # *instead of* any device key and that is true on either one: with
+        # `gpu_type_selector` it must not claim a slice, without one it has no
+        # devices to mount. Checking it inside the selector branch only left
+        # the commoner path — a group with no explicit card type — handing the
+        # router an empty request.
+        #
+        # `gpu_type_selector` is a Model-level field every role inherits by
+        # projection, which is why the slice case needs saying rather than
+        # catching. Measured on a live cluster: the scheduler correctly placed
+        # a managed router with no VRAM claim, the container asked for one
+        # anyway, and the device plugin handed it 40% of a card that its own
+        # prefill and decode were sharing. Nothing failed — the group ran.
+        if role_takes_no_accelerator(
+            self._model_spec or self._model,
+            getattr(self._model_instance, "role", None),
+        ):
+            return self._get_accelerator_free_resources(resources)
         if getattr(self._model, "gpu_type_selector", None) is not None:
-            # A role that takes no accelerator must not claim a slice either,
-            # and `gpu_type_selector` is a Model-level field that every role
-            # inherits by projection. Measured on a live cluster: the scheduler
-            # correctly placed a managed router with no VRAM claim, the
-            # container asked for one anyway, and the device plugin handed it
-            # 40% of a card that its own prefill and decode were sharing.
-            # Nothing failed — the group ran — which is why this needs saying
-            # rather than catching.
-            if role_takes_no_accelerator(
-                self._model_spec or self._model,
-                getattr(self._model_instance, "role", None),
-            ):
-                return resources
             return self._get_vgpu_configured_resources(resources)
         gpu_devices = self._get_selected_gpu_devices()
         if gpu_devices:
@@ -958,6 +964,30 @@ class InferenceServer(ABC):
                     if not mount_all_devices
                     else "all"
                 )
+        return resources
+
+    def _get_accelerator_free_resources(
+        self, resources: ContainerResources
+    ) -> ContainerResources:
+        """CPU and memory for a role that holds no weights — the router.
+
+        The only role whose footprint the platform knows outright: it forwards
+        requests and loads nothing, so a fixed floor is a better answer than an
+        estimate. Without this it declared *nothing*, which on Kubernetes is a
+        Pod with no requests — invisible to kubelet admission and, once the
+        ledger grows a CPU dimension, to placement as well.
+
+        ⚠️ Both numbers land in the container's requests and limits alike
+        (Guaranteed QoS on Kubernetes; a share rather than a cap on Docker).
+        Only `memory` also reaches the scheduler, as the role's RAM claim —
+        CPU is not a dimension the allocatable view has.
+        """
+        declared = role_container_resources(
+            self._model_spec or self._model,
+            getattr(self._model_instance, "role", None),
+        )
+        resources["cpu"] = declared.cpu
+        resources["memory"] = declared.memory
         return resources
 
     def _get_vgpu_configured_resources(

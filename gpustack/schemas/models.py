@@ -489,6 +489,41 @@ class PortBand(BaseModel):
     count: int = 1
 
 
+class RoleResources(BaseModel):
+    """What a role's container asks for besides accelerators.
+
+    Only meaningful for a role that holds no weights — today the router — and
+    that is why it is not a Model-level field with the usual inherit-when-None
+    rule: prefill and decode get these numbers from sizing, and a hand-typed
+    value there would only fight the estimate.
+    """
+
+    cpu: Optional[float] = None
+    """Cores. Rendered into the container's requests *and* limits on
+    Kubernetes (so the Pod lands in the Guaranteed QoS class) and into
+    ``cpu_shares`` on Docker, which makes it a weight rather than a cap there.
+
+    ⚠️ It does **not** take part in placement. The scheduler's allocatable
+    view has two dimensions, RAM and VRAM, and CPU is not one of them, so
+    nothing subtracts this from a worker before choosing it. Declaring it
+    still buys cgroup enforcement and kubelet admission; "the scheduler will
+    place the router according to this number" is not true yet and must not
+    be implied in the UI.
+    """
+    memory: Optional[int] = None
+    """Bytes. Unlike `cpu` this one *is* consumed by placement: it becomes the
+    role's ``ComputedResourceClaim.ram``, which the allocatable view already
+    tracks and subtracts."""
+
+
+# A managed router is a proxy: it forwards requests and loads no weights, so
+# its footprint is a fixed floor rather than something to estimate. The memory
+# figure is deliberately the one the CPU-only claim already hardcoded, so
+# turning it into a declared default changes no placement decision.
+ROUTER_DEFAULT_CPU = 2.0
+ROUTER_DEFAULT_MEMORY = 2 * 1024**3
+
+
 class RoleSpec(BaseModel):
     """One role of a multi-role deployment.
 
@@ -554,6 +589,19 @@ class RoleSpec(BaseModel):
     """Roles that must be ready before this one starts. Must not cycle."""
     cpu_only: bool = False
     """A router takes no GPU."""
+    resources: Optional[RoleResources] = None
+    """CPU and memory for a role that claims no accelerator — the router.
+
+    Role-own rather than an override, because there is no Model-level field to
+    inherit from: `ram_size` / `ram_ratio` feed the *VRAM* estimate, not a
+    container's memory request. Left as `None` the router still gets
+    `ROUTER_DEFAULT_CPU` / `ROUTER_DEFAULT_MEMORY`, so the field only exists
+    to move off that floor.
+
+    Refused on prefill and decode at admission: their footprint is what sizing
+    computes from the weights and the parallelism, and a second, hand-written
+    source for the same number is a way to disagree with it silently.
+    """
 
 
 class PDModeEnum(str, Enum):
@@ -646,6 +694,23 @@ class GatherSpec(BaseModel):
 
 class DisaggregationSpec(BaseModel):
     mode: PDModeEnum
+
+    vendor: Optional[str] = None
+    """Which accelerator vendor this group runs on, e.g. "nvidia".
+
+    Only needed in a cluster with more than one vendor partition that could
+    host the group. A PD group cannot span vendors -- the KV path differs
+    (HCCL/MemFabric vs UCX/RDMA verbs) -- so this is a *placement* constraint,
+    not a preference, and it doubles as the key the recipe is derived from.
+
+    None in a single-vendor cluster, where it is derived. Deliberately not
+    guessed in a mixed one: the platform picking "the partition with the most
+    cards" would override a user who wants the idle partition instead.
+
+    It lives here rather than on the model because the constraint exists
+    *because of* PD. If a non-PD workload ever needs the same thing, promote
+    it to a model-level `gpu_filters` -- the two shapes match.
+    """
 
     readiness: Literal["any_per_role", "all"] = "any_per_role"
     """Whether every role member has to be ready, or one per role is enough.
@@ -1047,7 +1112,7 @@ class RoleEffectiveModel(ModelBase):
 # The RoleSpec fields that describe the role itself rather than override a
 # Model field. Everything else is an override, derived rather than listed so
 # that adding one to RoleSpec cannot silently fail to be projected.
-_ROLE_OWN_FIELDS = frozenset({"name", "dependencies", "cpu_only"})
+_ROLE_OWN_FIELDS = frozenset({"name", "dependencies", "cpu_only", "resources"})
 
 _ROLE_OVERRIDE_FIELDS = frozenset(RoleSpec.model_fields) - _ROLE_OWN_FIELDS
 
@@ -1116,6 +1181,25 @@ def role_takes_no_accelerator(model, role_name: Optional[str]) -> bool:
     if role.name != RoleNameEnum.ROUTER.value:
         return False
     return not (role.image_name and role.run_command)
+
+
+def role_container_resources(model, role_name: Optional[str]) -> RoleResources:
+    """CPU and memory for a role that claims no accelerator.
+
+    Returns the declared values where given and the router floor otherwise, so
+    a caller never has to know whether the deployment said anything. Callers
+    that also handle accelerator-bearing roles must gate on
+    `role_takes_no_accelerator` first: this returns the floor for any role
+    name, and applying it to prefill would override what sizing computed.
+    """
+    role = find_role(model, role_name)
+    declared = role.resources if role else None
+    return RoleResources(
+        cpu=(declared.cpu if declared and declared.cpu else ROUTER_DEFAULT_CPU),
+        memory=(
+            declared.memory if declared and declared.memory else ROUTER_DEFAULT_MEMORY
+        ),
+    )
 
 
 def role_effective_model(model, role_name: Optional[str]):

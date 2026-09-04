@@ -25,7 +25,7 @@ reactions from an operator.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence
 
 from gpustack.config.config import Config
 from gpustack.policies.base import WorkerFilterChain
@@ -36,17 +36,34 @@ from gpustack.policies.worker_filters.cluster_filter import ClusterFilter
 from gpustack.policies.worker_filters.gpu_matching_filter import GPUMatchingFilter
 from gpustack.policies.worker_filters.label_matching_filter import LabelMatchingFilter
 from gpustack.policies.worker_filters.local_path_filter import LocalPathFilter
+from gpustack.policies.worker_filters.pd_mode_filter import PDModeRuntimeFilter
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
     role_effective_model,
+    role_container_resources,
     role_takes_no_accelerator,
 )
 from gpustack.schemas.workers import Worker
 from gpustack.scheduler.offer_slot import _PlacedStandIn, count_offer_slots
 
 logger = logging.getLogger(__name__)
+
+
+class _RoleProjection(NamedTuple):
+    """What `_eligible_for` worked out for a role, read back by two callers.
+
+    A NamedTuple rather than a bare tuple because the role-OWN fields read
+    before projection are a growing set — `cpu_only`, now `ram_claim` — and a
+    positional tuple couples every read site, plus every test that builds one,
+    to that count. `ram_claim` defaults so a caller that only cares about
+    placement need not spell it.
+    """
+
+    model: Model
+    cpu_only: bool
+    ram_claim: Optional[int] = None
 
 
 class GroupCapacity:
@@ -71,7 +88,7 @@ class GroupCapacity:
         self._model_instances = list(model_instances)
         # role -> {worker_id: worker}, after that role's filters.
         self._eligible: Dict[Optional[str], Dict[int, Worker]] = {}
-        self._projected: Dict[Optional[str], tuple] = {}
+        self._projected: Dict[Optional[str], "_RoleProjection"] = {}
         # (role, worker_id) -> one member's claim there, learned while counting.
         # See `_translate`.
         self._claims: Dict[tuple, tuple] = {}
@@ -93,7 +110,7 @@ class GroupCapacity:
         if not eligible:
             return {}
 
-        model, cpu_only = self._projected[role]
+        projected = self._projected[role]
         instances = self._model_instances + self._translate(already_placed)
         limit = self._limit_for(role)
 
@@ -107,8 +124,8 @@ class GroupCapacity:
                 out[worker_id] = 0
                 continue
             offer = await count_offer_slots(
-                make_selector=lambda instances_now, m=model, c=cpu_only: (
-                    self._selector(m, instances_now, c)
+                make_selector=lambda instances_now, p=projected: (
+                    self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
                 ),
                 worker=worker,
                 model_instances=instances,
@@ -184,13 +201,17 @@ class GroupCapacity:
             )
         return out
 
-    def _selector(self, model, instances, cpu_only):
+    def _selector(self, model, instances, cpu_only, ram_claim=None):
         # Imported here rather than at module scope: `scheduler` imports a wide
         # slice of the policy stack, and this module is imported by a route.
         from gpustack.scheduler.scheduler import build_candidate_selector
 
         return build_candidate_selector(
-            self._config, model, instances, cpu_only=cpu_only
+            self._config,
+            model,
+            instances,
+            cpu_only=cpu_only,
+            ram_claim=ram_claim,
         )
 
     def _limit_for(self, role: str) -> int:
@@ -211,8 +232,13 @@ class GroupCapacity:
         # Read before projecting: `cpu_only` is a role-OWN field and the
         # projection flattens the role's overrides onto the model.
         cpu_only = role_takes_no_accelerator(self._model, role)
+        # `resources` is role-OWN as well, and only the accelerator-free
+        # branch consumes it — same read-before-projection reason.
+        ram_claim = (
+            role_container_resources(self._model, role).memory if cpu_only else None
+        )
         model = role_effective_model(self._model, role)
-        self._projected[role] = (model, cpu_only)
+        self._projected[role] = _RoleProjection(model, cpu_only, ram_claim)
 
         chain = WorkerFilterChain(
             [
@@ -222,6 +248,7 @@ class GroupCapacity:
                 StatusFilter(model),
                 BackendFrameworkFilter(model),
                 LocalPathFilter(model),
+                PDModeRuntimeFilter(model),
             ]
         )
         try:
@@ -266,7 +293,7 @@ class GroupCapacity:
         standing in. Anything else hands out the same cards twice.
         """
         eligible = await self._eligible_for(role)
-        model, cpu_only = self._projected[role]
+        projected = self._projected[role]
         instances = self._model_instances + self._translate(already_placed)
 
         wanted: Dict[int, int] = {}
@@ -279,8 +306,8 @@ class GroupCapacity:
             if worker is None:
                 return []
             offer = await count_offer_slots(
-                make_selector=lambda instances_now, m=model, c=cpu_only: (
-                    self._selector(m, instances_now, c)
+                make_selector=lambda instances_now, p=projected: (
+                    self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
                 ),
                 worker=worker,
                 model_instances=instances,

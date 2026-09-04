@@ -41,6 +41,7 @@ from gpustack.policies.worker_filters.backend_framework_filter import (
 from gpustack.policies.worker_filters.label_matching_filter import LabelMatchingFilter
 from gpustack.policies.worker_filters.gpu_matching_filter import GPUMatchingFilter
 from gpustack.policies.worker_filters.local_path_filter import LocalPathFilter
+from gpustack.policies.worker_filters.pd_mode_filter import PDModeRuntimeFilter
 from gpustack.policies.worker_filters.cluster_filter import ClusterFilter
 from gpustack.scheduler.model_registry import detect_model_type
 from gpustack.scheduler.meta_registry import get_model_meta
@@ -62,6 +63,7 @@ from gpustack.schemas.models import (
     SourceEnum,
     is_omni_model,
     role_effective_model,
+    role_container_resources,
     role_takes_no_accelerator,
 )
 from gpustack.schemas.model_files import ModelFileStateEnum
@@ -571,6 +573,7 @@ def build_candidate_selector(
     model: Model,
     model_instances: List[ModelInstance],
     cpu_only: bool = False,
+    ram_claim: Optional[int] = None,
 ):
     """Which resource-fit selector answers "does one more member fit here".
 
@@ -585,6 +588,11 @@ def build_candidate_selector(
     `model` is expected to be role-projected already (`role_effective_model`):
     every branch here reads Model-level fields and none of them knows about
     roles.
+
+    `ram_claim` is the accelerator-free role's declared memory, resolved by the
+    caller before projection because `resources` is a role-OWN field. Only the
+    `cpu_only` branch reads it — every other selector derives RAM from the
+    weights it just sized.
     """
     if cpu_only:
         # Ahead of every backend branch, because the backend a router inherits
@@ -593,7 +601,7 @@ def build_candidate_selector(
         # is what leaves it unschedulable on a host whose cards its own peers
         # have just filled.
         return CustomBackendResourceFitSelector(
-            config, model, model_instances, cpu_only=True
+            config, model, model_instances, cpu_only=True, ram_claim=ram_claim
         )
     if model.gpu_type_selector:
         # Whole cards and slices are two different questions on the same field.
@@ -646,6 +654,9 @@ async def find_candidate(
     # pushed up to the Model level — "this member takes no accelerator" is true
     # of one role, and a Model-level flag would say it of all of them.
     cpu_only = role_takes_no_accelerator(model, role)
+    # Same reason, same moment: `resources` is role-OWN too, and only the
+    # accelerator-free branch consumes it.
+    ram_claim = role_container_resources(model, role).memory if cpu_only else None
 
     # Apply the role's overrides once, here. Every filter, selector and scorer
     # below is constructed from `model` and reads Model-level fields directly;
@@ -660,6 +671,7 @@ async def find_candidate(
         StatusFilter(model),
         BackendFrameworkFilter(model),
         LocalPathFilter(model),
+        PDModeRuntimeFilter(model),
     ]
 
     worker_filter_chain = WorkerFilterChain(filters)
@@ -673,7 +685,7 @@ async def find_candidate(
     # Initialize candidate selector.
     try:
         candidates_selector = build_candidate_selector(
-            config, model, model_instances, cpu_only=cpu_only
+            config, model, model_instances, cpu_only=cpu_only, ram_claim=ram_claim
         )
     except Exception as e:
         return None, [f"Failed to initialize {model.backend} candidates selector: {e}"]

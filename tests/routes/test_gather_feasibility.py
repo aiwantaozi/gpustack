@@ -94,23 +94,37 @@ def _pd_spec(prefill=2, decode=2, router=True):
 
 @pytest.mark.asyncio
 async def test_tiers_are_leaf_first():
-    """The tightest choice is the one that exists whatever the cluster
-    declared, and the one most deployments want, so it leads."""
-    result, _ = await _feasibility(
-        _pd_spec(),
-        topology=ClusterTopology.model_validate(
-            {"layers": [{"name": "Rack", "labelKeys": [RACK]}]}
-        ),
-    )
-    assert [t.layer for t in result.tiers] == [NODE_LAYER, "Rack"]
+    """Host first, then the rack the worker's label put into the tree. The
+    tightest choice is the one that exists unconditionally."""
+    result, _ = await _feasibility(_pd_spec())
+
+    assert [t.layer for t in result.tiers] == [NODE_LAYER, "rack"]
+    assert [t.name for t in result.tiers] == ["Host", "Rack"]
 
 
 @pytest.mark.asyncio
-async def test_a_cluster_with_no_layers_still_offers_the_tightest_tier():
-    """The leaf is built in, so "at least on the same host" is never absent —
-    which is the tier the design calls the most useful one."""
-    result, _ = await _feasibility(_pd_spec())
+async def test_a_cluster_with_no_values_still_offers_the_tightest_tier():
+    result, _ = await _feasibility(_pd_spec(), workers=[_worker(1, "w1")])
     assert [t.layer for t in result.tiers] == [NODE_LAYER]
+
+
+@pytest.mark.asyncio
+async def test_a_discovered_domain_is_a_tier_right_after_the_host():
+    """Between the host and the tree: inside the domain the transfer runs over
+    the accelerator fabric, faster than any switch hop whatever the domain's
+    physical extent."""
+    workers = [
+        SimpleNamespace(
+            id=1,
+            name="w1",
+            labels={RACK: "rack-a"},
+            status=SimpleNamespace(topology_facts={"nvidia.com/gpu.clique": "u.1"}),
+        ),
+    ]
+    result, calls = await _feasibility(_pd_spec(), workers=workers)
+
+    assert [t.layer for t in result.tiers] == [NODE_LAYER, "accelerator_domain", "rack"]
+    assert [c.layer for c in calls[:-1]] == [NODE_LAYER, "accelerator_domain", "rack"]
 
 
 @pytest.mark.asyncio
@@ -258,18 +272,12 @@ async def test_a_spec_that_cannot_be_a_model_is_a_400():
 
 @pytest.mark.asyncio
 async def test_a_declaration_that_cannot_become_a_tree_is_a_400():
+    bad = SimpleNamespace(
+        layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
+        accelerator_domain=None,
+    )
     with pytest.raises(BadRequestException):
-        await _feasibility(
-            _pd_spec(),
-            topology=ClusterTopology.model_validate(
-                {
-                    "layers": [
-                        {"name": "Rack", "labelKeys": [RACK]},
-                        {"name": "Zone", "labelKeys": ["z"]},
-                    ]
-                }
-            ),
-        )
+        await _feasibility(_pd_spec(), topology=bad)
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +336,11 @@ def test_widening_reads_the_annotation_rather_than_naming_the_field():
     assert not _declares_a_list(str)
     assert not _declares_a_list(Optional[int])
 
-    # A scalar field keeps its scalar, a list keeps its list, None stays None,
-    # and a key the Model does not have is left for the caller's own filter.
+    # A scalar field keeps its scalar, a list keeps its list, a null list
+    # becomes empty, and a key the Model does not have is left for the
+    # caller's own filter.
     assert _widen_single_selects({"replicas": 2}) == {"replicas": 2}
     assert _widen_single_selects({"categories": ["llm"]}) == {"categories": ["llm"]}
-    assert _widen_single_selects({"categories": None}) == {"categories": None}
+    # A cleared multi-select posts null; the projection needs a list.
+    assert _widen_single_selects({"categories": None}) == {"categories": []}
     assert _widen_single_selects({"scheduleType": "auto"}) == {"scheduleType": "auto"}

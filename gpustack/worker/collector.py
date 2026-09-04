@@ -16,7 +16,11 @@ from gpustack.schemas.workers import (
     SystemInfo,
 )
 from gpustack.utils.profiling import time_decorator
-
+from gpustack.worker.topology_facts import (
+    HostSwitchProbe,
+    facts_from_devices,
+    merge_facts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,11 @@ class WorkerStatusCollector:
             )
         else:
             self._detector_factory = DetectorFactory()
+        # Listens for the switches behind the host's RDMA ports, on its own
+        # thread: one listen is a whole LLDP interval and cannot sit on the
+        # status-report path.
+        self._switch_probe = HostSwitchProbe()
+        self._switch_probe.start()
 
     """A class for collecting worker status information."""
 
@@ -99,6 +108,7 @@ class WorkerStatusCollector:
                 logger.error(f"Failed to detect GPU devices: {e}")
         self._inject_unified_memory(status)
         self._inject_computed_filesystem_usage(status)
+        self._inject_topology_facts(status)
 
         # If disable_worker_metrics is set, set metrics_port to -1
         metrics_port = self._cfg.worker_metrics_port
@@ -118,6 +128,19 @@ class WorkerStatusCollector:
             worker_uuid=self._worker_uuid_getter(),
             proxy_mode=self._cfg.proxy_mode,
         )
+
+    def _inject_topology_facts(self, status: WorkerStatus):
+        """Where this worker is, as its devices and ports report it.
+
+        Device-side facts (a card's own domain and RDMA port) win over the
+        host's NICs. Left as None when nothing is known, so a worker on an
+        older runtime looks exactly as it did before.
+        """
+        facts = merge_facts(
+            facts_from_devices(status.gpu_devices or []),
+            self._switch_probe.facts,
+        )
+        status.topology_facts = facts or None
 
     def _inject_unified_memory(self, status: WorkerStatus):
         is_unified_memory = False

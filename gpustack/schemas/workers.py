@@ -163,6 +163,17 @@ class GPUDeviceStatus(GPUDeviceInfo):
     """
     Network information of the GPU device, mainly for Ascend devices.
     """
+    topology_hints: Optional[Dict[str, str]] = Field(
+        sa_column=Column(JSON), default=None
+    )
+    """
+    Where this device sits beyond the host, as the device itself reports it:
+    the NVLink/HCCS domain it belongs to and the switch its RDMA port is cabled
+    to. Keyed by topology label key (`nvidia.com/gpu.clique`,
+    `topology.gpustack.ai/accelerator-domain`, `topology.gpustack.ai/switch`...).
+    Per device; the worker-level `WorkerStatus.topology_facts` is derived from
+    these and is what the scheduler reads.
+    """
 
 
 GPUDevicesStatus = List[GPUDeviceStatus]
@@ -282,6 +293,14 @@ class WorkerStatus(SystemInfo):
     rpc_servers: Optional[Dict[int, RPCServer]] = Field(
         sa_column=Column(JSON), default=None
     )
+    topology_facts: Optional[Dict[str, str]] = Field(
+        sa_column=Column(JSON), default=None
+    )
+    """
+    The worker's discovered position, keyed by topology label key: its
+    accelerator domain and the access switch its ports hang off. Read under
+    `Worker.labels`, so a hand-filled label always wins over a discovered fact.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 

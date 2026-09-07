@@ -3292,6 +3292,13 @@ async def calculate_model_destinations(
         and instance.worker_ip != ""
         and instance.state == ModelInstanceStateEnum.RUNNING
     ]
+    # Same narrowing as the registry side in `_ensure_model_mcp_bridge`. The
+    # registry decides which addresses *exist* as upstreams; this annotation
+    # decides how traffic is *split* across them, and a weight naming a member
+    # the registry never registered is what Envoy hangs on. Measured: a 1P1D
+    # group got `34% router / 33% prefill / 33% decode`, the router answered
+    # correctly and the other two thirds of requests never returned.
+    instances = _gateway_registrable_instances(model, instances)
     worker_list = await Worker.all_by_fields(
         session=session,
         fields={

@@ -241,6 +241,11 @@ class ModelInstanceSnapshot(ModelInstanceRuntimeInfo):
     id: int
     name: str
     resolved_path: Optional[str] = None
+    # Which role of its model this member served. None for a plain deployment,
+    # and the only thing that tells a group's members apart once the run is
+    # over: a report that lists three machines cannot otherwise say which one
+    # was the router the load was sent to and which held the cards.
+    role: Optional[str] = None
 
     # resource info
     state: Optional[str] = None

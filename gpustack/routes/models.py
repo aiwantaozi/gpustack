@@ -100,6 +100,7 @@ from gpustack.routes.model_common import (
 )
 from gpustack.config.config import get_global_config
 from gpustack.server.pd_metrics import PDMetricsPublic, collect_pd_metrics
+from gpustack.schemas.pd_modes import PDTensorParallelPairingEnum
 from gpustack.server.pd_mode_catalog import get_pd_mode
 from gpustack.server.pd_mode_resolver import resolve_pd_mode
 from gpustack.server.cluster_accelerators import cluster_vendors
@@ -829,6 +830,47 @@ def _role_parameters(role: RoleSpec, model_parameters) -> List[str]:
     return list(role.backend_parameters)
 
 
+def _check_tensor_parallel_pairing(disaggregation, *, prefill_tp, decode_tp) -> None:
+    """Apply the recipe's declared tensor-parallel direction.
+
+    The direction belongs to the KV connector, so it is read off the mode
+    (`PDMode.pairing.tensor_parallel`) rather than written here: NIXL needs
+    decode at least as wide as prefill, vllm-ascend's Mooncake needs the
+    opposite (Huawei's reference deployment is prefill TP4 / decode TP1), and
+    `custom` injects no connector GPUStack knows. A mode the catalog cannot
+    resolve is held to the NIXL rule, which is what every mode was held to
+    before the rule became declarable.
+    """
+    mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
+    mode = get_pd_mode(mode_name)
+    rule = (
+        mode.pairing.tensor_parallel
+        if mode is not None
+        else PDTensorParallelPairingEnum.DECODE_GE_PREFILL
+    )
+
+    if rule == PDTensorParallelPairingEnum.DECODE_GE_PREFILL and decode_tp < prefill_tp:
+        raise BadRequestException(
+            message=(
+                f"decode runs tensor parallelism {decode_tp}, below prefill's "
+                f"{prefill_tp}. A decode narrower than its prefill cannot "
+                f"receive that prefill's KV layout, and the engine reports it "
+                f"as an IndexError inside decode rather than as a "
+                f"configuration error. decode's tensor parallelism must be at "
+                f"least prefill's."
+            )
+        )
+    if rule == PDTensorParallelPairingEnum.PREFILL_GE_DECODE and prefill_tp < decode_tp:
+        raise BadRequestException(
+            message=(
+                f"prefill runs tensor parallelism {prefill_tp}, below decode's "
+                f"{decode_tp}. pd mode '{mode_name}' gathers each decode rank's "
+                f"KV from prefill ranks, which needs prefill's tensor "
+                f"parallelism to be at least decode's."
+            )
+        )
+
+
 def validate_role_pairing(  # noqa: C901
     model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
     stored: Optional[Model] = None,
@@ -897,16 +939,9 @@ def validate_role_pairing(  # noqa: C901
 
     prefill_tp = find_int_parameter(prefill_params, _PAIRING_TP)
     decode_tp = find_int_parameter(decode_params, _PAIRING_TP)
-    if prefill_tp is not None and decode_tp is not None and decode_tp < prefill_tp:
-        raise BadRequestException(
-            message=(
-                f"decode runs tensor parallelism {decode_tp}, below prefill's "
-                f"{prefill_tp}. A decode narrower than its prefill cannot "
-                f"receive that prefill's KV layout, and the engine reports it "
-                f"as an IndexError inside decode rather than as a "
-                f"configuration error. decode's tensor parallelism must be at "
-                f"least prefill's."
-            )
+    if prefill_tp is not None and decode_tp is not None:
+        _check_tensor_parallel_pairing(
+            field("disaggregation"), prefill_tp=prefill_tp, decode_tp=decode_tp
         )
 
     if _hybrid_cache_manager_enabled(prefill_params) != _hybrid_cache_manager_enabled(

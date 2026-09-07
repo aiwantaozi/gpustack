@@ -873,6 +873,14 @@ modes:
     gpu_filters:
       vendor: ascend
     kv_lease: mooncake
+    pairing:
+      # The opposite of NIXL's rule. This connector carries both roles'
+      # tp/dp in its config so a decode rank can gather its KV from several
+      # prefill ranks; Huawei's reference deployment (910C, 3P1D) is prefill
+      # TP4 / decode TP1, which the NIXL default rejected outright. A decode
+      # wider than its prefill has not been measured on this connector, so
+      # the rule stays one-directional rather than `any` until it is.
+      tensor_parallel: prefill_ge_decode
     roles:
       prefill:
         ports:
@@ -1163,3 +1171,7 @@ modes:
     router:
       protocol: user_provided
     kv_lease: null
+    # No connector GPUStack knows, so no tensor-parallel direction it can
+    # vouch for either way; the user's engine is the judge.
+    pairing:
+      tensor_parallel: any

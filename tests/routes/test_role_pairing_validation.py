@@ -10,7 +10,10 @@ they are why this validation exists at all:
   only a prompt above decode's window fails — at decode, after prefill has
   already computed it. The user believes the deployment serves 8192.
 * a decode narrower than its prefill is asserted at run time, but surfaces as
-  an `IndexError` inside decode rather than as a configuration error.
+  an `IndexError` inside decode rather than as a configuration error. That is
+  NIXL's rule; the direction belongs to the connector and is read off the
+  recipe (`PDMode.pairing`), because vllm-ascend's Mooncake wants the
+  opposite and `custom` injects no connector at all.
 """
 
 from contextlib import contextmanager
@@ -38,7 +41,12 @@ def rejects(fragment):
     assert fragment in excinfo.value.message, excinfo.value.message
 
 
-def _model_in(roles=None, disaggregation=True, backend_parameters=None):
+def _model_in(
+    roles=None,
+    disaggregation=True,
+    backend_parameters=None,
+    mode=PDModeEnum.VLLM_NIXL,
+):
     return ModelCreate(
         name="m",
         source=SourceEnum.HUGGING_FACE,
@@ -46,9 +54,7 @@ def _model_in(roles=None, disaggregation=True, backend_parameters=None):
         backend="vLLM",
         backend_parameters=backend_parameters,
         roles=roles,
-        disaggregation=(
-            DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL) if disaggregation else None
-        ),
+        disaggregation=(DisaggregationSpec(mode=mode) if disaggregation else None),
     )
 
 
@@ -137,6 +143,59 @@ def test_a_wider_decode_is_allowed():
             )
         )
     )
+
+
+def test_the_direction_is_the_connectors_not_pds():
+    """vllm-ascend's Mooncake gathers a decode rank's KV from several prefill
+    ranks; Huawei's reference deployment is prefill TP4 / decode TP1 — the
+    exact shape NIXL's rule forbids. Holding every recipe to NIXL's rule
+    rejected a working deployment, so the recipe declares its own."""
+    validate_role_pairing(
+        _model_in(
+            _roles(
+                prefill_params=["--tensor-parallel-size=4"],
+                decode_params=["--tensor-parallel-size=1"],
+            ),
+            mode=PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        )
+    )
+
+
+def test_the_ascend_recipe_is_held_to_its_own_direction():
+    with rejects("prefill runs tensor parallelism 1, below decode's 4"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--tensor-parallel-size=1"],
+                    decode_params=["--tensor-parallel-size=4"],
+                ),
+                mode=PDModeEnum.VLLM_ASCEND_MOONCAKE,
+            )
+        )
+
+
+def test_custom_injects_no_connector_so_no_direction_is_enforced():
+    """The user's engine is the judge: GPUStack knows nothing about the
+    connector they wrote into `--kv-transfer-config`."""
+    for prefill, decode in (("8", "4"), ("4", "8")):
+        validate_role_pairing(
+            _model_in(
+                _roles(prefill_params=["-tp", prefill], decode_params=["-tp", decode]),
+                mode=PDModeEnum.CUSTOM,
+            )
+        )
+
+
+def test_an_unresolvable_mode_falls_back_to_the_nixl_rule(monkeypatch):
+    """What every recipe was held to before the direction became declarable,
+    so a catalog that cannot answer changes nothing."""
+    from gpustack.routes import models as routes_models
+
+    monkeypatch.setattr(routes_models, "get_pd_mode", lambda name: None)
+    with rejects("decode runs tensor parallelism 4, below prefill's 8"):
+        validate_role_pairing(
+            _model_in(_roles(prefill_params=["-tp", "8"], decode_params=["-tp", "4"]))
+        )
 
 
 # --- factors the engine also checks, caught here for attribution ----------- #

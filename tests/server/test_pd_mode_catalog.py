@@ -11,6 +11,7 @@ from gpustack.schemas.pd_modes import (
     PDPortScopeEnum,
     PDRouter,
     PDRouterProtocolEnum,
+    PDTensorParallelPairingEnum,
 )
 from gpustack.server.pd_mode_catalog import (
     PDModeCatalogError,
@@ -208,6 +209,24 @@ def test_constraining_custom_fails_the_load():
     with pytest.raises(PDModeCatalogError) as excinfo:
         parse_pd_mode_catalog(document)
     assert "custom" in str(excinfo.value)
+
+
+def test_tensor_parallel_direction_is_the_connectors_to_declare():
+    """One rule for every recipe rejected a working Ascend deployment:
+    Huawei's reference (910C, 3P1D) is prefill TP4 / decode TP1, which NIXL's
+    "decode at least prefill" forbids. So the direction is a recipe
+    declaration. The default stays NIXL's — what every recipe was held to
+    before the field existed — and `custom`, which injects no connector, has
+    no direction to vouch for."""
+    nixl = get_pd_mode(PDModeEnum.VLLM_NIXL.value)
+    ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+    custom = get_pd_mode(PDModeEnum.CUSTOM.value)
+    assert nixl.pairing.tensor_parallel is PDTensorParallelPairingEnum.DECODE_GE_PREFILL
+    assert (
+        ascend.pairing.tensor_parallel
+        is not PDTensorParallelPairingEnum.DECODE_GE_PREFILL
+    )
+    assert custom.pairing.tensor_parallel is PDTensorParallelPairingEnum.ANY
 
 
 def test_exactly_one_recipe_is_preferred_per_engine_accelerator_pair():

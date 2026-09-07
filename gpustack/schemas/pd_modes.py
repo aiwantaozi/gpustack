@@ -697,6 +697,44 @@ class PDRouter(BaseModel):
         return [port.name for port in self.ports]
 
 
+class PDTensorParallelPairingEnum(str, Enum):
+    """Which way a prefill/decode tensor-parallel mismatch is allowed to go.
+
+    The direction is the connector's, not PD's. vLLM's NixlConnector maps
+    each decode rank onto a slice of one prefill rank and asserts "Decode TP
+    cannot be smaller than prefill TP" (measured: it surfaces as an
+    IndexError inside decode). vllm-ascend's Mooncake connector carries both
+    sides' tp/dp in its config precisely so a decode rank can gather from
+    several prefill ranks — Huawei's reference deployment is prefill TP4 /
+    decode TP1, the exact shape the NIXL rule forbids. One rule for every
+    recipe therefore rejects a working Ascend deployment, so the rule is
+    declared per recipe.
+    """
+
+    DECODE_GE_PREFILL = "decode_ge_prefill"
+    """decode's tensor parallelism must be at least prefill's (NIXL)."""
+    PREFILL_GE_DECODE = "prefill_ge_decode"
+    """prefill's tensor parallelism must be at least decode's."""
+    ANY = "any"
+    """No constraint GPUStack knows of; the engine is the judge."""
+
+
+class PDPairing(BaseModel):
+    """Cross-role constraints the recipe's connector imposes.
+
+    Only the ones that differ between connectors live here. Factors every
+    connector hashes on contact (dtype, block size, KV layout) and the one
+    nothing checks (`max_model_len`) are the same for all recipes and stay in
+    the validation code.
+    """
+
+    tensor_parallel: PDTensorParallelPairingEnum = (
+        PDTensorParallelPairingEnum.DECODE_GE_PREFILL
+    )
+    """Default is the NIXL rule because that is what every recipe was held to
+    before this field existed; a recipe whose connector differs declares so."""
+
+
 class PDMode(BaseModel):
     """One disaggregation recipe: engine, KV connector and router.
 
@@ -779,6 +817,10 @@ class PDMode(BaseModel):
     what decides both the lease window and the counters. None means the
     mode has no connector GPUStack knows (``custom``), so PD effectiveness
     is not measurable for it."""
+
+    pairing: PDPairing = PDPairing()
+    """Connector-specific cross-role constraints, read by admission. Absent
+    means the NIXL defaults — see ``PDPairing``."""
 
     def role(self, name: str) -> Optional[PDModeRole]:
         return self.roles.get(name)

@@ -2138,3 +2138,52 @@ class TestTheProbesCapIsNotTheUsersRange:
         }
         codes = [w["code"] for w in self._validity(ramp)["warnings"]]
         assert codes == ["not_saturated"]
+
+
+class TestAnUnreadablePointSaysWhy:
+    """ "2 result file(s) were unreadable" is not a diagnosis.
+
+    A truncated write, a schema the installed guidellm does not know, and a run
+    that died mid-point all reduce to that one sentence, and they are fixed
+    differently. The message referred the reader to the worker log, which is the
+    hardest artifact to reach from a browser — the log page next to it shows the
+    CONTAINER's output, not the agent's. So the first file's actual error
+    travels with the count.
+    """
+
+    def _collected(self, tmp_path, contents: dict):
+        for name, body in contents.items():
+            (tmp_path / name).write_text(body)
+        mgr = _bare_manager(tmp_path)
+        benchmark = SimpleNamespace(
+            id=7, name="bm", dataset_input_tokens=128, stages=None
+        )
+        return mgr._aggregate_points(
+            benchmark, [str(tmp_path / name) for name in contents]
+        )
+
+    def test_the_first_failure_is_carried(self, tmp_path):
+        collected = self._collected(
+            tmp_path, {"7__p0.json": "", "7__p1.json": "{not json"}
+        )
+        assert collected.skipped == 2
+        assert collected.loaded == 0
+        # Named by file, because which point died is half the answer.
+        assert "7__p0.json" in collected.skipped_reason
+
+    def test_the_first_one_wins_not_the_last(self, tmp_path):
+        # Files are read in point order, so the earliest failure is the one that
+        # explains the run; a later point usually fails as a consequence.
+        collected = self._collected(
+            tmp_path, {"7__p0.json": "", "7__p1.json": "{not json"}
+        )
+        assert "7__p1.json" not in collected.skipped_reason
+
+    def test_a_clean_read_carries_no_reason(self, tmp_path):
+        mgr = _bare_manager(tmp_path)
+        benchmark = SimpleNamespace(
+            id=7, name="bm", dataset_input_tokens=128, stages=None
+        )
+        collected = mgr._aggregate_points(benchmark, [])
+        assert collected.skipped == 0
+        assert collected.skipped_reason is None

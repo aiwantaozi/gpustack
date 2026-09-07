@@ -84,6 +84,12 @@ class CollectedResults(NamedTuple):
     report: Optional[GenerativeBenchmarksReport]
     loaded: int
     skipped: int
+    # Why the first skipped file was skipped. The count alone sends the reader
+    # to the worker log for the one fact that decides what to do next, and the
+    # worker log is the hardest thing to reach from a browser — the run's own
+    # log page shows the CONTAINER's output, not the agent's. Carried so the
+    # row can say it.
+    skipped_reason: Optional[str] = None
 
 
 class BenchmarkManager:
@@ -727,6 +733,7 @@ class BenchmarkManager:
         worst_errs = -1
         loaded = 0
         skipped = 0
+        skipped_reason = None
 
         for path in paths:
             try:
@@ -741,6 +748,12 @@ class BenchmarkManager:
                 m = rep.to_metrics()
             except Exception as e:
                 skipped += 1
+                # The FIRST reason, not the last: the files are read in point
+                # order, so the earliest failure is the one that explains the
+                # run. A later point failing differently is usually a
+                # consequence of it.
+                if skipped_reason is None:
+                    skipped_reason = f"{os.path.basename(path)}: {e}"
                 logger.warning(
                     f"Skipping result file {path} of benchmark "
                     f"{benchmark.name}(id={benchmark.id}); unavailable: {e}"
@@ -762,7 +775,7 @@ class BenchmarkManager:
                 report = rep
                 worst_errs = errs
 
-        return CollectedResults(results, best, report, loaded, skipped)
+        return CollectedResults(results, best, report, loaded, skipped, skipped_reason)
 
     def _collect_results(self, benchmark) -> "CollectedResults":
         """Load this benchmark's result files into one aggregated curve.
@@ -864,8 +877,19 @@ class BenchmarkManager:
                 f"No metrics found for benchmark {benchmark.name}(id={benchmark.id})."
             )
             if collected.skipped:
+                # Carrying the first file's actual error, because the count on
+                # its own answers nothing: "unreadable" is a truncated write, a
+                # schema the installed guidellm does not know, and a run that
+                # died mid-point all at once, and they are fixed differently.
+                # "See worker logs" is a poor referral here — the log page next
+                # to this message shows the container's output, not the agent's.
                 raise RuntimeError(
                     f"all {collected.skipped} result file(s) were unreadable"
+                    + (
+                        f" ({collected.skipped_reason})"
+                        if collected.skipped_reason
+                        else ""
+                    )
                 )
             raise RuntimeError("the run produced no result file")
 
@@ -879,7 +903,9 @@ class BenchmarkManager:
             lost_points_message = (
                 f"{collected.skipped} of {collected.loaded + collected.skipped} "
                 "measured point(s) could not be read and are missing from the "
-                "results. See worker logs for details."
+                "results"
+                + (f": {collected.skipped_reason}" if collected.skipped_reason else "")
+                + ". See worker logs for the rest."
             )
             logger.error(
                 f"Benchmark {benchmark.name}(id={benchmark.id}) finished with "

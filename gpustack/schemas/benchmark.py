@@ -370,8 +370,15 @@ class BenchmarkBase(SQLModel):
     # of the configuration a clone or an export has to carry, and two runs of
     # one model in different modes are not comparable, so the report has to be
     # able to say which one it was.
+    # Stored as a plain string for the same reason as `load_type` below: the
+    # default enum column keys on member NAMES (`INSTANCE`), while the
+    # migration backfills, the API accepts and the UI sends the VALUE
+    # (`instance`). Measured consequence of the mismatch: every read of a
+    # pre-existing row raised `'instance' is not among the defined enum
+    # values`, which killed the benchmark watch stream and left the worker
+    # re-subscribing every five seconds.
     target_mode: BenchmarkTargetModeEnum = Field(
-        default=BenchmarkTargetModeEnum.INSTANCE
+        default=BenchmarkTargetModeEnum.INSTANCE, sa_type=AutoString
     )
     model_id: Optional[int] = Field(default=None)
     model_name: Optional[str] = Field(

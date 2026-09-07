@@ -74,6 +74,36 @@ def resolve_progress_insecure_tls() -> bool:
     return bool(get_gpustack_env_bool("INSECURE_TLS"))
 
 
+def _local_model_snapshot(
+    benchmark, endpoint_snapshot: ModelInstanceSnapshot
+) -> ModelInstanceSnapshot:
+    """The snapshot member whose weights are on the worker running this.
+
+    `--processor` is a path, and the path only exists where a member downloaded
+    the model. The endpoint answers that for every model with one member; for a
+    group it does not, because the endpoint is the router. The server picks the
+    placement worker, so the member to read is the one the snapshot puts there.
+
+    Falls back to the endpoint rather than raising: a caller with a
+    single-member snapshot must keep working unchanged, including one written
+    before the snapshot carried the whole group.
+    """
+    if endpoint_snapshot.resolved_path and (
+        benchmark.worker_id is None
+        or endpoint_snapshot.worker_id == benchmark.worker_id
+    ):
+        return endpoint_snapshot
+
+    members = list((benchmark.snapshot.instances or {}).values())
+    local = [
+        m for m in members if m.resolved_path and m.worker_id == benchmark.worker_id
+    ]
+    if local:
+        # Stable across members that all hold the same weights.
+        return sorted(local, key=lambda m: m.name)[0]
+    return endpoint_snapshot
+
+
 class BenchmarkRunner:
     _clientset: ClientSet
     _config: Config
@@ -120,10 +150,6 @@ class BenchmarkRunner:
             instance_snapshot: ModelInstanceSnapshot = benchmark.snapshot.instances.get(
                 benchmark.model_instance_name
             )
-            if instance_snapshot.resolved_path is None:
-                raise ValueError(
-                    f"Benchmark {benchmark.name}(id={benchmark.id}) snapshot for model instance {benchmark.model_instance_name} has no resolved path"
-                )
 
             if instance_snapshot.worker_ip is None:
                 raise ValueError(
@@ -135,8 +161,20 @@ class BenchmarkRunner:
                     f"Benchmark {benchmark.name}(id={benchmark.id}) snapshot for model instance {benchmark.model_instance_name} has no ports"
                 )
 
+            # The tokenizer comes from the member that lives HERE, which is not
+            # the member the load is sent to when the target is a group: the
+            # endpoint is the router and `--processor` is a host path, so the
+            # weights are on the worker the server placed this run on. The two
+            # coincide for every non-PD model, where the snapshot holds exactly
+            # one member and this picks it.
+            local_snapshot = _local_model_snapshot(benchmark, instance_snapshot)
+            if local_snapshot.resolved_path is None:
+                raise ValueError(
+                    f"Benchmark {benchmark.name}(id={benchmark.id}) has no snapshot member with a resolved model path on worker {benchmark.worker_id}; the tokenizer is read from disk, so the run has to sit on a worker that holds the weights"
+                )
+
             self._benchmark_dir = self._config.benchmark_dir
-            self._model_path = instance_snapshot.resolved_path
+            self._model_path = local_snapshot.resolved_path
             self._model_endpoint = f"http://{instance_snapshot.worker_ip}:{instance_snapshot.ports[0] if instance_snapshot.ports else ''}"
             self._model_backend_parameters = instance_snapshot.backend_parameters
 
@@ -416,6 +454,18 @@ class BenchmarkRunner:
             "run",
             "--target",
             self._model_endpoint,
+            # Named, never discovered. Without it guidellm asks the target for
+            # `GET /v1/models` and takes the first entry, which fails two ways:
+            # a PD router does not necessarily answer that route in the shape
+            # guidellm reads (measured against a live 1P1D: `KeyError: 'data'`
+            # before a single request was sent), and an engine serving LoRA
+            # adapters answers with several names of which the first is not
+            # necessarily the one to measure. The name is the one the engine
+            # was started with (`--served-model-name`), so it is also the name
+            # the router forwards. A row without one (nothing the server
+            # creates today) falls back to discovery rather than sending the
+            # string "None" as a model id.
+            *(["--model", b.model_name] if b.model_name else []),
             *profile_args,
             "--sample-requests",
             "0",

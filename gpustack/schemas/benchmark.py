@@ -464,6 +464,10 @@ class BenchmarkSnapshot(BaseModel):
     instances: Optional[ModelInstanceSnapshots] = None
     workers: Optional[WorkerSnapshots] = None
     gpus: Optional[GPUSnapshots] = None
+    # The deployment generation the run measured, for a model that carries one.
+    # Not a scalar column: nothing queries or sorts by it, it is read with the
+    # rest of the snapshot when a reader asks what a report was measuring.
+    spec_digest: Optional[str] = None
 
 
 class BenchmarkMetricsLite(SQLModel):
@@ -742,7 +746,13 @@ class BenchmarkListParams(ListParams):
 
 
 class BenchmarkCreate(BenchmarkBase):
-    pass
+    # A run targets a MODEL. Naming a member is still accepted — the instance
+    # list page's "run benchmark" action does exactly that, and a client that
+    # names one is naming its model too — but it is no longer required, and
+    # under PD it is not a choice a client can make correctly: a group answers
+    # only through its router. The server resolves the endpoint and writes the
+    # name it resolved, so the column stays as non-null as it ever was.
+    model_instance_name: Optional[str] = None
 
 
 class BenchmarkUpdate(SQLModel):

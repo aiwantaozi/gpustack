@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from fastapi.responses import RedirectResponse, StreamingResponse
-from urllib.parse import urlencode
 from gpustack_runtime.detector import ManufacturerEnum
 from sqlalchemy.orm import selectinload
 from sqlmodel import or_
@@ -105,7 +104,7 @@ from gpustack.server.pd_mode_catalog import get_pd_mode
 from gpustack.server.pd_mode_resolver import resolve_pd_mode
 from gpustack.server.cluster_accelerators import cluster_vendors
 from gpustack.server.prometheus_query import parse_window
-from gpustack.utils.grafana import resolve_grafana_base_url
+from gpustack.utils.grafana import build_model_dashboard_url, resolve_grafana_base_url
 from gpustack.utils.lora_model_source import lora_route_name_for
 
 router = APIRouter()
@@ -300,63 +299,26 @@ async def get_model_dashboard(
 
     cfg = get_global_config()
 
-    # 🔴 A disaggregated group goes to the PD dashboard, not the model one.
-    #
-    # Decided here rather than in the caller because the caller has a model id
-    # and this has the model: whether a deployment is a group, which connector
-    # it runs, and therefore which role owns its transfer counters are all
-    # server-side facts, and the last one is not even on the model — it comes
-    # from the mode catalog.
-    #
-    # The model dashboard is not merely less specific for these, it is wrong in
-    # one place: every request traverses both roles, so its request counters
-    # double under PD. Sending a group there hands the user a number that is
-    # 2x reality with nothing saying so.
-    pd = bool(model.disaggregation)
-    uid = cfg.grafana_pd_dashboard_uid if pd else cfg.grafana_model_dashboard_uid
-    if not cfg.get_grafana_url() or not uid:
-        raise InternalServerErrorException(
-            message="Grafana dashboard settings are not configured"
-        )
-
     cluster = None
     if model.cluster_id is not None:
         cluster = await Cluster.one_by_id(session, model.cluster_id)
 
-    query_params = {}
-    if cluster is not None:
-        query_params["var-cluster_name"] = cluster.name
-    query_params["var-model_name"] = model.name
-    if pd:
-        # Which role's transfer counter is authoritative for this connector --
-        # decode where it pulls (NIXL), prefill where it pushes (SGLang). The
-        # dashboard's default is `decode`, so leaving it unset would show an
-        # SGLang group a flat zero for the panels that matter most.
-        query_params["var-counted_role"] = _counted_role(model)
-
-    grafana_base = resolve_grafana_base_url(cfg, request)
-    slug = "gpustack-pd" if pd else "gpustack-model"
-    dashboard_url = f"{grafana_base}/d/{uid}/{slug}"
-    if query_params:
-        dashboard_url = f"{dashboard_url}?{urlencode(query_params)}"
+    # Which dashboard a deployment belongs on, and with which variables, is
+    # `build_model_dashboard_url`'s to answer: a benchmark report links to the
+    # same place and a group must not be sent to the model dashboard from
+    # either door.
+    dashboard_url = build_model_dashboard_url(
+        cfg,
+        resolve_grafana_base_url(cfg, request),
+        model,
+        cluster_name=cluster.name if cluster is not None else None,
+    )
+    if dashboard_url is None:
+        raise InternalServerErrorException(
+            message="Grafana dashboard settings are not configured"
+        )
 
     return RedirectResponse(url=dashboard_url, status_code=302)
-
-
-def _counted_role(model: Model) -> str:
-    """The role whose KV transfer counters this model's connector populates.
-
-    `decode` when the catalog cannot say, matching the dashboard's own default:
-    the two-hop connectors are the common case, and a wrong guess here shows an
-    empty panel rather than a wrong number.
-    """
-    mode_name = getattr(model.disaggregation.mode, "value", None) or str(
-        model.disaggregation.mode
-    )
-    mode = get_pd_mode(mode_name)
-    if mode and mode.transfer_metrics and mode.transfer_metrics.read_from_role:
-        return mode.transfer_metrics.read_from_role
-    return "decode"
 
 
 async def _get_model(

@@ -47,7 +47,10 @@ async def _redirect(model, cfg=None, mode=None):
         patch.object(
             route, "resolve_grafana_base_url", lambda *_: "http://grafana:3000"
         ),
-        patch.object(route, "get_pd_mode", lambda _: mode),
+        # Patched at its source, not on a route module: the dashboard link is
+        # built in `utils.grafana` now, shared with the benchmark report, and
+        # it reads the catalog through a deferred import.
+        patch("gpustack.server.pd_mode_catalog.get_pd_mode", lambda _: mode),
     ):
         response = await route.get_model_dashboard(
             session=None, ctx=None, id=1, request=None

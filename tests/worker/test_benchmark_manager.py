@@ -263,6 +263,9 @@ class TestBuildCommandArgs:
     def _runner(self, **benchmark_fields):
         benchmark = SimpleNamespace(
             id=1,
+            # The name the target is asked for, rather than one discovered from
+            # it — see `--model` in the runner.
+            model_name="qwen3-0.6b",
             auto_tune=False,
             stages=None,
             load_type="fixed_rate",

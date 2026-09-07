@@ -329,6 +329,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("BUILTIN_GRAFANA_PORT"),
     )
     server_group.add_argument(
+        "--prometheus-url",
+        type=str,
+        help="Base URL of an external Prometheus to query. When unset, the embedded one is used if it is enabled. Set this to keep metric-backed features (model and PD dashboards, bandwidth self-check) working on a deployment that delegates observability to its own stack.",
+        default=get_gpustack_env("PROMETHEUS_URL"),
+    )
+    server_group.add_argument(
         "--grafana-url",
         type=str,
         help="Grafana base URL for dashboard redirects and proxying. Must be browser-reachable (not a container-only hostname). If set, embedded Grafana and Prometheus will be disabled. Only required for external Grafana.",
@@ -895,6 +901,7 @@ def set_server_options(args, config_data: dict):
         "disable_builtin_observability",
         "builtin_prometheus_port",
         "builtin_grafana_port",
+        "prometheus_url",
         "grafana_url",
         "grafana_worker_dashboard_uid",
         "grafana_model_dashboard_uid",

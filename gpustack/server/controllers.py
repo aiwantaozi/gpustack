@@ -2520,8 +2520,40 @@ def derive_model_state(
     return ModelStateEnum.RUNNING, None
 
 
+async def _router_proxy(
+    session: AsyncSession, router_instance: ModelInstance
+) -> Tuple[Optional[str], Optional[str]]:
+    """`(proxy, token)` to reach this router through, or `(None, None)` direct.
+
+    Direct is the answer for every worker that is not in `tunnel` mode, and
+    for a worker row that cannot be loaded — dialling direct is what the
+    product did before this existed, so an unreadable row degrades to the old
+    behaviour rather than to no attempt at all.
+
+    🔴 The token comes back with the address because the proxy authenticates
+    every request it forwards. Returning the address alone would produce a
+    hop that answers 401, which `reconcile` cannot tell apart from a router
+    whose registry is unreadable — and that reading is what orders a router
+    restart, so a missing credential would present as a restart loop.
+    """
+    if not router_instance.worker_id:
+        return None, None
+    try:
+        worker = await Worker.one_by_id(session, router_instance.worker_id)
+    except Exception as e:
+        logger.debug(
+            "Could not load worker %s for the router's proxy address: %s",
+            router_instance.worker_id,
+            e,
+        )
+        return None, None
+    if worker is None:
+        return None, None
+    return worker.get_proxy_address(), worker.token
+
+
 async def _reconcile_router_membership(
-    model: Model, instances: List[ModelInstance]
+    session: AsyncSession, model: Model, instances: List[ModelInstance]
 ) -> None:
     """Tell every running router of this group who its members are.
 
@@ -2550,8 +2582,8 @@ async def _reconcile_router_membership(
         pd_membership.forget(model.id)
         return
 
-    addresses = pd_membership.router_addresses(instances)
-    if not addresses:
+    routers = pd_membership.router_instances(instances)
+    if not routers:
         pd_membership.record(
             model.id,
             pd_membership.MembershipOutcome(
@@ -2564,9 +2596,19 @@ async def _reconcile_router_membership(
     # registry serves 503s while another serves fine, and a group is only
     # servable when the thing in front of it is.
     worst = None
-    for address in addresses:
+    for router_instance in routers:
+        address = f"{router_instance.worker_ip}:{router_instance.port}"
+        # 🔴 Per router, because the proxy belongs to the WORKER the router
+        # runs on: a `tunnel` worker only ever dials out, so the server cannot
+        # reach the router's port directly and every call in `reconcile` has
+        # to ride the same forward proxy the gateway uses for that worker's
+        # model instances. `get_proxy_address()` is None for every other proxy
+        # mode, which leaves the direct path byte-for-byte unchanged.
+        proxy, proxy_token = await _router_proxy(session, router_instance)
         try:
-            outcome = await pd_membership.reconcile(model, mode, instances, address)
+            outcome = await pd_membership.reconcile(
+                model, mode, instances, address, proxy=proxy, proxy_token=proxy_token
+            )
         except Exception as e:
             logger.warning(
                 "Router membership reconcile failed for model %s at %s: %s",
@@ -2580,6 +2622,26 @@ async def _reconcile_router_membership(
         if worst is None or (worst.ok and not outcome.ok):
             worst = outcome
     if worst is not None:
+        if worst.unreadable and pd_membership.restarts_exhausted(model.id):
+            # 🔴 The message changes because the suspicion does. Up to here
+            # "unreadable" could have been a wedged router, and the repair was
+            # to restart it. Having restarted it and read nothing, what is left
+            # is the path: the server cannot reach the router's port. On a
+            # `tunnel`-mode worker that is the proxy — the only route inward —
+            # and no further restart can discover that for the operator.
+            worst = pd_membership.MembershipOutcome(
+                ok=False,
+                unreadable=True,
+                reason=(
+                    "the router's member list cannot be read from the server, "
+                    "and restarting the router did not change that — so the "
+                    "router's port is not reachable rather than the process "
+                    "being stuck. On a worker in `tunnel` proxy mode the only "
+                    "route inward is the server's proxy port; check that it is "
+                    "running and that the worker's tunnel is connected."
+                ),
+                registered=worst.registered,
+            )
         pd_membership.record(model.id, worst)
 
 
@@ -2686,7 +2748,7 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # A no-op for every group whose recipe does not carry the flag, which is
     # all of them today: `reconcile` returns ok immediately when
     # `membership_api_usable` is false.
-    await _reconcile_router_membership(model, instances)
+    await _reconcile_router_membership(session, model, instances)
 
     # 🔴 The one failure a restart can fix, and only after it has persisted.
     #
@@ -2699,7 +2761,7 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # disagreeing, and would refuse the same thing again from an empty
     # registry.
     if pd_membership.should_restart_router(model.id):
-        pd_membership.clear_restart_signal(model.id)
+        pd_membership.note_restart_ordered(model.id)
         await _restart_unreachable_routers(session, model, instances)
 
     state, state_message = derive_model_state(

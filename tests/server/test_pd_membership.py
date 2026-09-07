@@ -256,3 +256,209 @@ def test_a_readable_pass_breaks_the_streak():
     )
     assert pd_membership.should_restart_router(model_id) is False
     pd_membership.forget(model_id)
+
+
+# --- reaching a router the server cannot dial -------------------------------
+
+
+def test_router_instances_carry_the_worker_the_proxy_belongs_to():
+    """🔴 The address alone cannot reach a router on a tunnel-mode worker.
+
+    A tunnel worker only ever dials out, so `http://worker_ip:40027` times out
+    from the server and the group parks in PARTIAL with "waiting for upstream
+    registration" while the router is healthy and merely empty. The proxy is a
+    property of the WORKER, so the caller needs the instance, not just its
+    address — which is why `router_instances` exists beside `router_addresses`.
+    """
+    instances = [
+        _instance(RoleNameEnum.ROUTER.value, 40012),
+        _instance(RoleNameEnum.ROUTER.value, 40014, state=ModelInstanceStateEnum.ERROR),
+        _instance("decode", 40011),
+    ]
+    routers = pd_membership.router_instances(instances)
+    assert [i.port for i in routers] == [40012]
+    # The two views agree on which routers count, so a caller switching to the
+    # richer one cannot silently start reconciling a different set.
+    assert [f"{i.worker_ip}:{i.port}" for i in routers] == router_addresses(instances)
+
+
+@pytest.mark.asyncio
+async def test_the_proxy_is_passed_to_every_call_not_just_the_read():
+    """A registration that reads through the proxy and writes around it would
+    report an empty registry it could never fill — the failure would look like
+    a router refusing members rather than like a network it cannot cross."""
+    seen = []
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            return {"workers": []}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            seen.append((method, url, kwargs.get("proxy")))
+            return _Response()
+
+        async def close(self):
+            return None
+
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    mode = get_pd_mode("vllm-nixl")
+    assert mode.router.membership_api_usable, "the recipe must launch the flag"
+
+    instances = [
+        _instance(RoleNameEnum.ROUTER.value, 40027),
+        _instance("prefill", 40055),
+        _instance("decode", 40029),
+    ]
+    await pd_membership.reconcile(
+        _model(),
+        mode,
+        instances,
+        "10.0.0.1:40027",
+        client=_Client(),
+        proxy="http://user:pass@127.0.0.1:30079",
+    )
+    assert seen, "reconcile made no request at all"
+    assert all(
+        proxy == "http://user:pass@127.0.0.1:30079" for _, _, proxy in seen
+    ), seen
+    # And the reads and the writes both happened, so this is not vacuous.
+    assert any(method == "GET" for method, _, _ in seen), seen
+    assert any(method == "POST" for method, _, _ in seen), seen
+
+
+@pytest.mark.asyncio
+async def test_no_proxy_leaves_the_direct_path_unchanged():
+    """`get_proxy_address()` returns None for every mode but `tunnel`, so the
+    deployments that worked before this must keep dialling direct."""
+    seen = []
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            return {"workers": []}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            seen.append(kwargs.get("proxy"))
+            return _Response()
+
+        async def close(self):
+            return None
+
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    await pd_membership.reconcile(
+        _model(),
+        get_pd_mode("vllm-nixl"),
+        [
+            _instance(RoleNameEnum.ROUTER.value, 40027),
+            _instance("prefill", 40055),
+        ],
+        "10.0.0.1:40027",
+        client=_Client(),
+    )
+    assert seen and all(proxy is None for proxy in seen), seen
+
+
+# --- restarting only where restarting can help ------------------------------
+
+
+def _unreadable_outcome():
+    return MembershipOutcome(
+        ok=False, unreadable=True, reason="the router's member list could not be read"
+    )
+
+
+def test_a_wedged_router_is_still_restarted():
+    """The case this path exists for: the process is up and not answering, and
+    a fresh one rendered from the group's current addresses is the repair."""
+    pd_membership.forget(99)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(99, _unreadable_outcome())
+    assert pd_membership.should_restart_router(99)
+    pd_membership.forget(99)
+
+
+def test_an_unreachable_router_is_not_restarted_forever():
+    """🔴 The loop this fixes. `note_restart_ordered` clears the streak so the
+    next pass measures the new process — and without a budget the streak just
+    refills, so a network the server cannot cross produced one router restart
+    every five passes indefinitely, each a real outage and none of them able to
+    help. Measured on a `tunnel`-mode worker before the proxy path existed."""
+    pd_membership.forget(99)
+    ordered = 0
+    # Ten times the streak length: far past anything a wedged process needs.
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES * 10):
+        pd_membership.record(99, _unreadable_outcome())
+        if pd_membership.should_restart_router(99):
+            pd_membership.note_restart_ordered(99)
+            ordered += 1
+    assert ordered == pd_membership.RESTART_ATTEMPT_LIMIT, ordered
+    assert pd_membership.restarts_exhausted(99)
+    pd_membership.forget(99)
+
+
+def test_a_readable_registry_refreshes_the_restart_budget():
+    """The budget answers "has restarting ever helped", so only evidence that
+    the path works may reset it — a later wedge on a group that once recovered
+    still gets its restarts."""
+    pd_membership.forget(99)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(99, _unreadable_outcome())
+    pd_membership.note_restart_ordered(99)
+    assert pd_membership.restarts_exhausted(99) is False
+
+    # A read got through: not ok yet (members still missing), but readable.
+    pd_membership.record(99, MembershipOutcome(ok=False, reason="member missing"))
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(99, _unreadable_outcome())
+    assert pd_membership.should_restart_router(99), "budget was not refreshed"
+    pd_membership.forget(99)
+
+
+def test_ordering_a_restart_does_not_refresh_its_own_budget():
+    """The mistake that would reintroduce the loop: clearing the counter on the
+    attempt makes every attempt look like the first."""
+    pd_membership.forget(99)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(99, _unreadable_outcome())
+    pd_membership.note_restart_ordered(99)
+    pd_membership.note_restart_ordered(99)
+    assert pd_membership.restarts_exhausted(99)
+    pd_membership.forget(99)
+
+
+def test_forgetting_a_group_clears_its_restart_budget():
+    """A group that is deleted and redeployed is a new group, and must not
+    inherit a spent budget from the old one."""
+    pd_membership.forget(99)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(99, _unreadable_outcome())
+    pd_membership.note_restart_ordered(99)
+    pd_membership.note_restart_ordered(99)
+    assert pd_membership.restarts_exhausted(99)
+    pd_membership.forget(99)
+    assert pd_membership.restarts_exhausted(99) is False

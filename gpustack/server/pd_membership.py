@@ -158,7 +158,11 @@ def _body(api: PDMembershipAPI, url: str, role: str, model_name: str) -> dict:
 
 
 async def _read_registry(
-    client: aiohttp.ClientSession, api: PDMembershipAPI, base: str
+    client: aiohttp.ClientSession,
+    api: PDMembershipAPI,
+    base: str,
+    proxy: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     """`{url: role}` as the router itself reports it, or None if unreadable.
 
@@ -172,7 +176,11 @@ async def _read_registry(
     method, url = resolved
     try:
         async with client.request(
-            method, url, timeout=aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
+            method,
+            url,
+            proxy=proxy,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS),
         ) as response:
             if response.status != 200:
                 return None
@@ -203,6 +211,8 @@ async def _add_missing(
     model_name: str,
     wanted: Dict[str, str],
     current: Dict[str, str],
+    proxy: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Add every wanted member the router does not already have.
 
@@ -223,6 +233,8 @@ async def _add_missing(
                 method,
                 endpoint,
                 json=_body(api, url, role, model_name),
+                proxy=proxy,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS),
             ) as response:
                 if response.status >= 400:
@@ -238,6 +250,8 @@ async def _remove_stale(
     base: str,
     wanted: Dict[str, str],
     current: Dict[str, str],
+    proxy: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Drop members the group no longer has, and report what would not go.
 
@@ -268,6 +282,8 @@ async def _remove_stale(
             async with client.request(
                 method,
                 endpoint,
+                proxy=proxy,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS),
             ) as response:
                 if response.status >= 400:
@@ -284,12 +300,14 @@ async def _remove_stale(
     return kept
 
 
-async def reconcile(
+async def reconcile(  # noqa: C901
     model: Model,
     mode: Optional[PDMode],
     instances: Sequence[ModelInstance],
     router_address: Optional[str],
     client: Optional[aiohttp.ClientSession] = None,
+    proxy: Optional[str] = None,
+    proxy_token: Optional[str] = None,
 ) -> MembershipOutcome:
     """Make the router's registry match the group's members, and say whether it does.
 
@@ -298,6 +316,25 @@ async def reconcile(
     changed. That matters because this is the same call used at group
     formation and at scale-out — one code path, so the startup case cannot
     drift away from the steady-state case.
+
+    🔴 `proxy` is what makes this work on a worker the server cannot dial.
+    Every call here targets the ROUTER's own port, not the worker API, and a
+    `tunnel`-mode worker only ever dials out — so `http://worker_ip:40027`
+    times out from the server and the group parks in PARTIAL with
+    "waiting for upstream registration" while the router is in fact healthy
+    and merely empty. Measured on a tunnel worker: the registration path was
+    the one thing in the product still assuming it could reach a worker
+    directly, because the gateway reaches model instances through the same
+    proxy and this is not a model instance. `Worker.get_proxy_address()`
+    returns None for every other proxy mode, so the direct path is unchanged.
+
+    ⚠️ `proxy_token` is not optional in practice once `proxy` is set: the
+    server's forward proxy authenticates every request that is not
+    `GET /metrics`, so an unauthenticated hop answers 401 and the read looks
+    like an unreadable registry — which then trips the router restart, and no
+    restart can supply a missing credential. It rides `Proxy-Authorization`
+    rather than `Authorization`: the token authorises the HOP, and the router
+    has its own opinion about `Authorization`.
     """
     if mode is None or not mode.router.membership_api_usable:
         # The recipe does not launch the flag the API needs. Nothing to do,
@@ -318,13 +355,33 @@ async def reconcile(
         )
 
     base = f"http://{router_address}"
+    # Only when a proxy is in play: on the direct path there is no hop to
+    # authorise, and handing the worker's token to the router would be giving
+    # a credential to something that never asked for one.
+    proxy_headers = (
+        {"Proxy-Authorization": f"Bearer {proxy_token}"}
+        if proxy and proxy_token
+        else None
+    )
     owned = client is None
     try:
         if owned:
-            client = aiohttp.ClientSession()
+            # 🔴 `force_close` because these requests may ride a forward proxy
+            # to a tunnel worker, and that hop does not keep the connection
+            # alive between requests. Measured: the first `POST /workers`
+            # succeeded and the second failed with
+            # `Can not write request body` — aiohttp had reused a socket the
+            # proxy had already closed, so exactly one of two members got
+            # registered and the group parked in PARTIAL with a message that
+            # blamed registration rather than the connection.
+            client = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(force_close=True)
+            )
 
         async def _run() -> MembershipOutcome:
-            current = await _read_registry(client, api, base)
+            current = await _read_registry(
+                client, api, base, proxy=proxy, headers=proxy_headers
+            )
             if current is None:
                 return MembershipOutcome(
                     ok=False,
@@ -335,7 +392,16 @@ async def reconcile(
                     ),
                 )
 
-            await _add_missing(client, api, base, model.name, wanted, current)
+            await _add_missing(
+                client,
+                api,
+                base,
+                model.name,
+                wanted,
+                current,
+                proxy=proxy,
+                headers=proxy_headers,
+            )
 
             # Stale entries are removed, and a failure to remove one is NOT
             # fatal: upstream's removal gate is global (it waits for the
@@ -348,12 +414,16 @@ async def reconcile(
             # the path got 405 and the stale member stayed, while the outcome
             # still read ok. So the failure is logged at INFO with the status,
             # not swallowed: "lenient" has to still be visible.
-            stale_kept = await _remove_stale(client, api, base, wanted, current)
+            stale_kept = await _remove_stale(
+                client, api, base, wanted, current, proxy=proxy, headers=proxy_headers
+            )
 
             # 🔑 The read-back, and the whole reason `ok` is trustworthy. An
             # accepted POST is not a joined member: upstream probes the peer
             # first and drops it silently on timeout.
-            final = await _read_registry(client, api, base)
+            final = await _read_registry(
+                client, api, base, proxy=proxy, headers=proxy_headers
+            )
             if final is None:
                 return MembershipOutcome(
                     ok=False,
@@ -409,6 +479,10 @@ async def reconcile(
 _outcomes: Dict[int, MembershipOutcome] = {}
 _failures: Dict[int, int] = {}
 _unreadable: Dict[int, int] = {}
+# Restarts already ordered for this group without the registry ever becoming
+# readable afterwards. Cleared by a successful READ, not by ordering a
+# restart -- see `should_restart_router`.
+_restarts: Dict[int, int] = {}
 
 PERSISTENT_FAILURE_PASSES = 5
 
@@ -423,6 +497,23 @@ PERSISTENT_FAILURE_PASSES = 5
 # busy has answered, and short enough that a wedged one is not left serving
 # nothing for minutes.
 RESTART_AFTER_UNREADABLE_PASSES = 5
+
+# How many times a group's router may be restarted over an unreadable
+# registry before this stops trying.
+#
+# 🔴 A restart repairs exactly one cause: a router process that is up but
+# wedged. It cannot repair a network path that does not exist -- and that is
+# the other thing "unreadable" means. Measured on a `tunnel`-mode worker,
+# where the server cannot dial the router at all: the streak refilled after
+# every restart, so the group churned one router per five passes
+# indefinitely, each restart costing a real outage (the new process answers
+# 503 until registration completes) and none of them able to help.
+#
+# Two, not one: the first covers the wedged process this path exists for,
+# the second covers losing that race against a router that was still coming
+# up. A third has nothing left to prove.
+RESTART_ATTEMPT_LIMIT = 2
+
 """Consecutive failed reconciles before the message names the way out.
 
 🔴 The escape hatch is an OPERATOR action, not something this code can take.
@@ -444,6 +535,13 @@ def record(model_id: int, outcome: MembershipOutcome) -> None:
         _unreadable[model_id] = _unreadable.get(model_id, 0) + 1
     else:
         _unreadable.pop(model_id, None)
+        # A read that got through is proof the path works, so whatever the
+        # earlier restarts were fighting is over and the budget is fresh.
+        # Deliberately reset HERE and not when a restart is ordered: the
+        # question the budget answers is "has restarting ever helped", and
+        # clearing it on the attempt would make every attempt look like the
+        # first one -- which is precisely the loop.
+        _restarts.pop(model_id, None)
 
     if outcome.ok:
         _failures.pop(model_id, None)
@@ -472,6 +570,7 @@ def outcome_for(model_id: int) -> Optional[MembershipOutcome]:
 def forget(model_id: int) -> None:
     _outcomes.pop(model_id, None)
     _failures.pop(model_id, None)
+    _restarts.pop(model_id, None)
 
 
 def consecutive_failures(model_id: int) -> int:
@@ -481,22 +580,47 @@ def consecutive_failures(model_id: int) -> int:
 def should_restart_router(model_id: int) -> bool:
     """Whether the router has been unreachable long enough to be worth losing.
 
-    True only for the unreadable case, and only after
-    `RESTART_AFTER_UNREADABLE_PASSES` of them in a row. A router that refuses
-    a member is answering, and restarting it repeats the refusal from an empty
-    registry instead of a partial one.
+    Two conditions, and the second is what keeps this from looping.
+
+    `RESTART_AFTER_UNREADABLE_PASSES` in a row, and only for the unreadable
+    case: a router that refuses a member is answering, and restarting it
+    repeats the refusal from an empty registry instead of a partial one.
+
+    🔴 And `RESTART_ATTEMPT_LIMIT` restarts not yet spent. A restart repairs a
+    wedged process; it cannot repair a network the server cannot cross, and
+    "unreadable" covers both. Without this the streak simply refills after
+    each restart and the group churns a router every five passes forever —
+    each one a real outage, none of them able to help. Measured on a
+    `tunnel`-mode worker before the proxy path existed.
     """
-    return _unreadable.get(model_id, 0) >= RESTART_AFTER_UNREADABLE_PASSES
+    if _unreadable.get(model_id, 0) < RESTART_AFTER_UNREADABLE_PASSES:
+        return False
+    return _restarts.get(model_id, 0) < RESTART_ATTEMPT_LIMIT
 
 
-def clear_restart_signal(model_id: int) -> None:
+def restarts_exhausted(model_id: int) -> bool:
+    """Whether restarting has been tried and stopped helping.
+
+    The caller turns this into the group's message, because at this point the
+    honest statement changes: it is no longer "the router has not registered
+    its members yet" but "the router cannot be reached from here, and
+    restarting it did not change that".
+    """
+    return _restarts.get(model_id, 0) >= RESTART_ATTEMPT_LIMIT
+
+
+def note_restart_ordered(model_id: int) -> None:
     """Forget the streak once a restart has been ordered, so the next pass
-    measures the new process rather than re-ordering against the old count."""
+    measures the new process rather than re-ordering against the old count —
+    and spend one of the restart budget, so a path that restarting cannot fix
+    stops being restarted.
+    """
     _unreadable.pop(model_id, None)
+    _restarts[model_id] = _restarts.get(model_id, 0) + 1
 
 
-def router_addresses(instances: Sequence[ModelInstance]) -> List[str]:
-    """Every running router's `host:port`.
+def router_instances(instances: Sequence[ModelInstance]) -> List[ModelInstance]:
+    """Every running router of the group.
 
     A list because the group's router count is a declared replica count like
     any other, even though the shipped recipes run one: a second router with
@@ -506,10 +630,22 @@ def router_addresses(instances: Sequence[ModelInstance]) -> List[str]:
     from gpustack.schemas.models import ModelInstanceStateEnum
 
     return [
-        f"{i.worker_ip}:{i.port}"
+        i
         for i in instances
         if i.role == RoleNameEnum.ROUTER.value
         and i.state == ModelInstanceStateEnum.RUNNING
         and i.worker_ip
         and i.port
     ]
+
+
+def router_addresses(instances: Sequence[ModelInstance]) -> List[str]:
+    """Every running router's `host:port`.
+
+    The address alone is not enough to REACH a router on a tunnel-mode
+    worker — see `reconcile`'s `proxy` — so the caller wants
+    `router_instances` and the worker behind each. Kept because the address is
+    still the identity the router is known by, and reading it out of an
+    instance twice would be two places to get it wrong.
+    """
+    return [f"{i.worker_ip}:{i.port}" for i in router_instances(instances)]

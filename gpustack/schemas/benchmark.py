@@ -57,6 +57,33 @@ class BenchmarkLoadTypeEnum(str, Enum):
     CONCURRENCY = "concurrency"
 
 
+class BenchmarkTargetModeEnum(str, Enum):
+    r"""What the load is aimed at: one instance, or the deployment's entrance.
+
+    The two are different measurements, and the difference is not overhead —
+    it is what the number means.
+
+    ``instance`` measures an ENGINE. The load goes straight at a member's own
+    port, so nothing but the engine is in the path. It is the right mode for
+    tuning engine parameters, and it is what every run did before this field
+    existed. For a group the member is its router (no other member can answer
+    a whole request); for a plain model it is one replica.
+
+    ``route`` measures a DEPLOYMENT, through the route clients actually call.
+    A plain model with four replicas is four replicas here and one replica in
+    ``instance`` mode — which is the whole reason this exists: comparing a
+    2P2D group against a four-replica deployment is only meaningful when both
+    sides are driven as deployments.
+
+    ⚠️ ``route`` puts the server's proxy in the path, and at high rates the
+    proxy can be the bottleneck rather than the deployment. That is the reason
+    ``instance`` stays the default and stays available for groups.
+    """
+
+    INSTANCE = "instance"
+    ROUTE = "route"
+
+
 class BenchmarkLoadModeEnum(str, Enum):
     r"""
     Which of the three mutually-exclusive load shapes a benchmark runs.
@@ -339,6 +366,13 @@ class BenchmarkBase(SQLModel):
     dataset_output_max: Optional[int] = Field(default=None)
 
     cluster_id: int = Field(default=None)
+    # What the load is aimed at. A column rather than a derivation: it is part
+    # of the configuration a clone or an export has to carry, and two runs of
+    # one model in different modes are not comparable, so the report has to be
+    # able to say which one it was.
+    target_mode: BenchmarkTargetModeEnum = Field(
+        default=BenchmarkTargetModeEnum.INSTANCE
+    )
     model_id: Optional[int] = Field(default=None)
     model_name: Optional[str] = Field(
         default=None
@@ -473,6 +507,12 @@ class BenchmarkSnapshot(BaseModel):
     # Not a scalar column: nothing queries or sorts by it, it is read with the
     # rest of the snapshot when a reader asks what a report was measuring.
     spec_digest: Optional[str] = None
+    # The route the load entered through, in `route` mode. Recorded because a
+    # route is not a fixed view of a model: its targets and their weights can
+    # be edited, and a canary route can send a share of the load somewhere
+    # else entirely — so "which route, under what name" is part of what the
+    # numbers mean.
+    route_name: Optional[str] = None
 
 
 class BenchmarkMetricsLite(SQLModel):

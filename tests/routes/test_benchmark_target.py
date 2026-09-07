@@ -14,7 +14,8 @@ import pytest
 
 from gpustack.api.exceptions import BadRequestException
 from gpustack.routes import benchmarks as route
-from gpustack.schemas.benchmark import BenchmarkCreate
+from gpustack.schemas.benchmark import BenchmarkCreate, BenchmarkTargetModeEnum
+from gpustack.schemas.model_routes import TargetStateEnum
 from gpustack.schemas.models import (
     DisaggregationSpec,
     Model,
@@ -277,3 +278,74 @@ class TestTargetModel:
         with pytest.raises(BadRequestException) as excinfo:
             await route._resolve_target_model(None, BenchmarkCreate(name="bm"))
         assert "model_id" in excinfo.value.message
+
+
+class TestRouteMode:
+    """`instance` measures an engine, `route` measures a deployment.
+
+    The distinction is not overhead: a plain model with four replicas is four
+    replicas through its route and exactly one straight at a member, which is
+    why comparing a 2P2D group against a four-replica deployment needs this
+    mode on both sides.
+    """
+
+    def _targets(self, *, active=True, route_id=5):
+        return [
+            SimpleNamespace(
+                id=1,
+                model_id=1,
+                route_id=route_id,
+                route_name="qwen",
+                state=(
+                    TargetStateEnum.ACTIVE if active else TargetStateEnum.UNAVAILABLE
+                ),
+            )
+        ]
+
+    async def _resolve(self, model, targets, owner):
+        with (
+            patch.object(
+                route.ModelRouteTarget,
+                "all_by_fields",
+                AsyncMock(return_value=targets),
+            ),
+            patch.object(
+                route.ModelRoute,
+                "one_by_id",
+                AsyncMock(
+                    return_value=SimpleNamespace(name="qwen", owner_principal_id=9)
+                ),
+            ),
+            patch.object(route.Principal, "one_by_id", AsyncMock(return_value=owner)),
+        ):
+            return await route._resolve_route_name(None, model)
+
+    @pytest.mark.asyncio
+    async def test_the_platform_orgs_route_keeps_its_bare_name(self):
+        # What existing clients call it, and what the proxy matches on.
+        owner = SimpleNamespace(id=route.platform_principal_id(), name="platform")
+        assert await self._resolve(_plain_model(), self._targets(), owner) == "qwen"
+
+    @pytest.mark.asyncio
+    async def test_another_orgs_route_is_prefixed(self):
+        owner = SimpleNamespace(id=42, name="org1")
+        assert await self._resolve(_plain_model(), self._targets(), owner) == (
+            "org1/qwen"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_active_route_is_refused_rather_than_measured(self):
+        # An UNAVAILABLE target resolves to nothing at request time, so the run
+        # would measure a 503 and report it as the deployment's latency.
+        owner = SimpleNamespace(id=42, name="org1")
+        with pytest.raises(BadRequestException) as excinfo:
+            await self._resolve(_plain_model(), [], owner)
+        assert "route" in excinfo.value.message
+
+    def test_instance_is_the_default(self):
+        # Every run written before this field existed measured an engine, and
+        # a create body that says nothing still does.
+        assert (
+            BenchmarkCreate(name="bm", model_id=1).target_mode
+            is BenchmarkTargetModeEnum.INSTANCE
+        )

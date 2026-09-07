@@ -12,6 +12,7 @@ from gpustack.envs import BENCHMARK_DATASET_SHAREGPT_PATH, BENCHMARK_REQUEST_TIM
 from gpustack.logging import setup_logging
 from gpustack.ssl_context import resolve_ca_bundle
 from gpustack.schemas.benchmark import (
+    BenchmarkTargetModeEnum,
     DATASET_RANDOM,
     DATASET_SHAREGPT,
     SLO_THRESHOLDS,
@@ -115,6 +116,7 @@ class BenchmarkRunner:
     _api_key: str
     _benchmark_dir: Optional[str]
     _progress_insecure_skip_tls_verify: bool
+    _route_name: Optional[str] = None
     _fallback_registry: Optional[str] = None
     """The fallback container registry to use if needed."""
 
@@ -177,6 +179,13 @@ class BenchmarkRunner:
             self._model_path = local_snapshot.resolved_path
             self._model_endpoint = f"http://{instance_snapshot.worker_ip}:{instance_snapshot.ports[0] if instance_snapshot.ports else ''}"
             self._model_backend_parameters = instance_snapshot.backend_parameters
+            # `route` mode aims at the deployment instead of the member: the
+            # load enters where client traffic does, so a plain model's
+            # replicas are all of them rather than the one this snapshot
+            # happens to name. Resolved on the server and carried on the
+            # snapshot — the runner must not re-derive which route fronts a
+            # model, or the two could disagree about what was measured.
+            self._route_name = getattr(benchmark.snapshot, "route_name", None)
 
             _api_key = read_worker_token(self._config.data_dir)
             if _api_key is None:
@@ -380,6 +389,19 @@ class BenchmarkRunner:
     def _build_command_args(  # noqa: C901
         self, with_ca_cert: bool = False
     ) -> List[str]:
+        b = self._benchmark
+        # Where the load goes, and what it asks for by name. In `route` mode
+        # both change together: the target is the server's benchmark proxy
+        # (which resolves the route and load-balances exactly as `/v1` does)
+        # and the name is the route's, not the model's -- a route is what the
+        # proxy matches on.
+        route_mode = (
+            getattr(b, "target_mode", None) == BenchmarkTargetModeEnum.ROUTE
+            and self._route_name
+        )
+        target = self._route_proxy_target() if route_mode else self._model_endpoint
+        served_name = self._route_name if route_mode else b.model_name
+
         # guidellm 0.7.1 registers request handlers on OpenAIRequestHandlerFactory
         # by API PATH, and benchmark-runner's `openai_http_error_detail` backend
         # exposes that as a `request_handlers` field (path -> registered handler
@@ -393,6 +415,14 @@ class BenchmarkRunner:
                 "/v1/chat/completions": "chat_completions_with_reasoning"
             },
         }
+        if route_mode:
+            # The proxy is the server, and the server authenticates. The worker
+            # token is the credential this process already holds and already
+            # uses (progress reporting posts with it), so route mode needs no
+            # new secret and nothing of the user's is stored on the run.
+            backend_kwargs["api_key"] = self._api_key
+            if self._progress_insecure_skip_tls_verify:
+                backend_kwargs["verify"] = False
 
         # Load selection — one of three mutually-exclusive shapes, named by
         # benchmark_load_mode so the precedence lives in one place (the result
@@ -405,7 +435,6 @@ class BenchmarkRunner:
         #      mode; each stage carries its own max_requests / max_seconds).
         #   3. single     -> one `constant`/`concurrent` run (single-rate records
         #      via request_rate).
-        b = self._benchmark
         mode = benchmark_load_mode(b)
         # fixed_rate -> ramp/pin the request rate (open-loop constant);
         # concurrency -> ramp/pin the stream count (closed-loop concurrent).
@@ -453,7 +482,7 @@ class BenchmarkRunner:
             "benchmark",
             "run",
             "--target",
-            self._model_endpoint,
+            target,
             # Named, never discovered. Without it guidellm asks the target for
             # `GET /v1/models` and takes the first entry, which fails two ways:
             # a PD router does not necessarily answer that route in the shape
@@ -465,7 +494,7 @@ class BenchmarkRunner:
             # the router forwards. A row without one (nothing the server
             # creates today) falls back to discovery rather than sending the
             # string "None" as a model id.
-            *(["--model", b.model_name] if b.model_name else []),
+            *(["--model", served_name] if served_name else []),
             *profile_args,
             "--sample-requests",
             "0",
@@ -633,6 +662,20 @@ class BenchmarkRunner:
             "/benchmarks/{id}/state".format(id=id), json=kwargs
         )
         resp.raise_for_status()
+
+    def _route_proxy_target(self) -> str:
+        """The server's benchmark proxy, which fronts the deployment's route.
+
+        Not `/v1` directly: that door authenticates a USER, and this process
+        holds a worker token rather than anyone's credentials. The proxy is the
+        same resolution and the same load balancer behind a worker-authenticated
+        prefix, so `route` mode needs no key of the user's and stores no secret
+        on the run.
+
+        The path stops before `/v1`, which the load generator appends itself.
+        """
+        base = self._api_url.split("/v2/benchmarks/")[0]
+        return f"{base}/v2/benchmark-proxy"
 
     def _get_configured_mounts(self) -> List[ContainerMount]:
         """

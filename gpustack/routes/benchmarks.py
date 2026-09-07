@@ -37,11 +37,19 @@ from gpustack.schemas.models import (
     servable_instances,
 )
 from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.model_routes import (
+    ModelRoute,
+    ModelRouteTarget,
+    TargetStateEnum,
+    effective_route_name,
+)
+from gpustack.schemas.principals import Principal, platform_principal_id
 from gpustack.schemas.workers import Worker
 from gpustack.config.config import get_global_config
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
 from gpustack.schemas.benchmark import (
+    BenchmarkTargetModeEnum,
     DATASET_RANDOM,
     DATASET_SEED_MAX,
     DATASET_SEED_MIN,
@@ -681,6 +689,52 @@ async def _resolve_target_endpoint(
     return sorted(servable, key=lambda m: m.id)[0]
 
 
+async def _resolve_route_name(session: SessionDep, model: Model) -> str:
+    """The name a client calls this deployment by.
+
+    `route` mode drives the deployment through the same door as production
+    traffic, and that door is addressed by the effective route name — prefixed
+    with the owning Org for everyone but the platform Org, exactly as the
+    gateway and `/v1` resolve it. Deriving it here rather than asking the
+    caller for it keeps the two from disagreeing: a benchmark that named the
+    wrong route would measure a different deployment and say nothing.
+
+    An ACTIVE target is required. A route whose target is UNAVAILABLE resolves
+    to nothing at request time, so a run against it would measure a 503 —
+    refusing with the reason is the honest answer.
+    """
+    targets = await ModelRouteTarget.all_by_fields(
+        session,
+        {"model_id": model.id, "state": TargetStateEnum.ACTIVE, "deleted_at": None},
+    )
+    if not targets:
+        raise BadRequestException(
+            message=(
+                f"Model '{model.name}' is not reachable through any active route, "
+                f"so it cannot be benchmarked in route mode. Deploy a route for "
+                f"it, or benchmark an instance instead."
+            )
+        )
+
+    # Lowest id: a model reachable through several routes (an alias, a canary)
+    # is measured through the oldest, which is the one that has been in front
+    # of it the longest. The name is recorded on the run either way, since a
+    # route's targets and weights are editable and a canary can send part of
+    # the load elsewhere.
+    target = sorted(targets, key=lambda t: t.id)[0]
+    route = await ModelRoute.one_by_id(session, target.route_id)
+    if route is None:
+        raise BadRequestException(
+            message=f"Route '{target.route_name}' no longer exists"
+        )
+    owner = await Principal.one_by_id(session, route.owner_principal_id)
+    return effective_route_name(
+        route.name,
+        getattr(owner, "name", None),
+        getattr(owner, "id", None) == platform_principal_id(),
+    )
+
+
 async def _resolve_placement(
     session: SessionDep, model: Model, endpoint: ModelInstance
 ) -> ModelInstance:
@@ -732,6 +786,15 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
         session, model, benchmark_in.model_instance_name
     )
     placement = await _resolve_placement(session, model, instance)
+    # Route mode still resolves an instance above: the run has to be recorded
+    # against something, the placement still has to land where the weights are,
+    # and the snapshot still describes the deployment. What changes is only
+    # where the load is SENT, which the runner reads off `target_mode`.
+    route_name = (
+        await _resolve_route_name(session, model)
+        if mutated.target_mode == BenchmarkTargetModeEnum.ROUTE
+        else None
+    )
 
     mutated.model_id = model.id
     mutated.model_name = model.name
@@ -791,7 +854,9 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
 
     _validate_load_config(benchmark_in)
 
-    snapshot = await get_benchmark_snapshot(session, instance, model)
+    snapshot = await get_benchmark_snapshot(
+        session, instance, model, route_name=route_name
+    )
     mutated.snapshot = snapshot
     mutated.gpu_summary, mutated.gpu_vendor_summary = summary_gpu_snapshots(
         snapshot.gpus
@@ -927,7 +992,10 @@ async def _snapshot_members(
 
 
 async def get_benchmark_snapshot(
-    session: SessionDep, mi: ModelInstance, model: Model
+    session: SessionDep,
+    mi: ModelInstance,
+    model: Model,
+    route_name: Optional[str] = None,
 ) -> BenchmarkSnapshot:
     # instance snapshot
 
@@ -974,6 +1042,10 @@ async def get_benchmark_snapshot(
         # same model" routinely measure different things; without this the
         # reports cannot be told apart after the fact.
         spec_digest=getattr(mi, "spec_digest", None),
+        # Set in route mode only: the door the load went through, recorded
+        # because a route's targets and weights are editable and a canary can
+        # send part of the load somewhere else entirely.
+        route_name=route_name,
     )
 
 

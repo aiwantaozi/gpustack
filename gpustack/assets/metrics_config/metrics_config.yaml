@@ -158,6 +158,10 @@ gpustack_metrics:
     type: Counter
     description: "Requests the router dispatched to a decode worker."
 
+  gpustack:pd_router_decode_errors:
+    type: Counter
+    description: "Decode dispatches the router saw fail, per worker. Counted before the router's own retry, so a non-zero value against a window where every request returned 200 is the share of traffic a retry covered up -- the only place that is visible."
+
   gpustack:pd_prompt_tokens_by_source:
     type: Counter
     description: "Prompt tokens split by where they came from, on the `source` label: `local_compute` (this engine prefilled them), `local_cache_hit` (its own prefix cache), `external_kv_transfer` (they arrived from a KV connector). vLLM guarantees the three sum to the prompt total, which is what makes the external share a ratio rather than a count."
@@ -208,6 +212,17 @@ runtime_mapping:
       vllm_router_pd_prefill_requests: gpustack:pd_router_prefill_requests
       vllm_router_pd_decode_requests: gpustack:pd_router_decode_requests
       vllm_router_pd_requests: gpustack:pd_router_requests
+      # ⚠️ The `worker` label these three and the errors counter carry is the
+      # UPSTREAM ENGINE URL (`http://ip:port`), not a GPUStack worker -- the
+      # host is separately on `worker_name`, added by the aggregator. Grouping
+      # a per-member chart on the wrong one collapses every member of a host
+      # into one series, which on a single-host xPyD is all of them.
+      vllm_router_pd_decode_errors: gpustack:pd_router_decode_errors
+      # ⛔ Deliberately NOT mapped: `vllm_router_active_workers`. Measured
+      # 2026-09-07 on a 1P1D that was serving traffic -- it read 0. The router
+      # does not maintain the gauge, so surfacing it would show "no members"
+      # on a healthy group, and an unmapped name is the honest way to say a
+      # counter cannot be trusted.
       vllm:spec_decode_num_draft_tokens: gpustack:spec_decode_draft_tokens
       # PD effectiveness, per token rather than per transfer. The engine
       # itself says how much of each prompt it did NOT compute, so this needs
@@ -361,6 +376,67 @@ metric_queries:
           scope: receiving_role
           labels:
             source: local_compute
+      # 🔑 The same question as `recomputed_tokens`, asked per REQUEST instead
+      # of per token -- and the pair is not redundant, they have opposite
+      # blind spots.
+      #
+      # `external_token_share` sums every token in the window, so a minority
+      # of requests recomputing whole prompts is diluted by the majority that
+      # did not: 5% of requests recomputing, in a window with mixed prompt
+      # lengths, can leave the ratio at 0.97 and sit inside `effective`. This
+      # histogram's p99 jumps to those requests' prompt length instead.
+      #
+      # ⚠️ `receiving_role`, for the same reason the token counters use it: on
+      # PREFILL this histogram is the work prefill is *supposed* to do, and it
+      # spans the whole prompt on a healthy group. Measured 2026-09-07 on a
+      # working 1P1D -- decode had all 36 requests in the `le=1.0` bucket
+      # while prefill's spread from `le=10` to `+Inf`. Read on prefill it
+      # would alarm on every correctly working deployment.
+      #
+      # 🔴 A healthy reading is BELOW 1.0, not 0: the first bucket is `le=1.0`
+      # and `histogram_quantile` interpolates inside whichever bucket it lands
+      # in, so a group that recomputed nothing reports `quantile * 1.0`
+      # (0.95 / 0.99 -- measured). The signal is the jump to hundreds, since
+      # the next bucket edges are 2, 5, 10.
+      recomputed_tokens_p95:
+        histogram_quantile:
+          quantile: 0.95
+          metric: gpustack:request_prefill_kv_computed_tokens
+          scope: receiving_role
+      recomputed_tokens_p99:
+        histogram_quantile:
+          quantile: 0.99
+          metric: gpustack:request_prefill_kv_computed_tokens
+          scope: receiving_role
+      # --- Per member, from the router ----------------------------------
+      # The only counters that know how the router actually spread the
+      # traffic. Grouped on `worker` (the upstream engine URL) rather than
+      # `worker_name` (the host) -- see the mapping note above.
+      #
+      # 🔑 Why this is worth its own group rather than folding into the
+      # verdict: the verdict answers "is the group disaggregating", and these
+      # answer "is one member carrying or missing the traffic", which is the
+      # question an xPyD ratio change is actually about. A group can read
+      # `effective` with one decode taking nothing.
+      member_prefill_requests:
+        counter_increase:
+          metric: gpustack:pd_router_prefill_requests_total
+          scope: group
+        group_by: [worker]
+      member_decode_requests:
+        counter_increase:
+          metric: gpustack:pd_router_decode_requests_total
+          scope: group
+        group_by: [worker]
+      # Non-zero here while every request returned 200 means the router's
+      # retry covered a failure up. That is the signal, so it is reported per
+      # member rather than summed: a retry that always lands on the same bad
+      # decode is invisible in a total.
+      member_decode_errors:
+        counter_increase:
+          metric: gpustack:pd_router_decode_errors_total
+          scope: group
+        group_by: [worker]
       # `_count` of the seconds histogram IS the transfer count, so the
       # numerator needs no separate counter. Read from the SECONDS family and
       # not the bytes one: SGLang 0.5.15 dropped its bytes histogram, and the

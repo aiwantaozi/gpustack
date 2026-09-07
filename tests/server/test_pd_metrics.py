@@ -16,9 +16,13 @@ from gpustack.schemas.metric_queries import (
 )
 from gpustack.server.pd_metrics import (
     PDKVTransferMetrics,
+    PDMemberMetrics,
     PDMetricsPublic,
     PDRoleMetrics,
+    _MEMBER_FIELDS,
     _derive_role_rates,
+    _fill_members,
+    _fill_tokens,
     _fill_transfer,
     _fill_verdict,
     _preflight,
@@ -397,3 +401,176 @@ def test_an_idle_window_on_a_measurable_connector_stays_silent():
     no traffic produces exactly the same empty values, and calling that "cannot
     be measured" would hide a connector that is working."""
     assert _transfer(observable=True).kv_transfer.rates_unavailable_reason is None
+
+
+# --- per-request recomputation, and the volume figures ------------------
+
+
+def test_the_recompute_percentiles_are_declared_on_the_receiving_role():
+    """🔴 On PREFILL the same histogram is the work prefill exists to do, so a
+    threshold read there fires on every healthy group. Measured on a working
+    1P1D: decode had all 36 requests in `le=1.0` while prefill's spread from
+    `le=10` to `+Inf`."""
+    declared = _declared()
+    for key in ("recomputed_tokens_p95", "recomputed_tokens_p99"):
+        quantile = declared[key].histogram_quantile
+        assert quantile is not None, key
+        assert quantile.scope is QueryScopeEnum.RECEIVING_ROLE, key
+        assert quantile.metric == "gpustack:request_prefill_kv_computed_tokens", key
+
+
+def test_the_recompute_quantile_keeps_le_so_there_is_a_histogram_left():
+    declared = _declared()
+    expression = build_query(
+        declared["recomputed_tokens_p99"],
+        _selectors(1, "decode"),
+        "300s",
+    )
+    assert "histogram_quantile(0.99, sum by (le)" in expression, expression
+    assert "_bucket" in expression, expression
+    assert 'role="decode"' in expression, expression
+
+
+def test_the_percentiles_land_on_the_result():
+    result = PDMetricsPublic(available=True)
+    _fill_tokens(
+        result,
+        {
+            "external_tokens": None,
+            "recomputed_tokens_p95": 0.0,
+            "recomputed_tokens_p99": 4096.0,
+        },
+        WINDOW,
+    )
+    assert result.recomputed_tokens_p95 == 0.0
+    assert result.recomputed_tokens_p99 == 4096.0
+
+
+def test_the_token_rate_is_over_wall_clock_and_left_in_tokens():
+    """Bytes need the model's KV footprint, which means reading the pretrained
+    config — a disk or network read that must not sit on a polled endpoint.
+    The conversion belongs to the budget endpoint, which already does it."""
+    result = PDMetricsPublic(available=True)
+    _fill_tokens(result, {"external_tokens": 6000.0}, WINDOW)
+    assert result.kv_transfer.external_tokens == 6000.0
+    assert result.kv_transfer.external_tokens_per_second == 20.0
+
+
+def test_a_zero_window_derives_no_token_rate_rather_than_dividing_by_it():
+    result = PDMetricsPublic(available=True)
+    _fill_tokens(result, {"external_tokens": 6000.0}, 0)
+    assert result.kv_transfer.external_tokens == 6000.0
+    assert result.kv_transfer.external_tokens_per_second is None
+
+
+def test_the_volume_figures_survive_the_router_fallback_path():
+    """`_fill_verdict` returns as soon as it has a verdict, so these have to
+    be filled independently — a mode judged from the router counter still has
+    the engine's token accounting."""
+    result = PDMetricsPublic(available=True)
+    result.kv_transfer.count = 40.0
+    values = _values(requests_per_worker=40.0, external_tokens=6000.0)
+    _fill_verdict(result, values)
+    _fill_tokens(result, values, WINDOW)
+    assert result.request_count_source == "router_per_worker"
+    assert result.kv_transfer.external_tokens_per_second == 20.0
+
+
+# --- per member, from the router ----------------------------------------
+
+
+def test_member_counters_are_grouped_on_the_upstream_url_not_the_host():
+    """🔴 One host runs several members on an xPyD group. Grouping on
+    `worker_name` would collapse every member of a host into one series, which
+    on a single-host group is all of them."""
+    declared = _declared()
+    for key in (
+        "member_prefill_requests",
+        "member_decode_requests",
+        "member_decode_errors",
+    ):
+        assert declared[key].group_by == ["worker"], key
+        expression = build_query(declared[key], _selectors(1, "decode"), "300s")
+        assert "sum by (worker)(" in expression, expression
+
+
+def test_member_counters_use_the_exposed_total_suffixed_names():
+    declared = _declared()
+    assert (
+        declared["member_decode_errors"].counter_increase.metric
+        == "gpustack:pd_router_decode_errors_total"
+    )
+
+
+def test_every_per_member_declaration_has_a_field_to_land_in():
+    """`_fill_members` maps each declaration key to a field; a key with no
+    mapping is a metric collected and dropped."""
+    for key, query in _declared().items():
+        if not query.group_by or "worker" not in query.group_by:
+            continue
+        assert key in _MEMBER_FIELDS, key
+        assert _MEMBER_FIELDS[key] in PDMemberMetrics.model_fields, key
+
+
+def test_members_are_keyed_by_worker_and_carry_their_own_figures():
+    result = PDMetricsPublic(available=True)
+    _fill_members(
+        result,
+        {
+            "member_decode_requests": {
+                "http://10.0.0.1:40000": 30.0,
+                "http://10.0.0.2:40000": 15.0,
+            },
+            "member_decode_errors": {"http://10.0.0.2:40000": 4.0},
+        },
+    )
+    assert set(result.members) == {"http://10.0.0.1:40000", "http://10.0.0.2:40000"}
+    assert result.members["http://10.0.0.1:40000"].decode_requests == 30.0
+    assert result.members["http://10.0.0.1:40000"].decode_errors is None
+    assert result.members["http://10.0.0.2:40000"].decode_errors == 4.0
+
+
+def test_an_unlabelled_member_series_is_dropped_rather_than_folded_in():
+    result = PDMetricsPublic(available=True)
+    _fill_members(result, {"member_decode_requests": {"": 45.0}})
+    assert result.members == {}
+
+
+def test_a_member_the_router_never_mentioned_is_absent_not_zero():
+    """The absence is the finding: a zero row would say "measured, and it took
+    nothing" where the truth is "the router has not mentioned it"."""
+    result = PDMetricsPublic(available=True)
+    _fill_members(result, {"member_decode_requests": {"http://10.0.0.1:40000": 45.0}})
+    assert "http://10.0.0.2:40000" not in result.members
+
+
+def test_the_untrustworthy_router_gauge_stays_unmapped():
+    """🔴 Measured 2026-09-07 on a 1P1D that was serving traffic:
+    `vllm_router_active_workers` read 0. Surfacing it would show "no members"
+    on a healthy group."""
+    config = get_builtin_metrics_config()
+    mapping = config["runtime_mapping"]["vLLM"]["*"]
+    assert "vllm_router_active_workers" not in mapping
+    assert "vllm_router_pd_decode_errors" in mapping
+
+
+def test_a_healthy_recompute_tail_reads_below_one_not_zero():
+    """🔴 The false alarm this pins. vLLM's first bucket is `le=1.0` and
+    `histogram_quantile` interpolates inside the bucket it lands in, so a
+    group that recomputed nothing reports `quantile * 1.0` — measured 0.95 and
+    0.99 on a working 1P1D. A reader (or a threshold) treating 0.99 as "one
+    token recomputed" would alarm on a perfect deployment; the real signal is
+    the jump past the next bucket edges, which are 2, 5 and 10."""
+    result = PDMetricsPublic(available=True)
+    _fill_tokens(
+        result,
+        {
+            "external_tokens": 186.0,
+            "recomputed_tokens_p95": 0.95,
+            "recomputed_tokens_p99": 0.99,
+        },
+        WINDOW,
+    )
+    # Interpolation inside the first bucket, not a recomputation.
+    assert result.recomputed_tokens_p95 < 1.0
+    assert result.recomputed_tokens_p99 < 1.0

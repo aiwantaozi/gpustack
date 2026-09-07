@@ -77,7 +77,12 @@ class PDRoleMetrics(BaseModel):
     """
 
     pending_requests: Optional[float] = None
-    """Mean queue depth over the window.
+    """Queue depth at the newest sample in the window — not its mean.
+
+    Declared as `gauge_last` because queue depth describes *now*: averaged
+    over fifteen minutes, a backlog that formed a minute ago is divided by
+    fifteen and reads as calm, and one that cleared ten minutes ago keeps
+    being reported until the window rolls past it.
 
     The only objective signal for whether the prefill:decode ratio is right,
     and which way it is wrong: a queue that only ever builds on one side is
@@ -168,6 +173,63 @@ class PDKVTransferMetrics(BaseModel):
     nobody ever read it. Null — not zero — for connectors that export no such
     counter, because "we cannot see this" is not "it did not happen"."""
 
+    external_tokens: Optional[float] = None
+    """Prompt tokens that arrived over the wire in the window, read off the
+    engine rather than the connector.
+
+    🔑 This is the volume figure for every connector, including the ones that
+    export nothing: `bytes_per_second` above needs the connector's own byte
+    counter, and this needs only the engine's token accounting.
+    """
+
+    external_tokens_per_second: Optional[float] = None
+    """`external_tokens` over wall clock — the input to a derived bandwidth.
+
+    🔴 Deliberately left as tokens rather than converted here. Bytes need the
+    model's KV footprint (`2 * kv_heads * head_dim * layers * dtype`, or the
+    MLA latent), and deriving that means reading the pretrained config, which
+    hits disk or the network. This endpoint is polled, so the read belongs on
+    `POST /v2/models/kv-transfer-budget`, which already does it and already
+    returns `bytes_per_token` — multiply the two there:
+
+        bytes_per_second ≈ external_tokens_per_second * budget.bytes_per_token
+
+    ⚠️ Label the product as derived, not measured. Validated against the wire
+    on 910B2 (2026-09-07): a 4809-token request predicted 472.7 MB and the
+    NPU RoCE counters moved 485.5 MB, 2.7% high — the excess is protocol
+    overhead, and it is an estimate of the KV payload, not of link traffic.
+
+    ⚠️ Divided by wall clock, unlike `bytes_per_second`, which divides by time
+    spent transferring. The two are not interchangeable: this one reads lower
+    on a mostly-idle window, which is the honest answer for "how much KV is
+    this deployment moving" and the wrong one for "how fast is the link".
+    """
+
+
+class PDMemberMetrics(BaseModel):
+    """One upstream engine's share of the traffic, as the router saw it.
+
+    🔑 Keyed by the router's own `worker` label, which is the engine's URL
+    (`http://ip:port`) and NOT a GPUStack worker — one host runs several
+    members on an xPyD group, so keying on the host would collapse exactly
+    the members this exists to tell apart.
+
+    Why a group-level verdict is not enough: `status` answers "is this group
+    disaggregating", and a group reads `effective` with one decode taking no
+    traffic at all. These answer "which member", which is the question a ratio
+    change or a stuck member is actually about.
+    """
+
+    prefill_requests: Optional[float] = None
+    decode_requests: Optional[float] = None
+
+    decode_errors: Optional[float] = None
+    """Dispatches to this member the router saw fail, counted before its own
+    retry. Non-zero here over a window where every request returned 200 is
+    the share of traffic a retry covered up — and a retry that keeps landing
+    on one bad decode is invisible in a total, which is why this is per
+    member."""
+
 
 class PDMetricsPublic(BaseModel):
     """One window's answer for one disaggregated group.
@@ -225,8 +287,35 @@ class PDMetricsPublic(BaseModel):
     Surfaced rather than inferred, because the fallback is much weaker than
     the real thing and a reader has to be able to tell which they have."""
 
+    recomputed_tokens_p95: Optional[float] = None
+    recomputed_tokens_p99: Optional[float] = None
+    """New KV tokens the RECEIVING role computed per request, at the tail.
+
+    The per-request companion to `kv_transfers_per_request`, and the pair have
+    opposite blind spots. That ratio sums every token in the window, so a
+    minority of requests recomputing whole prompts is diluted by the majority
+    that did not — 5% of requests, in a window with mixed prompt lengths, can
+    leave it at 0.97 and inside `effective`. These percentiles jump to those
+    requests' prompt length instead.
+
+    🔴 **Healthy is below 1.0, NOT 0.** vLLM's first bucket is `le=1.0` and
+    `histogram_quantile` interpolates inside the bucket it lands in, so a
+    group where every request recomputed nothing reads `quantile × 1.0` —
+    p95 = 0.95 and p99 = 0.99, measured on a working 1P1D on 2026-09-07 where
+    all of decode's requests sat in that bucket. Reading 0.99 as "almost one
+    token recomputed" would be a false alarm on a perfect deployment; the
+    number to react to is the jump to the hundreds or thousands that a real
+    recomputation produces, because the next bucket edges are 2, 5, 10.
+
+    Read on the receiving role only. On prefill the same histogram is the work
+    prefill exists to do, so a threshold there would fire on every healthy
+    group."""
+
     kv_transfer: PDKVTransferMetrics = PDKVTransferMetrics()
     roles: Dict[str, PDRoleMetrics] = {}
+    members: Dict[str, PDMemberMetrics] = {}
+    """Per upstream engine, keyed by the router's `worker` label. Empty when
+    the mode's router exports no per-worker counters — absent, not zero."""
 
     kv_transfers_per_request_series: List[List[Optional[float]]] = []
     kv_transfer_bytes_per_second_series: List[List[Optional[float]]] = []
@@ -395,6 +484,51 @@ def _fill_verdict(result: PDMetricsPublic, values: dict) -> None:
     result.status = judge(count, result.routed_request_count)
 
 
+_MEMBER_FIELDS = {
+    "member_prefill_requests": "prefill_requests",
+    "member_decode_requests": "decode_requests",
+    "member_decode_errors": "decode_errors",
+}
+
+
+def _fill_members(result: PDMetricsPublic, by_worker: dict) -> None:
+    """Per-member figures, for whichever members the router reported.
+
+    Not seeded from the group's instances: a member the router never
+    dispatched to has no series, and inventing a zero row for it would say
+    "measured, and it took nothing" where the truth is "the router has not
+    mentioned it". The absence is the finding.
+    """
+    for key, per_worker in by_worker.items():
+        field = _MEMBER_FIELDS.get(key)
+        if field is None:
+            continue
+        for worker, value in per_worker.items():
+            if not worker:
+                # An unlabelled series cannot be attributed to a member and
+                # must not be folded into one.
+                continue
+            entry = result.members.setdefault(worker, PDMemberMetrics())
+            setattr(entry, field, value)
+
+
+def _fill_tokens(result: PDMetricsPublic, values: dict, window_seconds: int) -> None:
+    """The volume figures the engine can give for any connector.
+
+    Separate from `_fill_verdict` because that one returns as soon as it has
+    a verdict, and these are worth reporting on every path — including the
+    one where the token ratio was unavailable and the transfer counters
+    answered instead.
+    """
+    external = values.get("external_tokens")
+    result.kv_transfer.external_tokens = external
+    if external is not None and window_seconds > 0:
+        result.kv_transfer.external_tokens_per_second = external / window_seconds
+
+    result.recomputed_tokens_p95 = values.get("recomputed_tokens_p95")
+    result.recomputed_tokens_p99 = values.get("recomputed_tokens_p99")
+
+
 def _fill_roles(result: PDMetricsPublic, by_role: dict) -> None:
     """Per-role figures, for whichever roles the series actually carried.
 
@@ -509,7 +643,7 @@ async def collect_pd_metrics(
 
             now = time.time()
             values = {}
-            by_role = {}
+            grouped: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
             for key, expression in queries.items():
                 try:
                     rows = await query_instant(client, base_url, expression, now)
@@ -518,9 +652,15 @@ async def collect_pd_metrics(
                     # per-worker router counter should still get its numerator.
                     logger.debug("PD metric query %r failed: %s", key, e)
                     rows = []
-                if declared[key].group_by:
-                    by_role[key] = {
-                        row.get("metric", {}).get("role", ""): instant_value(row)
+                group_by = declared[key].group_by
+                if group_by:
+                    # Keyed on the label the declaration named, not on `role`:
+                    # the per-member queries group on `worker`, and reading
+                    # `role` there would put every one of them under the same
+                    # empty key and silently keep only the last.
+                    label = group_by[0]
+                    grouped.setdefault(label, {})[key] = {
+                        row.get("metric", {}).get(label, ""): instant_value(row)
                         for row in rows
                     }
                 else:
@@ -528,7 +668,9 @@ async def collect_pd_metrics(
 
             _fill_transfer(result, values, mode)
             _fill_verdict(result, values)
-            _fill_roles(result, by_role)
+            _fill_tokens(result, values, window_seconds)
+            _fill_roles(result, grouped.get("role", {}))
+            _fill_members(result, grouped.get("worker", {}))
             _derive_role_rates(result, window_seconds)
 
             step = max(window_seconds // 60, 15)

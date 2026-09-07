@@ -12,7 +12,12 @@ from abc import ABC, abstractmethod
 from transformers import PretrainedConfig
 
 from gpustack_runner.runner import BackendVersionedRunner
-from gpustack_runtime.deployer import ContainerResources, ContainerMount, ContainerPort
+from gpustack_runtime.deployer import (
+    ContainerResources,
+    ContainerMount,
+    ContainerMountModeEnum,
+    ContainerPort,
+)
 from gpustack_runtime.deployer.__utils__ import compare_versions
 from gpustack_runtime.detector import (
     ManufacturerEnum,
@@ -1111,6 +1116,25 @@ class InferenceServer(ABC):
                     path=model_dir,
                 ),
             )
+
+        # The PD recipe's host mounts, unlike the model directory, apply under
+        # mirrored deployment too: mirroring copies what the *worker* container
+        # happens to have, and a transport's host file is a property of the
+        # recipe rather than of how the worker was launched. The runtime merges
+        # explicit mounts with mirrored ones and keeps the explicit entry, so
+        # naming a path the worker already carries is harmless.
+        pd_injection = self._pd_injection()
+        if pd_injection and pd_injection.host_mounts:
+            declared = {m.path for m in mounts}
+            for path in pd_injection.host_mounts:
+                if path in declared:
+                    continue
+                mounts.append(
+                    ContainerMount(
+                        path=path,
+                        mode=ContainerMountModeEnum.ROX,
+                    ),
+                )
         return mounts
 
     def _get_configured_ports(self) -> List[ContainerPort]:

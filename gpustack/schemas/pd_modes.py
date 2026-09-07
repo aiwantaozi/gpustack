@@ -306,6 +306,29 @@ class PDModeRole(BaseModel):
     env: Dict[str, str] = {}
     args: List[str] = []
     files: Dict[str, str] = {}
+    host_mounts: List[str] = []
+    """Host paths the engine container needs read-only, same path inside.
+
+    A fifth injection channel, and the one the other four cannot stand in
+    for: a transport that reads a host file the accelerator runtime does not
+    inject needs that file *present*, and `files` writes contents GPUStack
+    composes rather than passing through something only the host knows.
+
+    🔴 Measured on 910B2 x8 x2 (2026-09-07): vllm-ascend's Mooncake uses
+    AscendDirectTransport, which resolves a peer's host address to the
+    per-card RoCE addresses through `/etc/hccn.conf`. The Ascend container
+    runtime injects the devices and the driver but not that file, so
+    cross-host `batch_transfer_sync_read` returned -1 on every rank while
+    same-host transfers succeeded — and the connector logs the exception,
+    sends its done signal anyway and lets decode answer 200 with garbage.
+    vllm-ascend's own multi-node guide says it plainly: *"Ensure that the
+    hccn.conf file exists in the environment. If using Docker, mount it into
+    the container."*
+
+    Declared per recipe rather than mounted for every Ascend deployment: a
+    non-PD model on the same cards needs nothing of the kind, and the reason
+    this path needs it belongs next to the transport that reads it.
+    """
 
     @model_validator(mode="after")
     def check_port_names_unique(self) -> "PDModeRole":

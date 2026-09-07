@@ -896,6 +896,14 @@ modes:
           # leaving the instance wedged in `starting`. Admission refuses that
           # combination rather than letting the band absorb it.
           - { name: kv_port, count: "{{accelerator_count}}", inject_to: args }
+        # AscendDirectTransport resolves a peer's host address to the
+        # per-card RoCE addresses through this file, and the Ascend container
+        # runtime injects the devices and driver but not it. Without the mount
+        # cross-host transfers fail on every rank with ret -1 while same-host
+        # ones succeed — measured on 910B2 x8 x2, and the connector answers
+        # 200 with garbage rather than failing. vllm-ascend's multi-node guide
+        # states the requirement directly.
+        host_mounts: ["/etc/hccn.conf"]
         connector:
           kv_connector: MooncakeHybridConnector
           kv_role: kv_producer
@@ -933,6 +941,9 @@ modes:
           # Same rule as prefill's: one port per worker rank, so the band is
           # the member's card count.
           - { name: kv_port, count: "{{accelerator_count}}", inject_to: args }
+        # Same requirement, and it has to be on both sides: decode is the one
+        # that pulls, prefill is the one whose card addresses get resolved.
+        host_mounts: ["/etc/hccn.conf"]
         connector:
           kv_connector: MooncakeHybridConnector
           kv_role: kv_consumer

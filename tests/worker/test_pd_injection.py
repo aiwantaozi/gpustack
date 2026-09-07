@@ -636,3 +636,85 @@ def test_a_declared_parallelism_is_never_overwritten():
         )
         == {}
     )
+
+
+# --- host mounts ----------------------------------------------------------- #
+
+
+def test_the_ascend_recipe_asks_for_the_hccn_map_on_both_sides():
+    """🔴 The mount is what makes cross-host transfers work at all.
+
+    AscendDirectTransport resolves a peer's host address to per-card RoCE
+    addresses through `/etc/hccn.conf`, and the Ascend container runtime
+    injects the devices and the driver but not that file. Measured on 910B2
+    x8 x2: without it every rank's `batch_transfer_sync_read` returns -1
+    cross-host while same-host transfers succeed, and the connector logs the
+    exception, sends its done signal and lets decode answer 200 with garbage.
+    """
+    # The recipe's connector names both roles' parallelism, so both roles
+    # have to declare it or the render refuses before reaching the mounts.
+    roles = [
+        RoleSpec(
+            name="prefill", replicas=1, backend_parameters=["--tensor-parallel-size=4"]
+        ),
+        RoleSpec(
+            name="decode", replicas=1, backend_parameters=["--tensor-parallel-size=2"]
+        ),
+        RoleSpec(name="router", replicas=1, cpu_only=True),
+    ]
+    for role in ("prefill", "decode"):
+        injection = render_pd_injection(
+            _model(mode=PDModeEnum.VLLM_ASCEND_MOONCAKE, roles=roles),
+            _instance(
+                role=role, named_ports={"kv_port": PortBand(base=41100, count=8)}
+            ),
+            _variables(role=role),
+        )
+        assert injection.host_mounts == ["/etc/hccn.conf"], role
+
+
+def test_a_recipe_that_needs_no_host_file_asks_for_none():
+    """NIXL reaches its peers over the host stack, so there is nothing to
+    mount — and a mount every recipe carried would be a host path bound into
+    containers that have no use for it."""
+    injection = render_pd_injection(_model(), _instance(), _variables())
+    assert injection.host_mounts == []
+
+
+def test_an_unrendered_mount_path_stops_the_launch():
+    """Same class as an unrendered env: the bind either fails or creates an
+    empty directory where the transport expects a file, and neither says
+    why."""
+    from gpustack.schemas.pd_modes import PDMode, PDModeRole
+    from gpustack.worker import pd_injection as module
+
+    mode = PDMode(
+        name=PDModeEnum.VLLM_NIXL.value,
+        backends=["vLLM"],
+        roles={"prefill": PDModeRole(host_mounts=["/etc/{{nowhere}}.conf"])},
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(module, "get_pd_mode", lambda name: mode)
+        with pytest.raises(PDInjectionError) as excinfo:
+            render_pd_injection(_model(), _instance(), _variables())
+    assert "{{nowhere}}" in str(excinfo.value)
+
+
+def test_the_mount_reaches_the_container_read_only():
+    """The channel only pays off if the container actually gets it, so the
+    assertion is on the runtime's mount list rather than on the injection."""
+    from gpustack_runtime.deployer import ContainerMountModeEnum
+
+    from gpustack.worker.backends.base import InferenceServer
+    from gpustack.worker.pd_injection import PDInjection
+
+    class _Stub:
+        _model_path = None
+
+        def _pd_injection(self):
+            return PDInjection(host_mounts=["/etc/hccn.conf"])
+
+    mounts = InferenceServer._get_configured_mounts(_Stub())
+    assert [(m.path, m.mode) for m in mounts] == [
+        ("/etc/hccn.conf", ContainerMountModeEnum.ROX)
+    ]

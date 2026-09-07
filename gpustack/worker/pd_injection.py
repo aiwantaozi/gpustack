@@ -95,9 +95,12 @@ class PDInjection(BaseModel):
     """Container path -> contents; written by the serving script before the
     engine starts (Mooncake's transfer-engine config is read only from a file
     the engine is pointed at, so nothing else can carry it)."""
+    host_mounts: List[str] = []
+    """Host paths to bind read-only at the same path inside the container.
+    See `PDModeRole.host_mounts` for why this cannot be a `files` entry."""
 
     def is_empty(self) -> bool:
-        return not (self.env or self.args or self.files)
+        return not (self.env or self.args or self.files or self.host_mounts)
 
 
 def render_pd_injection(
@@ -193,7 +196,16 @@ def render_pd_injection(
         for path, content in (role.files or {}).items()
     }
 
-    injection = PDInjection(env=env, args=args, files=files)
+    # Deduplicated in declaration order: two roles of one recipe naming the
+    # same path is normal, and a repeated bind is an error in some runtimes.
+    host_mounts = list(
+        dict.fromkeys(
+            render(path, context, context=f"{where} host mount")
+            for path in (role.host_mounts or [])
+        )
+    )
+
+    injection = PDInjection(env=env, args=args, files=files, host_mounts=host_mounts)
     _refuse_unrendered(injection, where)
     logger.info(
         "PD injection for role '%s' of mode '%s': %d env, %d args, %d files.",
@@ -236,6 +248,12 @@ def _refuse_unrendered(injection: "PDInjection", where: str) -> None:
             unrendered.append(f"{name}={match.group(0)}")
     for token in injection.args:
         for match in _ANY_PLACEHOLDER.finditer(str(token)):
+            unrendered.append(match.group(0))
+    for path in injection.host_mounts:
+        # An unrendered mount path is the same class of failure as an
+        # unrendered env: the bind either fails or creates an empty directory
+        # where the transport expects a file, and neither says why.
+        for match in _ANY_PLACEHOLDER.finditer(str(path)):
             unrendered.append(match.group(0))
 
     if not unrendered:

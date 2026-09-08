@@ -798,6 +798,17 @@ class BenchmarkListParams(ListParams):
 
 
 class BenchmarkCreate(BenchmarkBase):
+    # The route to drive, in `route` mode. Input only — the row keys on the
+    # model, and the name is recorded on the snapshot rather than as a column:
+    # what a route resolves to is editable (targets, weights, a canary), so it
+    # is a fact about the run, not a handle the run is addressed by.
+    #
+    # Optional, because an API client that names only a model still gets the
+    # route derived for it. The form sends it because it lists routes: a model
+    # can sit behind more than one, and picking for the user would measure
+    # whichever the server happened to choose.
+    route_name: Optional[str] = None
+
     # A run targets a MODEL. Naming a member is still accepted — the instance
     # list page's "run benchmark" action does exactly that, and a client that
     # names one is naming its model too — but it is no longer required, and

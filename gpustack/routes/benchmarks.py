@@ -689,6 +689,49 @@ async def _resolve_target_endpoint(
     return sorted(servable, key=lambda m: m.id)[0]
 
 
+async def _effective_name(session: SessionDep, route: ModelRoute) -> str:
+    owner = await Principal.one_by_id(session, route.owner_principal_id)
+    return effective_route_name(
+        route.name,
+        getattr(owner, "name", None),
+        getattr(owner, "id", None) == platform_principal_id(),
+    )
+
+
+async def _resolve_named_route(
+    session: SessionDep, model: Model, requested: str
+) -> str:
+    """The route the caller named, once it is confirmed to front this model.
+
+    A model can sit behind several routes — an alias, a canary — and they are
+    not the same measurement: a canary sends a share of the load to a
+    different model entirely. So the form names the one it listed rather than
+    letting the server pick, and this checks that the pair actually holds
+    instead of trusting it: a route that does not front this model would
+    measure something else under this model's name, and the report would say
+    nothing about the mismatch.
+    """
+    targets = await ModelRouteTarget.all_by_fields(
+        session,
+        {"model_id": model.id, "state": TargetStateEnum.ACTIVE, "deleted_at": None},
+    )
+    for target in targets:
+        route = await ModelRoute.one_by_id(session, target.route_id)
+        if route is None:
+            continue
+        name = await _effective_name(session, route)
+        if requested in (name, route.name):
+            return name
+
+    raise BadRequestException(
+        message=(
+            f"Route '{requested}' does not have an active target for model "
+            f"'{model.name}', so a run through it would not measure this "
+            f"deployment."
+        )
+    )
+
+
 async def _resolve_route_name(session: SessionDep, model: Model) -> str:
     """The name a client calls this deployment by.
 
@@ -727,12 +770,7 @@ async def _resolve_route_name(session: SessionDep, model: Model) -> str:
         raise BadRequestException(
             message=f"Route '{target.route_name}' no longer exists"
         )
-    owner = await Principal.one_by_id(session, route.owner_principal_id)
-    return effective_route_name(
-        route.name,
-        getattr(owner, "name", None),
-        getattr(owner, "id", None) == platform_principal_id(),
-    )
+    return await _effective_name(session, route)
 
 
 async def _resolve_placement(
@@ -790,11 +828,15 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
     # against something, the placement still has to land where the weights are,
     # and the snapshot still describes the deployment. What changes is only
     # where the load is SENT, which the runner reads off `target_mode`.
-    route_name = (
-        await _resolve_route_name(session, model)
-        if mutated.target_mode == BenchmarkTargetModeEnum.ROUTE
-        else None
-    )
+    route_name = None
+    if mutated.target_mode == BenchmarkTargetModeEnum.ROUTE:
+        # Named by the caller when it had a list to pick from (the form does),
+        # derived when it did not (an API client naming only a model).
+        route_name = (
+            await _resolve_named_route(session, model, benchmark_in.route_name)
+            if benchmark_in.route_name
+            else await _resolve_route_name(session, model)
+        )
 
     mutated.model_id = model.id
     mutated.model_name = model.name

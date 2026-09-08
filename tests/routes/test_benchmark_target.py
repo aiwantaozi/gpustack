@@ -349,3 +349,67 @@ class TestRouteMode:
             BenchmarkCreate(name="bm", model_id=1).target_mode
             is BenchmarkTargetModeEnum.INSTANCE
         )
+
+
+class TestANamedRouteIsChecked:
+    """A model can sit behind several routes, and they are not the same
+    measurement: a canary sends a share of the load to a different model
+    entirely. So the form names the route it listed, and the pairing is
+    verified rather than trusted."""
+
+    def _targets(self, route_ids):
+        return [
+            SimpleNamespace(
+                id=i + 1,
+                model_id=1,
+                route_id=rid,
+                route_name=f"r{rid}",
+                state=TargetStateEnum.ACTIVE,
+            )
+            for i, rid in enumerate(route_ids)
+        ]
+
+    async def _resolve(self, requested, route_ids=(5, 6)):
+        routes = {
+            5: SimpleNamespace(name="alias", owner_principal_id=9),
+            6: SimpleNamespace(name="canary", owner_principal_id=9),
+        }
+        with (
+            patch.object(
+                route.ModelRouteTarget,
+                "all_by_fields",
+                AsyncMock(return_value=self._targets(route_ids)),
+            ),
+            patch.object(
+                route.ModelRoute,
+                "one_by_id",
+                AsyncMock(side_effect=lambda _s, rid: routes.get(rid)),
+            ),
+            patch.object(
+                route.Principal,
+                "one_by_id",
+                AsyncMock(
+                    return_value=SimpleNamespace(
+                        id=route.platform_principal_id(), name="platform"
+                    )
+                ),
+            ),
+        ):
+            return await route._resolve_named_route(None, _plain_model(), requested)
+
+    @pytest.mark.asyncio
+    async def test_the_named_route_is_the_one_used(self):
+        # Not "the first active one": picking for the user would measure
+        # whichever route the server happened to choose.
+        assert await self._resolve("canary") == "canary"
+
+    @pytest.mark.asyncio
+    async def test_a_route_that_does_not_front_this_model_is_refused(self):
+        with pytest.raises(BadRequestException) as excinfo:
+            await self._resolve("someone-elses-route")
+        assert "does not have an active target" in excinfo.value.message
+
+    @pytest.mark.asyncio
+    async def test_the_prefixed_and_bare_names_both_resolve(self):
+        # The form may hold either, and both address the same route.
+        assert await self._resolve("alias", route_ids=(5,)) == "alias"

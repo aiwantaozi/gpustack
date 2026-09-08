@@ -47,6 +47,32 @@ class TestTheDoorExists:
         assert proxy.endpoint is public.endpoint
 
 
+class TestTheProbeThatComesFirst:
+    """guidellm validates a backend by GETting `{target}/health` before it
+    sends anything, and a non-200 kills the run at startup -- measured against
+    a live server as `404 Not Found for /v2/benchmark-proxy/health`, with no
+    request ever made."""
+
+    def test_the_prefix_answers_health(self):
+        assert "/v2/benchmark-proxy/health" in {
+            r.path for r in _routes_under("/v2/benchmark-proxy")
+        }
+
+    def test_the_probe_is_authenticated_like_everything_else(self):
+        # Which is what makes it worth probing: reaching it proves the token
+        # works, instead of the run discovering that as 401s mid-ramp.
+        health = next(
+            r
+            for r in _routes_under("/v2/benchmark-proxy")
+            if r.path.endswith("/health")
+        )
+        assert get_worker_principal in {d.call for d in health.dependant.dependencies}
+
+    @pytest.mark.asyncio
+    async def test_it_answers_ok(self):
+        assert await routes_module.benchmark_proxy_health() == {"status": "ok"}
+
+
 class TestTheDoorIsGuarded:
     def _dependency_calls(self, route):
         return {d.call for d in route.dependant.dependencies}

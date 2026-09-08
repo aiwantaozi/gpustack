@@ -512,6 +512,23 @@ async def mark_internal_inference(request: Request):
 benchmark_proxy_router = APIRouter(
     dependencies=[Depends(get_worker_principal), Depends(mark_internal_inference)]
 )
+
+
+@benchmark_proxy_router.get("/health", include_in_schema=False)
+async def benchmark_proxy_health():
+    """What the load generator probes before it starts.
+
+    guidellm validates a backend by GETting `{target}/health` with the auth
+    headers, and treats a non-200 as "cannot reach or configure this backend"
+    -- so without this the whole run dies before its first request. Serving it
+    on the prefix rather than switching the check off keeps the probe worth
+    making: reaching this handler proves both that the proxy is up and that
+    the worker token authenticates, which is the failure it would otherwise
+    discover as a wall of 401s mid-ramp.
+    """
+    return {"status": "ok"}
+
+
 benchmark_proxy_router.include_router(
     openai.get_api_router(),
     prefix="/v1",

@@ -88,6 +88,17 @@ def saturation_probe_path(benchmark_dir: str, benchmark_id: int) -> str:
     return f"{benchmark_dir}/{benchmark_id}__satprobe.json"
 
 
+def curve_outcome_path(benchmark_dir: str, benchmark_id: int) -> str:
+    """The ladder sidecar a manual-stages run writes when it returns.
+
+    Counterpart to `ramp_facts_path` for the other multi-point shape. Same
+    signal value: it exists only once the runner has finished walking the
+    stages, so its presence distinguishes "the container is gone because the
+    run ended" from "the container is gone because it died".
+    """
+    return f"{benchmark_dir}/{benchmark_id}__curve.json"
+
+
 def ramp_facts_path(benchmark_dir: str, benchmark_id: int) -> str:
     """The ramp's diagnostic sidecar: WHY the search stopped.
 

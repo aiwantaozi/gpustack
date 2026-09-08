@@ -525,6 +525,14 @@ class BenchmarkManager:
 
     def _sync_single_benchmark_state(self, benchmark: Benchmark):
         """Synchronize a single benchmark's state."""
+        if self._is_torn_down(benchmark.id):
+            # The row can still read RUNNING here after a terminal handler has
+            # patched it: this poll lists from the server, and the list can be
+            # served before the patch is visible. Without this guard the stale
+            # row re-enters the terminal path — one full teardown per tick until
+            # the write lands (observed 21 times for a single run).
+            return
+
         # Check for timeout
         if self._is_benchmark_timed_out(benchmark):
             self._handle_benchmark_timeout(benchmark)
@@ -554,6 +562,19 @@ class BenchmarkManager:
             return
 
         if self._is_workload_failed(workload):
+            if workload is None and self._runner_left_terminal_artifact(benchmark):
+                # Gone because it finished, not because it died. The container
+                # can be reaped between the runner returning and this 3-second
+                # poll, and on that path every point was already measured and
+                # written — reporting ERROR there put a red badge on a complete
+                # curve. The runner's terminal sidecar is what tells the two
+                # apart; completion re-reads the point files, so nothing is lost.
+                logger.info(
+                    f"Benchmark {benchmark.name}(id={benchmark.id}) workload is gone "
+                    "but the runner wrote its terminal artifact; treating as finished."
+                )
+                self._handle_benchmark_completion(benchmark)
+                return
             self._handle_benchmark_failure(benchmark)
             return
 
@@ -592,6 +613,28 @@ class BenchmarkManager:
             WorkloadStatusStateEnum.UNHEALTHY,
             WorkloadStatusStateEnum.FAILED,
         ]
+
+    def _runner_left_terminal_artifact(self, benchmark: Benchmark) -> bool:
+        """True when the runner got far enough to write its end-of-run sidecar.
+
+        One per load shape, each written only as the runner returns: `__curve`
+        for manual stages, `__ramp` for an adaptive ramp, and the single report
+        for a one-rate run. Only presence is checked — the file's contents are a
+        diagnostic, while the measurement lives in the point/stage reports that
+        the completion path re-reads.
+        """
+        d = self._benchmark_dir
+        for path in (
+            artifacts.curve_outcome_path(d, benchmark.id),
+            artifacts.ramp_facts_path(d, benchmark.id),
+            artifacts.single_report_path(d, benchmark.id),
+        ):
+            try:
+                if os.path.exists(path):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _handle_benchmark_timeout(self, benchmark: Benchmark):
         """Handle benchmark timeout.

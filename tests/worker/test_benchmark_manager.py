@@ -2296,3 +2296,81 @@ class TestTeardownIsIdempotent:
         assert len(mgr._torn_down_ids) == bm._TEARDOWN_MEMO_LIMIT
         assert not mgr._is_torn_down(0)
         assert mgr._is_torn_down(bm._TEARDOWN_MEMO_LIMIT + 49)
+
+
+class TestVanishedWorkloadIsNotAutomaticallyAFailure:
+    """The runner container can be reaped between the run returning and the
+    3-second state poll. Every point is already measured and written by then, so
+    calling that ERROR puts a red badge on a complete curve."""
+
+    def _mgr(self, tmp_path, calls):
+        mgr = object.__new__(BenchmarkManager)
+        mgr._benchmark_dir = str(tmp_path)
+        mgr._torn_down_ids = bm.OrderedDict()
+        mgr._is_benchmark_timed_out = lambda _b: False
+        mgr._is_provisioning = lambda _b: False
+        mgr._handle_benchmark_completion = lambda b: calls.append(("complete", b.id))
+        mgr._handle_benchmark_failure = lambda b: calls.append(("fail", b.id))
+        mgr._maybe_snapshot_logs = lambda _b: None
+        mgr._maybe_sync_partial_metrics = lambda _b: None
+        return mgr
+
+    def _run(self, monkeypatch, mgr, workload):
+        monkeypatch.setattr(bm, "get_workload", lambda *a, **k: workload)
+        mgr._sync_single_benchmark_state(
+            SimpleNamespace(id=35, name="b", namespace=None)
+        )
+
+    def test_gone_after_writing_the_curve_counts_as_finished(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        mgr = self._mgr(tmp_path, calls)
+        (tmp_path / "35__curve.json").write_text("{}")
+
+        self._run(monkeypatch, mgr, None)
+
+        assert calls == [("complete", 35)]
+
+    def test_gone_after_writing_the_ramp_sidecar_counts_as_finished(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        mgr = self._mgr(tmp_path, calls)
+        (tmp_path / "35__ramp.json").write_text("{}")
+
+        self._run(monkeypatch, mgr, None)
+
+        assert calls == [("complete", 35)]
+
+    def test_gone_with_no_terminal_artifact_is_still_a_failure(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        mgr = self._mgr(tmp_path, calls)
+
+        self._run(monkeypatch, mgr, None)
+
+        assert calls == [("fail", 35)]
+
+    def test_an_unhealthy_workload_is_a_failure_even_with_the_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        mgr = self._mgr(tmp_path, calls)
+        (tmp_path / "35__curve.json").write_text("{}")
+        workload = SimpleNamespace(state=bm.WorkloadStatusStateEnum.UNHEALTHY)
+
+        self._run(monkeypatch, mgr, workload)
+
+        assert calls == [("fail", 35)]
+
+    def test_a_torn_down_row_is_not_handled_again(self, tmp_path, monkeypatch):
+        calls = []
+        mgr = self._mgr(tmp_path, calls)
+        (tmp_path / "35__curve.json").write_text("{}")
+        mgr._record_teardown(35)
+
+        self._run(monkeypatch, mgr, None)
+
+        assert calls == []

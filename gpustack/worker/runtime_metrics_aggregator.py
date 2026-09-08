@@ -127,8 +127,21 @@ class RuntimeMetricsAggregator:
         if model_instance.api_detected_backend_version is not None:
             return model_instance.api_detected_backend_version
 
+        api_endpoint = f"{model_instance.worker_ip}:{_api_port(model_instance)}"
+        if api_endpoint != endpoint:
+            # The caller hands us the EXPOSITION endpoint, which for a router is a
+            # separate port band (see `_metrics_port`). `/version` does not live
+            # there. Worse than a 404: the router's exposition listener answers
+            # EVERY path with 200 + Prometheus text, so probing it returns a body
+            # that is not JSON and the parse raises once per scrape — an ERROR
+            # every few seconds that reads like metrics collection is broken when
+            # only the version probe is.
+            logger.trace(
+                f"Instance {model_instance.id} exposes metrics on a separate port; "
+                f"probing the API port {api_endpoint} for its runtime version."
+            )
         version = self._metrics_client.fetch_runtime_version_from_endpoint(
-            endpoint, model_instance.backend
+            api_endpoint, model_instance.backend
         )
         if version is not None:
             self._update_model_instance(
@@ -422,6 +435,16 @@ _METRIC_FAMILY_CLASS = {
     "counter": CounterMetricFamily,
     "summary": SummaryMetricFamily,
 }
+
+
+def _api_port(mi) -> int:
+    """Where this instance serves its HTTP API.
+
+    Separate from `_metrics_port` because the two coincide for an engine and
+    diverge for a router. Anything asking a question of the SERVER (its version,
+    its health) belongs here; only the Prometheus scrape belongs on the other.
+    """
+    return mi.port or mi.ports[0]
 
 
 def _metrics_port(mi) -> int:

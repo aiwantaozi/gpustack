@@ -672,6 +672,7 @@ class TestQueueCancelGuard:
         mgr = object.__new__(BenchmarkManager)
         mgr._benchmark_queue = deque()
         mgr._canceled_ids = set()
+        mgr._torn_down_ids = bm.OrderedDict()
         mgr._provisioning_processes = {}
         mgr._benchmark_by_id = {}
         mgr._container_log_offset = {}
@@ -2187,3 +2188,111 @@ class TestAnUnreadablePointSaysWhy:
         collected = mgr._aggregate_points(benchmark, [])
         assert collected.skipped == 0
         assert collected.skipped_reason is None
+
+
+class TestTeardownIsIdempotent:
+    """The watch replays terminal rows on every reconnect. Teardown is not
+    repeatable — the row and the workload it acts on are already gone — so a
+    replay used to spin: finalize (404) -> fetch logs (no workload) -> delete
+    workload (no workload), forever, at ~3/s, starving every queued run behind
+    it."""
+
+    def _mgr(self, calls):
+        mgr = object.__new__(BenchmarkManager)
+        mgr._worker_id_getter = lambda: 7
+        mgr._canceled_ids = set()
+        mgr._torn_down_ids = bm.OrderedDict()
+        mgr._provisioning_processes = {}
+        mgr._benchmark_by_id = {}
+        mgr._container_log_offset = {}
+        mgr._last_log_snapshot_at = {}
+        mgr._partial_synced_count = {}
+        mgr._last_partial_sync_at = {}
+        mgr._active_benchmark_id = None
+        mgr._active_benchmark_started_at = None
+        mgr._is_provisioning = lambda _b: False
+        mgr._delete_workload_calls = calls
+        return mgr
+
+    def _event(self, etype, state):
+        return SimpleNamespace(
+            type=etype,
+            data=SimpleNamespace(
+                id=27, name="b", worker_id=7, state=state, namespace=None
+            ),
+        )
+
+    def _patch_common(self, monkeypatch, mgr, calls):
+        monkeypatch.setattr(
+            bm.Benchmark, "model_validate", staticmethod(lambda d: d), raising=False
+        )
+        monkeypatch.setattr(
+            bm, "delete_workload", lambda *a, **k: calls.append("delete")
+        )
+
+    def test_replayed_delete_tears_down_once(self, monkeypatch):
+        calls = []
+        mgr = self._mgr(calls)
+        self._patch_common(monkeypatch, mgr, calls)
+
+        event = self._event(bm.EventType.DELETED, bm_schemas.BenchmarkStateEnum.RUNNING)
+        for _ in range(5):
+            mgr._handle_benchmark_event(event)
+
+        assert calls == ["delete"]
+        assert mgr._is_torn_down(27)
+
+    def test_replayed_stop_schedules_one_teardown(self, monkeypatch):
+        calls = []
+        mgr = self._mgr(calls)
+        self._patch_common(monkeypatch, mgr, calls)
+        scheduled = []
+        monkeypatch.setattr(
+            bm.asyncio, "create_task", lambda coro: (coro.close(), scheduled.append(1))
+        )
+
+        event = self._event(bm.EventType.UPDATED, bm_schemas.BenchmarkStateEnum.STOPPED)
+        mgr._handle_benchmark_event(event)
+        # The async handler is what calls _stop_benchmark; stand in for it.
+        mgr._stop_benchmark(event.data)
+        for _ in range(5):
+            mgr._handle_benchmark_event(event)
+
+        assert len(scheduled) == 1
+        assert calls == ["delete"]
+
+    def test_re_enqueue_rearms_the_guard(self, monkeypatch):
+        import asyncio
+
+        calls = []
+        mgr = self._mgr(calls)
+        self._patch_common(monkeypatch, mgr, calls)
+        mgr._benchmark_queue = deque()
+        mgr._queue_lock = asyncio.Lock()
+
+        async def _noop_state(_id, **_kw):
+            return None
+
+        mgr._update_benchmark_state = _noop_state
+
+        deleted = self._event(
+            bm.EventType.DELETED, bm_schemas.BenchmarkStateEnum.RUNNING
+        )
+        mgr._handle_benchmark_event(deleted)
+        assert mgr._is_torn_down(27)
+
+        asyncio.run(mgr._enqueue_benchmark(deleted.data))
+        assert not mgr._is_torn_down(27)
+        assert 27 not in mgr._canceled_ids
+
+        mgr._handle_benchmark_event(deleted)
+        assert calls == ["delete", "delete"]
+
+    def test_memo_is_bounded(self):
+        mgr = self._mgr([])
+        for i in range(bm._TEARDOWN_MEMO_LIMIT + 50):
+            mgr._record_teardown(i)
+
+        assert len(mgr._torn_down_ids) == bm._TEARDOWN_MEMO_LIMIT
+        assert not mgr._is_torn_down(0)
+        assert mgr._is_torn_down(bm._TEARDOWN_MEMO_LIMIT + 49)

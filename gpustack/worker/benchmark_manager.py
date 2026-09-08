@@ -6,7 +6,7 @@ import re
 import time
 from typing import Dict, NamedTuple, Optional, Callable, List, Set, Tuple
 import logging
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 
 from gpustack_runtime.deployer import (
     delete_workload,
@@ -92,6 +92,13 @@ class CollectedResults(NamedTuple):
     skipped_reason: Optional[str] = None
 
 
+# How many finished benchmark ids to remember for the teardown guard below.
+# Only ids are kept, and the memo is consulted on the event path alone, so the
+# bound is about not growing without limit over a long worker uptime rather
+# than about cost per entry.
+_TEARDOWN_MEMO_LIMIT = 1024
+
+
 class BenchmarkManager:
     @property
     def _worker_id(self) -> int:
@@ -128,6 +135,7 @@ class BenchmarkManager:
     If the (sub)process exited, the benchmark is either running or failed.
     """
     _benchmark_by_id: Dict[int, Benchmark]
+    _torn_down_ids: "OrderedDict[int, None]"
     _benchmark_queue: deque
     _queue_lock: asyncio.Lock
     _worker_task: Optional[asyncio.Task]
@@ -158,6 +166,18 @@ class BenchmarkManager:
         # is never launched — the queue snapshot alone is racy (the stop can land
         # between popleft and _start_benchmark).
         self._canceled_ids: Set[int] = set()
+        # Ids whose teardown has already run. The watch re-delivers terminal
+        # events — every reconnect replays the current rows — and a STOPPED or
+        # DELETED replay used to re-run the whole terminal path each time:
+        # finalize the analysis, fetch the container logs, delete the workload.
+        # Once the row and its workload are both gone those three are pure
+        # failing I/O, and because each attempt logs and returns rather than
+        # raising, nothing ever broke the cycle: observed at ~3 teardowns/s for
+        # a benchmark that no longer existed, which also starved every run
+        # queued behind it (each was started and immediately marked
+        # "exited or unhealthy"). Cleared on re-enqueue so re-running the same
+        # row arms it again.
+        self._torn_down_ids = OrderedDict()
         self._worker_task = None
         self._active_benchmark_id = None
         self._active_benchmark_started_at = None
@@ -210,6 +230,11 @@ class BenchmarkManager:
 
         if event.type == EventType.DELETED:
             self._canceled_ids.add(benchmark.id)
+            if self._is_torn_down(benchmark.id):
+                # A replayed DELETED event. The teardown already ran, and the
+                # row and workload it would act on are gone, so re-running it
+                # only produces failing I/O — see `_torn_down_ids`.
+                return
             self._stop_benchmark(benchmark)
             logger.trace(
                 f"DELETED event: stopped deleted benchmark {benchmark.name}(id={benchmark.id})."
@@ -224,6 +249,10 @@ class BenchmarkManager:
             # Record the cancel synchronously (before the async handler runs) so
             # the queue worker can't start it in the meantime.
             self._canceled_ids.add(benchmark.id)
+            if self._is_torn_down(benchmark.id):
+                # Same as the DELETED branch above: the watch replays STOPPED
+                # rows on every reconnect, and the teardown is not repeatable.
+                return
             asyncio.create_task(self._handle_stop_benchmark_event(benchmark))
 
     async def _handle_stop_benchmark_event(self, benchmark: Benchmark):
@@ -245,8 +274,10 @@ class BenchmarkManager:
 
     async def _enqueue_benchmark(self, benchmark: Benchmark):
         async with self._queue_lock:
-            # A fresh enqueue supersedes any earlier cancel for this id.
+            # A fresh enqueue supersedes any earlier cancel for this id, and
+            # re-arms the teardown guard so the new run can be torn down.
             self._canceled_ids.discard(benchmark.id)
+            self._torn_down_ids.pop(benchmark.id, None)
             if benchmark.id not in [b.id for b in self._benchmark_queue]:
                 self._benchmark_queue.append(benchmark)
 
@@ -457,6 +488,8 @@ class BenchmarkManager:
         self._partial_synced_count.pop(benchmark.id, None)
         self._last_partial_sync_at.pop(benchmark.id, None)
         self._clear_active_benchmark(benchmark.id)
+
+        self._record_teardown(benchmark.id)
 
         logger.info(f"Stopped benchmark {benchmark.name}(id={benchmark.id})")
 
@@ -1435,6 +1468,23 @@ class BenchmarkManager:
     def _set_active_benchmark(self, benchmark_id: int):
         self._active_benchmark_id = benchmark_id
         self._active_benchmark_started_at = time.time()
+
+    def _record_teardown(self, benchmark_id: int):
+        """Remember that this benchmark's teardown has run.
+
+        Plain dict mutation on purpose: this is reached from the sync thread as
+        well as the event loop, and the module's other shared state takes the
+        same approach (see `_stop_benchmark` on why `_queue_lock` cannot cover
+        the thread). A lost race here costs one extra teardown, which is the
+        behaviour we already had, never a missed one.
+        """
+        self._torn_down_ids.pop(benchmark_id, None)
+        self._torn_down_ids[benchmark_id] = None
+        while len(self._torn_down_ids) > _TEARDOWN_MEMO_LIMIT:
+            self._torn_down_ids.popitem(last=False)
+
+    def _is_torn_down(self, benchmark_id: int) -> bool:
+        return benchmark_id in self._torn_down_ids
 
     def _clear_active_benchmark(self, benchmark_id: int):
         if self._active_benchmark_id == benchmark_id:

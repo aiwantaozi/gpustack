@@ -9,7 +9,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
-from sqlmodel import func
+from sqlmodel import func, or_
 from gpustack import envs
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -140,6 +140,9 @@ async def get_benchmarks(
     load_type: Optional[BenchmarkLoadTypeEnum] = Query(
         None, description="Filter by load type (fixed_rate / concurrency)."
     ),
+    target_mode: Optional[BenchmarkTargetModeEnum] = Query(
+        None, description="Filter by target mode (instance / route)."
+    ),
 ):
     return await _get_benchmarks(
         ctx=ctx,
@@ -151,6 +154,7 @@ async def get_benchmarks(
         dataset_name=dataset_name,
         profile=profile,
         load_type=load_type,
+        target_mode=target_mode,
     )
 
 
@@ -185,7 +189,7 @@ def _make_benchmark_visibility_filter(ctx):
     return _visible
 
 
-async def _get_benchmarks(
+async def _get_benchmarks(  # noqa: C901
     ctx,
     params: BenchmarkListParams,
     search: str = None,
@@ -195,6 +199,7 @@ async def _get_benchmarks(
     dataset_name: Optional[str] = None,
     profile: Optional[str] = None,
     load_type: Optional[BenchmarkLoadTypeEnum] = None,
+    target_mode: Optional[BenchmarkTargetModeEnum] = None,
 ):
     fuzzy_fields = {}
     if search:
@@ -212,6 +217,17 @@ async def _get_benchmarks(
     def _load_type_match(data) -> bool:
         return not load_type or data.load_type == load_type
 
+    # `target_mode` (instance / route) filter. A row written before the column
+    # existed can still hold NULL if it escaped the migration's backfill, and
+    # what it measured was an instance — so `instance` matches NULL too, keeping
+    # the two modes a partition of the list rather than losing rows between them.
+    def _target_mode_match(data) -> bool:
+        if not target_mode:
+            return True
+        if target_mode == BenchmarkTargetModeEnum.INSTANCE:
+            return data.target_mode in (None, BenchmarkTargetModeEnum.INSTANCE)
+        return data.target_mode == target_mode
+
     extra_conditions = list(tenant_list_conditions(ctx, Benchmark))
     if gpu_summary:
         extra_conditions.append(
@@ -227,6 +243,15 @@ async def _get_benchmarks(
         )
     if load_type:
         extra_conditions.append(Benchmark.load_type == load_type)
+    if target_mode == BenchmarkTargetModeEnum.INSTANCE:
+        extra_conditions.append(
+            or_(
+                Benchmark.target_mode == target_mode,
+                col(Benchmark.target_mode).is_(None),
+            )
+        )
+    elif target_mode:
+        extra_conditions.append(Benchmark.target_mode == target_mode)
 
     _benchmark_visible = _make_benchmark_visibility_filter(ctx)
 
@@ -239,7 +264,8 @@ async def _get_benchmarks(
                 and gpu_summary_filter(data, gpu_summary)
                 and _fuzzy_contains(profile, data.profile)
                 and _fuzzy_contains(model_name, data.model_name)
-                and _load_type_match(data),
+                and _load_type_match(data)
+                and _target_mode_match(data),
             ),
             media_type="text/event-stream",
         )

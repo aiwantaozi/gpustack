@@ -76,7 +76,8 @@
                 "value": 0.5
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -136,7 +137,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -196,7 +198,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -260,7 +263,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 注意这不等于「0 次」。该连接器没有导出这个计数器（vLLM 的 mooncake/stats.py 导出 0 个计数器），或这段时间没有实例在跑。之前这里会显示一个确定的 0，那是对从未测量的东西给健康结论。"
         },
         "overrides": []
       },
@@ -284,7 +288,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}) or vector(0)",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -326,7 +330,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -393,7 +398,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -478,7 +484,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -538,7 +545,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -577,8 +585,8 @@
       },
       "id": 111,
       "type": "stat",
-      "title": "KV Transfer p99",
-      "description": "The tail is where a degrading path shows up first, and where a mean is guaranteed to hide it.",
+      "title": "KV Transfer Mean",
+      "description": "一次 KV 传输的平均耗时（sum/count）。\n\n这里用均值而不是 p99：⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。",
       "gridPos": {
         "h": 4,
         "w": 6,
@@ -598,7 +606,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -622,7 +631,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(gpustack:pd_kv_transfer_seconds_bucket{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])))",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -662,7 +671,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 注意这不等于「0 次」。该连接器没有导出这个计数器（vLLM 的 mooncake/stats.py 导出 0 个计数器），或这段时间没有实例在跑。之前这里会显示一个确定的 0，那是对从未测量的东西给健康结论。"
         },
         "overrides": []
       },
@@ -686,7 +696,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}) or vector(0)",
+          "expr": "sum(increase(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -702,7 +712,7 @@
       "id": 113,
       "type": "timeseries",
       "title": "KV Transfer Duration Percentiles",
-      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.",
+      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -728,7 +738,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -780,6 +791,17 @@
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(rate(gpustack:pd_kv_transfer_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval]))",
+          "legendFormat": "mean (不受分桶影响)",
+          "range": true,
+          "refId": "D"
         }
       ]
     },
@@ -817,7 +839,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
         },
         "overrides": []
       },
@@ -897,7 +920,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -964,7 +988,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -1031,7 +1056,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -1098,7 +1124,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
         },
         "overrides": []
       },
@@ -1184,18 +1211,19 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "query_result(max by(cluster_id, cluster_name, model_id, model_name, runtime, runtime_version, source, source_key, category) (gpustack:model_info{cluster_name=\"$cluster_name\"}))",
+          "query": "query_result(max by(cluster_id, cluster_name, model_id, model_name) (gpustack:model_role_desired_instances{cluster_name=\"$cluster_name\"}))",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
         "regex": "/model_name=\"([^\"]+)\"/",
-        "type": "query"
+        "type": "query",
+        "description": "只列 PD 组。用的是 model_role_desired_instances（由模型的 roles 派生），所以聚合部署不会出现在这里 —— 拿 PD 面板看聚合部署会得到 19 个空图。停机的 PD 组仍会列出，因为这个指标来自 spec 而非流量。"
       },
       {
         "name": "counted_role",
         "label": "KV counted on",
         "type": "custom",
-        "description": "Which role's transfer counter is authoritative. A property of the connector, not a preference: NIXL has decode PULL so decode counts; SGLang has prefill PUSH so prefill counts. Set this wrong and a perfectly healthy pair reads as zero transfers.",
+        "description": "KV 传输计数在哪一侧，是连接器的属性、不是偏好：NIXL 是 decode PULL ⇒ 选 decode；SGLang 是 prefill PUSH ⇒ 选 prefill。选错的那一侧恒为 0，所有传输面板会静默显示 0/空。从模型页「监控」进来时这个值由目录自动带上，手动切模型时要自己对。",
         "query": "decode,prefill",
         "includeAll": false,
         "multi": false,

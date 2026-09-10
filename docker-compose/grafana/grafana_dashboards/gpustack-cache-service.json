@@ -62,7 +62,8 @@
             ]
           },
           "unit": "percentunit",
-          "max": 1
+          "max": 1,
+          "noValue": "无数据 —— 不等于「命中率 0%」。可能是所选时间窗内没有查询（分母为 0），或这个缓存服务没有实例在跑 / 没被抓取。曾经这里会显示一个确定的 0%。"
         },
         "overrides": []
       },
@@ -98,7 +99,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(sum(rate(lmcache_mp_lookup_hit_tokens_total{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}[$__rate_interval])) / (sum(rate(lmcache_mp_lookup_requested_tokens_total{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}[$__rate_interval])) > 0)) or vector(0)",
+          "expr": "(sum(rate(lmcache_mp_lookup_hit_tokens_total{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}[$__rate_interval])) / (sum(rate(lmcache_mp_lookup_requested_tokens_total{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}[$__rate_interval])) > 0))",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -130,7 +131,8 @@
             ]
           },
           "unit": "percentunit",
-          "max": 1
+          "max": 1,
+          "noValue": "无数据 —— 不等于「缓存是空的」。该缓存服务没有实例在上报 `lmcache_mp_l1_usage_ratio`（未部署、未运行，或未被 Prometheus 抓到）。"
         },
         "overrides": []
       },
@@ -166,7 +168,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "avg(lmcache_mp_l1_usage_ratio{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}) or vector(0)",
+          "expr": "avg(lmcache_mp_l1_usage_ratio{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"})",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -197,7 +199,8 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "bytes",
+          "noValue": "无数据 —— 不等于「没占内存」。该缓存服务没有实例在上报 `lmcache_mp_l1_memory_usage_bytes`（未部署、未运行，或未被 Prometheus 抓到）。"
         },
         "overrides": []
       },
@@ -233,7 +236,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(lmcache_mp_l1_memory_usage_bytes{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"}) or vector(0)",
+          "expr": "sum(lmcache_mp_l1_memory_usage_bytes{cluster_name=\"$cluster_name\", cache_service_name=\"$cache_service_name\", worker_name=~\"$worker_name\"})",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -378,7 +381,8 @@
             ]
           },
           "unit": "percentunit",
-          "max": 1
+          "max": 1,
+          "noValue": "无数据 —— 不等于「命中率 0%」。可能是所选时间窗内没有查询（分母为 0），或这个缓存服务没有实例在跑 / 没被抓取。曾经这里会显示一个确定的 0%。"
         },
         "overrides": []
       },
@@ -582,7 +586,8 @@
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "bytes",
+          "noValue": "无数据 —— 不等于「没占内存」。该缓存服务没有实例在上报 `lmcache_mp_l1_memory_usage_bytes`（未部署、未运行，或未被 Prometheus 抓到）。"
         },
         "overrides": []
       },
@@ -679,7 +684,8 @@
             ]
           },
           "unit": "percentunit",
-          "max": 1
+          "max": 1,
+          "noValue": "无数据 —— 不等于「缓存是空的」。该缓存服务没有实例在上报 `lmcache_mp_l1_usage_ratio`（未部署、未运行，或未被 Prometheus 抓到）。"
         },
         "overrides": []
       },

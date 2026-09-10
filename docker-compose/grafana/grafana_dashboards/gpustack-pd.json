@@ -35,49 +35,42 @@
         "x": 0,
         "y": 0
       },
-      "id": 101,
+      "id": 1,
       "panels": [],
-      "title": "Is disaggregation actually happening",
-      "type": "row"
+      "title": "分离是否真的在发生 —— 引擎口径，所有连接器都有数据",
+      "type": "row",
+      "description": "这一段读的是**引擎自己**的指标（不是连接器），所以 vLLM+NIXL、vLLM+Mooncake（昇腾）、SGLang 都有数据。空了通常只意味着这段时间没有实例在跑。"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 102,
+      "id": 2,
       "type": "stat",
-      "title": "KV Transfers per Request",
-      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.",
+      "title": "Decode Tokens From Transfer",
+      "description": "decode 侧的 prompt token 里，有多少是**从 prefill 传过来**而不是自己重算的。\n\n**这是判断分离有没有生效的第一指标**，因为它来自引擎而非连接器 —— Mooncake 没有任何传输计数器时，它仍然有数据。\n\n100% = 每个 token 都复用了 prefill 的成果；接近 0% = 分离已经静默退化成聚合推理。",
       "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 6,
         "x": 0,
         "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "percentunit",
           "decimals": 2,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
+                "color": "text",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.01
-              },
-              {
-                "color": "green",
-                "value": 0.5
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
@@ -101,7 +94,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "expr": "sum(increase(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"decode\", source=\"external_kv_transfer\"}[$__range])) / sum(increase(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"decode\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -114,14 +107,75 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 103,
+      "id": 3,
+      "type": "stat",
+      "title": "Decode Tokens Recomputed",
+      "description": "decode 自己重算的 prompt token 数。**健康的 PD 组这里应当是 0**。\n\n不为 0 意味着 KV 没送到或送晚了，decode 只好自己重算 —— 分离的成本付了，收益没拿到。",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "无数据 · 这段时间没有实例在跑"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"decode\", source=\"local_compute\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 4,
       "type": "stat",
       "title": "Requests Routed",
       "description": "Counted at the router, which is the only place a request is counted ONCE. Engine-side request counters double under PD: every request traverses both roles, so summing them across the group reports twice the traffic.",
       "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 6,
-        "x": 6,
+        "x": 12,
         "y": 1
       },
       "fieldConfig": {
@@ -138,7 +192,7 @@
               }
             ]
           },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
@@ -175,96 +229,31 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 104,
+      "id": 5,
       "type": "stat",
-      "title": "KV Transfers",
-      "description": "Read on $counted_role only. Which role counts is a property of the connector, not a choice: NIXL has decode PULL so decode counts, SGLang has prefill PUSH so prefill counts, and a healthy pair reports zero on the other side.",
+      "title": "Prefill Cache Hit",
+      "description": "prefill 侧命中前缀缓存的 token 占比。与 PD 无关，但它会**削弱 PD 的收益** —— 前缀命中率高时 prefill 本来就便宜，分离省下的那部分算力也就没那么值钱。",
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
-          "legendFormat": "",
-          "range": false,
-          "refId": "A",
-          "instant": true
-        }
-      ]
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 105,
-      "type": "stat",
-      "title": "Failed Transfers",
-      "description": "Cumulative. Any nonzero value is transfers that actually failed.",
-      "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 6,
         "x": 18,
         "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "percentunit",
           "decimals": 2,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "text",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
               }
             ]
           },
-          "noValue": "无数据 —— 注意这不等于「0 次」。该连接器没有导出这个计数器（vLLM 的 mooncake/stats.py 导出 0 个计数器），或这段时间没有实例在跑。之前这里会显示一个确定的 0，那是对从未测量的东西给健康结论。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
@@ -288,7 +277,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "expr": "sum(increase(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"prefill\", source=\"local_cache_hit\"}[$__range])) / sum(increase(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"prefill\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -301,26 +290,30 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 106,
+      "id": 6,
       "type": "timeseries",
-      "title": "KV Transfers per Request over time",
-      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.",
+      "title": "Prompt Tokens by Source",
+      "description": "每秒的 prompt token 按来源分解。健康的 PD 组只有两条线：`prefill · local_compute` 与 `decode · external_kv_transfer`，且两者基本重合。\n\n`decode · local_compute` 一旦抬头就是分离在退化。",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 5
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 8,
+            "fillOpacity": 40,
             "showPoints": "never",
             "spanNulls": false,
-            "axisPlacement": "auto"
+            "axisPlacement": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           },
           "thresholds": {
             "mode": "absolute",
@@ -331,7 +324,7 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
@@ -357,8 +350,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
-          "legendFormat": "transfers / request",
+          "expr": "sum by (role, source) (rate(gpustack:pd_prompt_tokens_by_source_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "{{role}} · {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -369,7 +362,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 107,
+      "id": 7,
       "type": "timeseries",
       "title": "Requests Dispatched by Role",
       "description": "Per-worker dispatch counts from the router. The two lines diverging means requests are reaching one role and not the other.",
@@ -377,7 +370,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 5
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -399,7 +392,7 @@
               }
             ]
           },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
@@ -449,33 +442,40 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 13
+        "y": 14
       },
-      "id": 108,
+      "id": 8,
       "panels": [],
-      "title": "KV transfer: how fast, how big, and is any of it lost",
-      "type": "row"
+      "title": "配比是否合适 —— 引擎口径，所有连接器都有数据",
+      "type": "row",
+      "description": "这一段读的是**引擎自己**的指标（不是连接器），所以 vLLM+NIXL、vLLM+Mooncake（昇腾）、SGLang 都有数据。空了通常只意味着这段时间没有实例在跑。"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 109,
-      "type": "stat",
-      "title": "KV Transfer Throughput",
-      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Do not compare this to your link's nameplate speed. Measured effective bandwidth is 94% of line rate on 2.5GbE and ~9% on a 200G RoCE link, so a nameplate denominator calls one of those two broken. Compare it to this group's own history instead.",
+      "id": 9,
+      "type": "timeseries",
+      "title": "Queue Depth by Role",
+      "description": "🔑 The only objective signal for whether the ratio is right, and which way it is wrong: a queue that only ever builds on one side is that side asking for more replicas.\n\nRead the SHAPE, not the value -- a queue that drains is healthy at any depth.",
       "gridPos": {
-        "h": 4,
-        "w": 6,
+        "h": 8,
+        "w": 12,
         "x": 0,
-        "y": 14
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "decimals": 2,
-          "mappings": [],
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -485,22 +485,24 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "reduceOptions": {
+        "legend": {
           "calcs": [
-            "lastNotNull"
+            "mean",
+            "max"
           ],
-          "fields": "",
-          "values": false
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "textMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -509,11 +511,10 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
-          "legendFormat": "",
-          "range": false,
-          "refId": "A",
-          "instant": true
+          "expr": "avg by (role) (gpustack:num_requests_waiting{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
         }
       ]
     },
@@ -522,21 +523,27 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 110,
-      "type": "stat",
-      "title": "Bytes per Transfer",
-      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.",
+      "id": 10,
+      "type": "timeseries",
+      "title": "Requests In Flight by Role",
+      "description": "Concurrency actually achieved per role.",
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 14
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
-          "decimals": 2,
-          "mappings": [],
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -546,22 +553,24 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 这段时间没有实例在跑"
         },
         "overrides": []
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "reduceOptions": {
+        "legend": {
           "calcs": [
-            "lastNotNull"
+            "mean",
+            "max"
           ],
-          "fields": "",
-          "values": false
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "textMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
@@ -570,11 +579,10 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
-          "legendFormat": "",
-          "range": false,
-          "refId": "A",
-          "instant": true
+          "expr": "sum by (role) (gpustack:num_requests_running{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
         }
       ]
     },
@@ -583,15 +591,165 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 111,
+      "id": 11,
+      "type": "timeseries",
+      "title": "Time To First Token by Role",
+      "description": "🔑 TTFT belongs to PREFILL -- that is what a user waited for. Decode's TTFT is the time from its own first forward pass and is not comparable.\n\nThis is why the two are charted apart rather than averaged: a figure across both roles describes neither, which is the premise of running PD at all.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "无数据 · 这段时间没有实例在跑"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (role) (increase(gpustack:time_to_first_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_to_first_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 12,
+      "type": "timeseries",
+      "title": "Time Per Output Token by Role",
+      "description": "🔑 TPOT belongs to DECODE. Prefill emits one token and then hands over, so its inter-token latency is not a steady-state figure.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "无数据 · 这段时间没有实例在跑"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (role) (increase(gpustack:time_per_output_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_per_output_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
+          "legendFormat": "{{role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "id": 13,
+      "panels": [],
+      "title": "KV 传输：多快、多大、有没有丢 —— ⚠️ 取决于连接器，Mooncake 无、SGLang 仅时长",
+      "type": "row",
+      "description": "⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 14,
       "type": "stat",
       "title": "KV Transfer Mean",
-      "description": "一次 KV 传输的平均耗时（sum/count）。\n\n这里用均值而不是 p99：⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。",
+      "description": "一次 KV 传输的平均耗时（sum/count）。\n\n这里用均值而不是 p99：⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 6,
-        "x": 12,
-        "y": 14
+        "x": 0,
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
@@ -607,7 +765,7 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
@@ -644,35 +802,31 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 112,
+      "id": 15,
       "type": "stat",
-      "title": "KV Leases Expired",
-      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\nAbsent (no data) rather than zero on connectors that export no such counter -- Mooncake exports none, and '0 expired' there would be a claim we cannot make.",
+      "title": "Bytes per Transfer",
+      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
-        "h": 4,
+        "h": 5,
         "w": 6,
-        "x": 18,
-        "y": 14
+        "x": 6,
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "bytes",
           "decimals": 2,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "text",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
               }
             ]
           },
-          "noValue": "无数据 —— 注意这不等于「0 次」。该连接器没有导出这个计数器（vLLM 的 mooncake/stats.py 导出 0 个计数器），或这段时间没有实例在跑。之前这里会显示一个确定的 0，那是对从未测量的东西给健康结论。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
@@ -696,7 +850,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -709,15 +863,145 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 113,
+      "id": 16,
+      "type": "stat",
+      "title": "KV Transfer Throughput",
+      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Do not compare this to your link's nameplate speed. Measured effective bandwidth is 94% of line rate on 2.5GbE and ~9% on a 200G RoCE link, so a nameplate denominator calls one of those two broken. Compare it to this group's own history instead.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 17,
+      "type": "stat",
+      "title": "KV Transfers per Request",
+      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          },
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 18,
       "type": "timeseries",
       "title": "KV Transfer Duration Percentiles",
-      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。",
+      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 37
       },
       "fieldConfig": {
         "defaults": {
@@ -739,7 +1023,7 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
@@ -810,15 +1094,15 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 114,
+      "id": 19,
       "type": "timeseries",
       "title": "KV Transfer Throughput over time",
-      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.",
+      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 37
       },
       "fieldConfig": {
         "defaults": {
@@ -840,7 +1124,7 @@
               }
             ]
           },
-          "noValue": "无数据。三种可能，按概率排序：\n1) 连接器不导出传输计数器 —— vLLM 的 mooncake/stats.py 导出 0 个（NIXL 导出 15 个），所以昇腾 vllm-ascend-mooncake 下这些面板结构性为空，PD 是否生效要看『Requests Dispatched by Role』与引擎的 token 口径；\n2) counted_role 选反了 —— NIXL/Mooncake 选 decode，SGLang 选 prefill，选错的一侧恒为 0；\n3) 这段时间没有实例在跑。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
@@ -874,32 +1158,19 @@
       ]
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 26
-      },
-      "id": 115,
-      "panels": [],
-      "title": "Balance: is the prefill:decode ratio right",
-      "type": "row"
-    },
-    {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 116,
+      "id": 20,
       "type": "timeseries",
-      "title": "Queue Depth by Role",
-      "description": "🔑 The only objective signal for whether the ratio is right, and which way it is wrong: a queue that only ever builds on one side is that side asking for more replicas.\n\nRead the SHAPE, not the value -- a queue that drains is healthy at any depth.",
+      "title": "KV Transfers per Request over time",
+      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -921,7 +1192,7 @@
               }
             ]
           },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
@@ -947,8 +1218,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "avg by (role) (gpustack:num_requests_waiting{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
-          "legendFormat": "{{role}}",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "legendFormat": "transfers / request",
           "range": true,
           "refId": "A"
         }
@@ -959,54 +1230,50 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 117,
-      "type": "timeseries",
-      "title": "Requests In Flight by Role",
-      "description": "Concurrency actually achieved per role.",
+      "id": 21,
+      "type": "stat",
+      "title": "Failed Transfers",
+      "description": "Cumulative. Any nonzero value is transfers that actually failed.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 27
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
           "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 8,
-            "showPoints": "never",
-            "spanNulls": false,
-            "axisPlacement": "auto"
-          },
+          "decimals": 2,
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "green",
                 "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
               }
             ]
           },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
       "options": {
-        "legend": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
           "calcs": [
-            "mean",
-            "max"
+            "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "textMode": "auto"
       },
       "targets": [
         {
@@ -1015,10 +1282,11 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (role) (gpustack:num_requests_running{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"})",
-          "legendFormat": "{{role}}",
-          "range": true,
-          "refId": "A"
+          "expr": "sum(increase(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
         }
       ]
     },
@@ -1027,54 +1295,50 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 118,
-      "type": "timeseries",
-      "title": "Time To First Token by Role",
-      "description": "🔑 TTFT belongs to PREFILL -- that is what a user waited for. Decode's TTFT is the time from its own first forward pass and is not comparable.\n\nThis is why the two are charted apart rather than averaged: a figure across both roles describes neither, which is the premise of running PD at all.",
+      "id": 22,
+      "type": "stat",
+      "title": "KV Leases Expired",
+      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\nAbsent (no data) rather than zero on connectors that export no such counter -- Mooncake exports none, and '0 expired' there would be a claim we cannot make.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 35
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 53
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 8,
-            "showPoints": "never",
-            "spanNulls": false,
-            "axisPlacement": "auto"
-          },
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "green",
                 "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
               }
             ]
           },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
+          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
         },
         "overrides": []
       },
       "options": {
-        "legend": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
           "calcs": [
-            "mean",
-            "max"
+            "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "textMode": "auto"
       },
       "targets": [
         {
@@ -1083,78 +1347,11 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (role) (increase(gpustack:time_to_first_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_to_first_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
-          "legendFormat": "{{role}}",
-          "range": true,
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 119,
-      "type": "timeseries",
-      "title": "Time Per Output Token by Role",
-      "description": "🔑 TPOT belongs to DECODE. Prefill emits one token and then hands over, so its inter-token latency is not a steady-state figure.",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 35
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 8,
-            "showPoints": "never",
-            "spanNulls": false,
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "noValue": "无数据 —— 这段时间该模型没有实例在运行，或所选时间窗内没有流量。"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (role) (increase(gpustack:time_per_output_token_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval])) / sum by (role) (increase(gpustack:time_per_output_token_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=~\"$role\"}[$__rate_interval]))",
-          "legendFormat": "{{role}}",
-          "range": true,
-          "refId": "A"
+          "expr": "sum(increase(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
         }
       ]
     }

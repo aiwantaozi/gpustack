@@ -37,9 +37,9 @@
       },
       "id": 1,
       "panels": [],
-      "title": "Is disaggregation actually happening — engine metrics, every connector reports these",
+      "title": "Is disaggregation actually happening — engine token accounting (vLLM: both NIXL and Mooncake)",
       "type": "row",
-      "description": "Read from the ENGINE, not the connector, so vLLM+NIXL, vLLM+Mooncake (Ascend) and SGLang all populate it. Empty here usually means nothing was running."
+      "description": "Read from the ENGINE rather than the connector, which is why it still works on Ascend/Mooncake where every transfer counter is missing. SGLang does not export `prompt_tokens_by_source`, so on SGLang only `Requests Routed` fills in here — see each panel's ⓘ."
     },
     {
       "datasource": {
@@ -49,7 +49,7 @@
       "id": 2,
       "type": "stat",
       "title": "Decode Tokens From Transfer",
-      "description": "How much of decode's prompt tokens arrived FROM prefill instead of being recomputed locally.\n\n**This is the first thing to read**, because it comes from the engine rather than the connector: it still has data on Mooncake, which exports no transfer counters at all.\n\n100% = every token reused prefill's work. Near 0% = disaggregation has silently collapsed into aggregated inference.",
+      "description": "How much of decode's prompt tokens arrived FROM prefill instead of being recomputed locally.\n\n**This is the first thing to read**, because it comes from the engine rather than the connector: it still has data on Mooncake, which exports no transfer counters at all.\n\n100% = every token reused prefill's work. Near 0% = disaggregation has silently collapsed into aggregated inference.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes — this is the one transfer signal Mooncake still gives you\n· SGLang — no — `prompt_tokens_by_source` is not exported\n_Source: `gpustack:pd_prompt_tokens_by_source` ← `vllm:prompt_tokens_by_source` (engine, not connector)_",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -89,7 +89,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -114,7 +117,7 @@
       "id": 3,
       "type": "stat",
       "title": "Decode Tokens Recomputed",
-      "description": "Prompt tokens decode computed itself. **A healthy group sits at 0.**\n\nAnything else means KV did not arrive, or arrived late, and decode fell back to recomputing — the cost of disaggregation paid without the benefit.",
+      "description": "Prompt tokens decode computed itself. **A healthy group sits at 0.**\n\nAnything else means KV did not arrive, or arrived late, and decode fell back to recomputing — the cost of disaggregation paid without the benefit.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — no — same metric missing\n_Source: `gpustack:pd_prompt_tokens_by_source` ← `vllm:prompt_tokens_by_source`_",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -154,7 +157,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -179,7 +185,7 @@
       "id": 4,
       "type": "stat",
       "title": "Requests Routed",
-      "description": "Counted at the router, which is the only place a request is counted ONCE. Engine-side request counters double under PD: every request traverses both roles, so summing them across the group reports twice the traffic.",
+      "description": "Counted at the router, which is the only place a request is counted ONCE. Engine-side request counters double under PD: every request traverses both roles, so summing them across the group reports twice the traffic.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — yes\n_Source: `gpustack:pd_router_requests` ← `vllm_router_pd_requests` / `smg_router_requests`_",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -219,7 +225,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -244,7 +253,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prefill Cache Hit",
-      "description": "Share of prefill's prompt tokens served from the prefix cache. Unrelated to PD, but it **erodes PD's payoff**: when prefix hits are high, prefill was cheap to begin with, so the compute disaggregation saves is worth less.",
+      "description": "Share of prefill's prompt tokens served from the prefix cache. Unrelated to PD, but it **erodes PD's payoff**: when prefix hits are high, prefill was cheap to begin with, so the compute disaggregation saves is worth less.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — no — SGLang reports `cache_hit_rate` instead, which is not split by source\n_Source: `gpustack:pd_prompt_tokens_by_source` ← `vllm:prompt_tokens_by_source`_",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -284,7 +293,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -309,7 +321,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Prompt Tokens by Source",
-      "description": "Prompt tokens per second, split by where they came from. A healthy group shows two lines that track each other: `prefill · local_compute` and `decode · external_kv_transfer`.\n\n`decode · local_compute` rising is disaggregation degrading.",
+      "description": "Prompt tokens per second, split by where they came from. A healthy group shows two lines that track each other: `prefill · local_compute` and `decode · external_kv_transfer`.\n\n`decode · local_compute` rising is disaggregation degrading.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — no\n_Source: `gpustack:pd_prompt_tokens_by_source` ← `vllm:prompt_tokens_by_source`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -381,7 +393,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "Requests Dispatched by Role",
-      "description": "Per-worker dispatch counts from the router. The two lines diverging means requests are reaching one role and not the other.",
+      "description": "Per-worker dispatch counts from the router. The two lines diverging means requests are reaching one role and not the other.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — no — its gateway exports the route aggregate only, no per-worker dispatch counter\n_Source: `gpustack:pd_router_{prefill,decode}_requests` ← `vllm_router_pd_*_requests`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -462,9 +474,9 @@
       },
       "id": 8,
       "panels": [],
-      "title": "Is the prefill:decode ratio right — engine metrics, every connector reports these",
+      "title": "Is the prefill:decode ratio right — engine metrics, every backend reports these",
       "type": "row",
-      "description": "Read from the ENGINE, not the connector, so vLLM+NIXL, vLLM+Mooncake (Ascend) and SGLang all populate it. Empty here usually means nothing was running."
+      "description": "vLLM+NIXL, vLLM+Mooncake (Ascend) and SGLang all export these. Empty here means nothing was running in this window."
     },
     {
       "datasource": {
@@ -474,7 +486,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Queue Depth by Role",
-      "description": "🔑 The only objective signal for whether the ratio is right, and which way it is wrong: a queue that only ever builds on one side is that side asking for more replicas.\n\nRead the SHAPE, not the value -- a queue that drains is healthy at any depth.",
+      "description": "🔑 The only objective signal for whether the ratio is right, and which way it is wrong: a queue that only ever builds on one side is that side asking for more replicas.\n\nRead the SHAPE, not the value -- a queue that drains is healthy at any depth.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — yes\n_Source: `gpustack:num_requests_waiting` ← `vllm:num_requests_waiting` / `sglang:num_queue_reqs`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -542,7 +554,7 @@
       "id": 10,
       "type": "timeseries",
       "title": "Requests In Flight by Role",
-      "description": "Concurrency actually achieved per role.",
+      "description": "Concurrency actually achieved per role.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — yes\n_Source: `gpustack:num_requests_running` ← `vllm:num_requests_running` / `sglang:num_running_reqs`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -610,7 +622,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Time To First Token by Role",
-      "description": "🔑 TTFT belongs to PREFILL -- that is what a user waited for. Decode's TTFT is the time from its own first forward pass and is not comparable.\n\nThis is why the two are charted apart rather than averaged: a figure across both roles describes neither, which is the premise of running PD at all.",
+      "description": "🔑 TTFT belongs to PREFILL -- that is what a user waited for. Decode's TTFT is the time from its own first forward pass and is not comparable.\n\nThis is why the two are charted apart rather than averaged: a figure across both roles describes neither, which is the premise of running PD at all.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — yes\n_Source: `gpustack:time_to_first_token_seconds` ← `vllm:` / `sglang:time_to_first_token_seconds`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -678,7 +690,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Time Per Output Token by Role",
-      "description": "🔑 TPOT belongs to DECODE. Prefill emits one token and then hands over, so its inter-token latency is not a steady-state figure.",
+      "description": "🔑 TPOT belongs to DECODE. Prefill emits one token and then hands over, so its inter-token latency is not a steady-state figure.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — yes\n· SGLang — yes\n_Source: `gpustack:time_per_output_token_seconds` ← `vllm:` / `sglang:time_per_output_token_seconds`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -760,7 +772,7 @@
       "id": 14,
       "type": "stat",
       "title": "KV Transfer Mean",
-      "description": "Mean time for one KV transfer (sum/count).\n\nMean rather than p99 here: ⚠️ The engine's histogram tops out at a 5 s bucket. When transfers are routinely slower than that (common cross-host without RDMA) every percentile pins to 5 — that is the bucket edge, not a measurement. Measured on a cross-host NIXL run: 1888 of 1919 transfers landed in `+Inf`, all three percentiles read 5 s, and the true mean from sum/count was 115 s. **When the percentiles pin, read the mean** — it is immune to bucketing.",
+      "description": "Mean time for one KV transfer (sum/count).\n\nMean rather than p99 here: ⚠️ The engine's histogram tops out at a 5 s bucket. When transfers are routinely slower than that (common cross-host without RDMA) every percentile pins to 5 — that is the bucket edge, not a measurement. Measured on a cross-host NIXL run: 1888 of 1919 transfers landed in `+Inf`, all three percentiles read 5 s, and the true mean from sum/count was 115 s. **When the percentiles pin, read the mean** — it is immune to bucketing.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no — `mooncake/stats.py` exports zero counters\n· SGLang — yes — from `kv_transfer_bootstrap_ms`, ms scaled to s\n_Source: `gpustack:pd_kv_transfer_seconds` ← `vllm:nixl_xfer_time_seconds` / `sglang:kv_transfer_bootstrap_ms`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -800,7 +812,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -825,7 +840,7 @@
       "id": 15,
       "type": "stat",
       "title": "Bytes per Transfer",
-      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — no — `kv_transfer_total_mb` was dropped in 0.5.15 and nothing replaced it\n_Source: `gpustack:pd_kv_transfer_bytes` ← `vllm:nixl_bytes_transferred`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -865,7 +880,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -890,7 +908,7 @@
       "id": 16,
       "type": "stat",
       "title": "KV Transfer Throughput",
-      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — no — needs the bytes counter SGLang no longer has\n_Source: `gpustack:pd_kv_transfer_bytes` / `gpustack:pd_kv_transfer_seconds`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -930,7 +948,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -955,7 +976,7 @@
       "id": 17,
       "type": "stat",
       "title": "KV Transfers per Request",
-      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — yes\n_Source: `gpustack:pd_kv_transfer_seconds_count` / `gpustack:pd_router_requests`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -1003,7 +1024,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -1012,7 +1036,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__range])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
           "legendFormat": "",
           "range": false,
           "refId": "A",
@@ -1028,7 +1052,7 @@
       "id": 18,
       "type": "stat",
       "title": "Failed Transfers",
-      "description": "Cumulative. Any nonzero value is transfers that actually failed.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.",
+      "description": "Cumulative. Any nonzero value is transfers that actually failed.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — no\n_Source: `gpustack:pd_kv_transfer_failed` ← `vllm:nixl_num_failed_transfers`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -1072,7 +1096,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -1097,7 +1124,7 @@
       "id": 19,
       "type": "stat",
       "title": "KV Leases Expired",
-      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.",
+      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — no\n_Source: `gpustack:pd_kv_lease_expired` ← `vllm:nixl_num_kv_expired_reqs`_",
       "gridPos": {
         "h": 5,
         "w": 4,
@@ -1141,7 +1168,10 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "auto",
+        "text": {
+          "valueSize": 18
+        }
       },
       "targets": [
         {
@@ -1166,7 +1196,7 @@
       "id": 20,
       "type": "timeseries",
       "title": "KV Transfer Duration Percentiles",
-      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — yes\n_Source: `gpustack:pd_kv_transfer_seconds` ← `vllm:nixl_xfer_time_seconds` / `sglang:kv_transfer_bootstrap_ms`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1267,7 +1297,7 @@
       "id": 21,
       "type": "timeseries",
       "title": "KV Transfer Throughput over time",
-      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — no\n_Source: `gpustack:pd_kv_transfer_bytes` / `gpustack:pd_kv_transfer_seconds`_",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1335,7 +1365,7 @@
       "id": 22,
       "type": "timeseries",
       "title": "KV Transfers per Request over time",
-      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
+      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n**Where this has data**\n· vLLM + NIXL — yes\n· vLLM + Mooncake (Ascend) — no\n· SGLang — yes\n_Source: `gpustack:pd_kv_transfer_seconds_count` / `gpustack:pd_router_requests`_",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1388,7 +1418,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_bytes_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(increase(gpustack:pd_router_requests_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__rate_interval]))",
           "legendFormat": "transfers / request",
           "range": true,
           "refId": "A"

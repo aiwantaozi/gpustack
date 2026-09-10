@@ -62,6 +62,15 @@ class VocabularyField:
 # cluster change: a tree whose rows sit inside racks is not a tree anyone
 # recognises, and a fixed order is what lets two clusters mean the same thing
 # by "rack".
+#
+# 🔴 `room` and `row` were removed in review. Five builtins pre-offered in the
+# UI's field list read as five things to fill in, while the only one a PD group
+# actually needs is `rack` (and `switch`, which the worker discovers by
+# itself). Anyone who does organise by machine room or rack row declares it as
+# a custom layer — that path exists, is named "Add layer" in the UI, and now
+# accepts these two ids because they are no longer reserved. Placement loses
+# nothing either way: a tier means "no worse than X", so a rack inside an
+# undeclared room still satisfies "same rack".
 VOCABULARY: Tuple[VocabularyField, ...] = (
     VocabularyField(
         "region",
@@ -71,8 +80,6 @@ VOCABULARY: Tuple[VocabularyField, ...] = (
         "zone",
         (GPUSTACK_PREFIX + "zone", "topology.kubernetes.io/zone"),
     ),
-    VocabularyField("room", (GPUSTACK_PREFIX + "room",)),
-    VocabularyField("row", (GPUSTACK_PREFIX + "row",)),
     VocabularyField(
         "rack",
         (GPUSTACK_PREFIX + "rack", "topology.kubernetes.io/rack"),
@@ -123,13 +130,13 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "fabric.topograph.run/tier-1",
         "Topograph",
-        ("row", "room"),
+        ("rack", "zone"),
         "One tier above the leaf switch.",
     ),
     KnownKey(
         "fabric.topograph.run/tier-2",
         "Topograph",
-        ("room", "zone"),
+        ("zone",),
         "Two tiers above the leaf switch.",
     ),
     KnownKey(
@@ -147,13 +154,13 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "network.topology.nvidia.com/block",
         "NVIDIA",
-        ("rack", "row"),
+        ("rack",),
         "IB fabric block.",
     ),
     KnownKey(
         "network.topology.nvidia.com/spine",
         "NVIDIA",
-        ("room", "zone"),
+        ("zone",),
         "IB fabric spine.",
     ),
     KnownKey(
@@ -171,7 +178,7 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "cloud.google.com/gce-topology-block",
         "GKE",
-        ("row", "room"),
+        ("rack", "zone"),
         "One fast network.",
     ),
     KnownKey(
@@ -451,8 +458,6 @@ def display_name(field_id: str) -> str:
     return {
         "region": "Region",
         "zone": "Zone",
-        "room": "Room",
-        "row": "Row",
         "rack": "Rack",
         "switch": "Access switch",
         ACCELERATOR_DOMAIN: "Accelerator domain",

@@ -47,6 +47,24 @@ def test_a_custom_layer_under_a_preset_is_re_parented_to_the_vocabulary():
     ]
 
 
+def test_row_survives_as_a_custom_layer_instead_of_folding():
+    """`row` is not a vocabulary id, so folding would strand the model.
+
+    The old UI offered `Row` alongside `Rack`/`Zone`/`Region`, but the
+    vocabulary that shipped has no `row`. Folding it would rewrite a model's
+    `gather.layer` to an id no layer answers to; kept as a declared layer it
+    stays a place the scheduler can resolve.
+    """
+    topology = {
+        "layers": [{"name": "Row", "labelKeys": ["topology.gpustack.ai/row"]}],
+        "defaultGatherLayer": "Row",
+    }
+    folded, renames = migration._fold(topology)
+
+    assert renames == {}
+    assert folded == topology
+
+
 def test_a_preset_name_with_customised_keys_is_left_alone():
     """Same name, different keys: the operator meant something else by it."""
     topology = {"layers": [{"name": "Rack", "labelKeys": ["dc/rack"]}]}

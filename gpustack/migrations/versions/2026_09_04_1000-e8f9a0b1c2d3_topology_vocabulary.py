@@ -1,13 +1,20 @@
 """topology vocabulary
 
 Cluster topology moves from operator-declared layers to a fixed vocabulary
-(region, zone, room, row, rack, switch, host) that a cluster only fills values
-into. A cluster that declared the preset layers the old UI offered — `Rack`,
-`Zone`, `Region`, `Row` with their preset keys — now means the vocabulary
-as-is, so those declarations are folded into it: the entries are dropped and a
-model whose `gather.layer` named one of them is pointed at the vocabulary id
-(`Rack` → `rack`). Custom layers and customised keys are left exactly as they
-were; the new code reads them as Advanced-mode overrides.
+(region, zone, rack, switch, host) that a cluster only fills values into. A
+cluster that declared the preset layers the old UI offered — `Rack`, `Zone`,
+`Region` with their preset keys — now means the vocabulary as-is, so those
+declarations are folded into it: the entries are dropped and a model whose
+`gather.layer` named one of them is pointed at the vocabulary id (`Rack` →
+`rack`). Custom layers and customised keys are left exactly as they were; the
+new code reads them as Advanced-mode overrides.
+
+`Row` is deliberately not folded, unlike the other three the old UI offered:
+`row` is no longer a vocabulary id, so folding would point a model's
+`gather.layer` at a layer nothing answers to and placement could not resolve
+it. Left alone, the declaration survives as an ordinary custom layer — the
+path the vocabulary now expects for a machine room or a rack row — and the
+models gathering on it keep working.
 
 No schema change: `clusters.topology` and `models.gather` are JSON columns.
 
@@ -41,7 +48,6 @@ _PRESETS = {
         "zone",
         {"topology.kubernetes.io/zone", "failure-domain.beta.kubernetes.io/zone"},
     ),
-    "Row": ("row", {"topology.gpustack.ai/row"}),
     "Rack": ("rack", {"topology.gpustack.ai/rack", "topology.kubernetes.io/rack"}),
 }
 

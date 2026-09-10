@@ -124,8 +124,6 @@ async def test_every_vocabulary_field_is_listed_inactive_until_someone_fills_it(
     assert [layer.id for layer in result.layers] == [
         "region",
         "zone",
-        "room",
-        "row",
         "rack",
         "switch",
         NODE_LAYER,
@@ -429,8 +427,6 @@ async def test_the_vocabulary_ships_with_the_view():
     assert [f.id for f in result.vocabulary.fields] == [
         "region",
         "zone",
-        "room",
-        "row",
         "rack",
         "switch",
     ]

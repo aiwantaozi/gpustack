@@ -164,7 +164,7 @@ def test_a_parent_on_a_vocabulary_entry_is_ignored():
     """The UI serialises the whole chain uniformly; a builtin's place is fixed
     regardless of what it says its parent is."""
     resolved = validate_declaration(
-        topology([layer("rack", ["dc/rack"], parent="row")])
+        topology([layer("rack", ["dc/rack"], parent="zone")])
     )
     assert [x.id for x in resolved.chain] == list(VOCABULARY_IDS)
     assert resolved.layer("rack").label_keys == (RACK, "dc/rack")

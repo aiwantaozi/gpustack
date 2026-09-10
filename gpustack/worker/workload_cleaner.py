@@ -2,7 +2,6 @@ import logging
 from typing import Callable
 from gpustack_runtime.deployer import (
     list_workloads,
-    WorkloadStatusStateEnum,
     delete_workload,
 )
 
@@ -10,9 +9,19 @@ from gpustack import envs
 from gpustack.client.generated_clientset import ClientSet
 from gpustack.utils import network
 from gpustack.utils.datetimex import parse_iso8601_to_utc
+from gpustack.schemas.benchmark import BenchmarkStateEnum
 from gpustack.utils.runtime import is_benchmark_workload, is_cache_service_workload
 
 logger = logging.getLogger(__name__)
+
+
+_TERMINAL_BENCHMARK_STATES = frozenset(
+    {
+        BenchmarkStateEnum.COMPLETED,
+        BenchmarkStateEnum.STOPPED,
+        BenchmarkStateEnum.ERROR,
+    }
+)
 
 
 class WorkloadCleaner:
@@ -46,10 +55,22 @@ class WorkloadCleaner:
                 names.add(deployment_metadata.name)
         return names
 
-    def _current_benchmark_names(self) -> set:
+    def _live_benchmark_names(self) -> set:
+        """Names of benchmarks whose row is still non-terminal.
+
+        Deliberately *not* "every benchmark name": a workload whose row already
+        reached COMPLETED/ERROR/STOPPED is garbage and should be swept, while a
+        workload whose row is PENDING/QUEUED/RUNNING is a live run and must be
+        left alone no matter what the container's momentary state says.
+
+        `page=-1` for the same reason `_current_cache_service_instance_names`
+        uses it: a truncated page would make live runs look orphaned.
+        """
         names = set()
-        benchmarks_page = self._clientset.benchmarks.list()
+        benchmarks_page = self._clientset.benchmarks.list(params={"page": -1})
         for benchmark in benchmarks_page.items or []:
+            if benchmark.state in _TERMINAL_BENCHMARK_STATES:
+                continue
             deployment_metadata = benchmark.get_deployment_metadata()
             if deployment_metadata:
                 names.add(deployment_metadata.name)
@@ -71,8 +92,23 @@ class WorkloadCleaner:
 
     def cleanup_orphan_workloads(self):
         current_instance_names = self._current_model_instance_names()
-        current_benchmark_names = self._current_benchmark_names()
         current_cache_service_names = self._current_cache_service_instance_names()
+
+        # Fail closed on the benchmark list. This worker reaches the server over
+        # a link that drops ~20% of packets, and a failed read used to surface as
+        # "no benchmarks exist" -- at which point every benchmark workload past
+        # the 300 s grace period looked orphaned. Measured 2026-09-09: two live
+        # runs deleted mid-flight (18 min and 34 min in), each losing its last
+        # stage, and one of them wedged the worker's benchmark queue for an hour
+        # because the deletion bypassed the manager's teardown.
+        try:
+            live_benchmark_names = self._live_benchmark_names()
+        except Exception as e:
+            logger.warning(
+                f"Skipping benchmark orphan cleanup this round; "
+                f"could not read the benchmark list: {e}"
+            )
+            live_benchmark_names = None
 
         # Namespace-less on purpose: workloads of every tenant are orphan
         # candidates, and the cleaner cannot know which namespaces exist. The
@@ -87,24 +123,21 @@ class WorkloadCleaner:
             create_at = parse_iso8601_to_utc(w.created_at)
             should_clean_orphan = False
             if is_benchmark_workload(w):
+                if live_benchmark_names is None:
+                    continue
                 should_clean_orphan, _ = network.is_offline(
                     create_at,
                     envs.WORKER_ORPHAN_BENCHMARK_WORKLOAD_CLEANUP_GRACE_PERIOD,
                 )
-                # Clean up benchmark workloads that are:
-                # 1. In FAILED or INACTIVE state (regardless of whether they're in current_benchmark_names)
-                # 2. Not in current_benchmark_names and past grace period
-                if should_clean_orphan and (
-                    w.state
-                    in [
-                        WorkloadStatusStateEnum.FAILED,
-                        WorkloadStatusStateEnum.INACTIVE,
-                    ]
-                    or w.name not in current_benchmark_names
-                ):
+                # Past the grace period and no live row owns it. The row's state
+                # is the authority, not the container's: a long multi-stage run
+                # can read FAILED/INACTIVE between stages, and deleting on that
+                # alone killed runs that were still producing results.
+                if should_clean_orphan and w.name not in live_benchmark_names:
                     delete_workload(w.name, namespace=w.namespace)
                     logger.info(
-                        f"Deleted orphan benchmark workload {w.name}, created at {w.created_at}."
+                        f"Deleted orphan benchmark workload {w.name}, "
+                        f"created at {w.created_at}."
                     )
             elif is_cache_service_workload(w):
                 should_clean_orphan, _ = network.is_offline(

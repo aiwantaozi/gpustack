@@ -586,6 +586,35 @@ class BenchmarkMetricsLite(SQLModel):
     request_latency_p99: Optional[float] = Field(
         default=None, description="P99 request latency (unit: seconds)"
     )
+    # ── Real ITL: the per-INTERVAL distribution ───────────────────────────────
+    # Everything above is one value per REQUEST. These four summarize the
+    # measured gaps BETWEEN consecutive streamed outputs — one sample per gap,
+    # pooled across requests — which is what vLLM / SGLang / evalscope report as
+    # ITL, and the only reading here that can show a single decode stall (a
+    # per-request average divides it away by that request's other gaps).
+    #
+    # Deliberately not named `inter_token_latency_*`: those columns above hold
+    # guidellm's field of that name, which is the industry's TPOT. Two names one
+    # letter apart for two different metrics is how a report ends up comparing
+    # the wrong pair.
+    #
+    # None means NOT MEASURED — a point from before benchmark-runner started
+    # recording the gaps, or a non-streaming run — never "the gaps were 0 ms".
+    # `_max` is carried (unlike every other metric here) because the worst
+    # single gap IS the finding for a stall hunt; SGLang reports Max ITL for the
+    # same reason.
+    itl_per_chunk_mean: Optional[float] = Field(
+        default=None, description="Mean measured inter-token gap (unit: ms)"
+    )
+    itl_per_chunk_p95: Optional[float] = Field(
+        default=None, description="P95 measured inter-token gap (unit: ms)"
+    )
+    itl_per_chunk_p99: Optional[float] = Field(
+        default=None, description="P99 measured inter-token gap (unit: ms)"
+    )
+    itl_per_chunk_max: Optional[float] = Field(
+        default=None, description="Largest measured inter-token gap (unit: ms)"
+    )
     tokens_per_second_mean: Optional[float] = Field(
         default=None, description="Mean tokens per second (unit: tok/s)"
     )

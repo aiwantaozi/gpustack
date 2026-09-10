@@ -2374,3 +2374,139 @@ class TestVanishedWorkloadIsNotAutomaticallyAFailure:
         self._run(monkeypatch, mgr, None)
 
         assert calls == []
+
+
+# ── Measured per-interval ITL ─────────────────────────────────────────────────
+
+
+def _dist(*, mean=1.0, p95=2.0, p99=3.0, maximum=4.0, count=10):
+    """A StatusDistributionSummary whose `successful` branch carries the values."""
+    from gpustack.worker.schemas.benchmark_runner import (
+        DistributionSummary,
+        Percentiles,
+        StatusDistributionSummary,
+    )
+
+    summary = DistributionSummary(
+        mean=mean,
+        median=mean,
+        min=0.0,
+        max=maximum,
+        count=count,
+        percentiles=Percentiles(p95=p95, p99=p99),
+    )
+    return StatusDistributionSummary(
+        successful=summary, incomplete=summary, errored=summary, total=summary
+    )
+
+
+def _metrics(**overrides):
+    """A GenerativeMetrics with every required distribution filled in."""
+    from gpustack.worker.schemas.benchmark_runner import (
+        GenerativeMetrics,
+        StatusBreakdown,
+    )
+
+    fields = {
+        name: _dist()
+        for name, field in GenerativeMetrics.model_fields.items()
+        if field.is_required() and name != "request_totals"
+    }
+    fields["request_totals"] = StatusBreakdown[int, int, int, int](
+        successful=10, errored=0, incomplete=0, total=10
+    )
+    fields.update(overrides)
+    return GenerativeMetrics(**fields)
+
+
+def _itl_kwargs(metrics):
+    """The flat row kwargs for a point with these metrics.
+
+    ``_point_metrics_kwargs`` only reads ``bm.metrics``, so a namespace stands
+    in for the whole GenerativeBenchmark.
+    """
+    from gpustack.worker.schemas.benchmark_runner import GenerativeBenchmarksReport
+
+    return GenerativeBenchmarksReport._point_metrics_kwargs(
+        SimpleNamespace(metrics=metrics)
+    )
+
+
+class TestMeasuredItlMapping:
+    """The per-interval ITL is a different metric from the per-request TPOT.
+
+    Both must reach the row, under names that cannot be mistaken for each other,
+    and "not measured" must not arrive as 0.0.
+    """
+
+    def test_measured_gaps_land_on_the_itl_columns(self):
+        metrics = _metrics(
+            inter_token_latency_per_chunk_ms=_dist(
+                mean=26.4, p95=27.0, p99=800.0, maximum=900.0
+            )
+        )
+
+        kwargs = _itl_kwargs(metrics)
+
+        assert kwargs["itl_per_chunk_mean"] == 26.4
+        assert kwargs["itl_per_chunk_p95"] == 27.0
+        assert kwargs["itl_per_chunk_p99"] == 800.0
+        assert kwargs["itl_per_chunk_max"] == 900.0
+
+    def test_itl_columns_do_not_shadow_the_tpot_columns(self):
+        """The two per-token metrics must not be wired to the same source.
+
+        `inter_token_latency_ms` is guidellm's per-request value (the TPOT);
+        `inter_token_latency_per_chunk_ms` is the measured gap distribution. A
+        copy-paste that pointed both at one field would make the report compare
+        a metric against itself.
+        """
+        metrics = _metrics(
+            inter_token_latency_ms=_dist(mean=500.0, p99=500.0),
+            inter_token_latency_per_chunk_ms=_dist(mean=26.4, p99=800.0),
+        )
+
+        kwargs = _itl_kwargs(metrics)
+
+        assert kwargs["inter_token_latency_mean"] == 500.0
+        assert kwargs["inter_token_latency_p99"] == 500.0
+        assert kwargs["itl_per_chunk_mean"] == 26.4
+        assert kwargs["itl_per_chunk_p99"] == 800.0
+
+    def test_an_unmeasured_run_leaves_the_itl_columns_null(self):
+        """A point from before the gaps were recorded, or a non-streaming run.
+
+        NULL, not 0.0: a zero here would read as a decode with no latency
+        between tokens at all.
+        """
+        kwargs = _itl_kwargs(_metrics())
+
+        assert kwargs["itl_per_chunk_mean"] is None
+        assert kwargs["itl_per_chunk_p95"] is None
+        assert kwargs["itl_per_chunk_p99"] is None
+        assert kwargs["itl_per_chunk_max"] is None
+
+    def test_a_distribution_with_no_successful_samples_is_null(self):
+        """Only failed requests produced gaps.
+
+        The `successful` summary still exists and every field on it reads 0.0,
+        which would land in the report as a perfect decode.
+        """
+        kwargs = _itl_kwargs(
+            _metrics(
+                inter_token_latency_per_chunk_ms=_dist(
+                    mean=0.0, p95=0.0, p99=0.0, maximum=0.0, count=0
+                )
+            )
+        )
+
+        assert kwargs["itl_per_chunk_mean"] is None
+        assert kwargs["itl_per_chunk_max"] is None
+
+    def test_every_itl_column_exists_on_the_row_schema(self):
+        """The kwargs must be real columns, or the upload silently drops them."""
+        kwargs = _itl_kwargs(_metrics(inter_token_latency_per_chunk_ms=_dist()))
+        columns = bm_schemas.BenchmarkMetricsLite.model_fields
+
+        for name in kwargs:
+            assert name in columns, f"{name} is not a BenchmarkMetricsLite column"

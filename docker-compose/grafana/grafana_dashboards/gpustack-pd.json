@@ -37,9 +37,9 @@
       },
       "id": 1,
       "panels": [],
-      "title": "分离是否真的在发生 —— 引擎口径，所有连接器都有数据",
+      "title": "Is disaggregation actually happening — engine metrics, every connector reports these",
       "type": "row",
-      "description": "这一段读的是**引擎自己**的指标（不是连接器），所以 vLLM+NIXL、vLLM+Mooncake（昇腾）、SGLang 都有数据。空了通常只意味着这段时间没有实例在跑。"
+      "description": "Read from the ENGINE, not the connector, so vLLM+NIXL, vLLM+Mooncake (Ascend) and SGLang all populate it. Empty here usually means nothing was running."
     },
     {
       "datasource": {
@@ -49,7 +49,7 @@
       "id": 2,
       "type": "stat",
       "title": "Decode Tokens From Transfer",
-      "description": "decode 侧的 prompt token 里，有多少是**从 prefill 传过来**而不是自己重算的。\n\n**这是判断分离有没有生效的第一指标**，因为它来自引擎而非连接器 —— Mooncake 没有任何传输计数器时，它仍然有数据。\n\n100% = 每个 token 都复用了 prefill 的成果；接近 0% = 分离已经静默退化成聚合推理。",
+      "description": "How much of decode's prompt tokens arrived FROM prefill instead of being recomputed locally.\n\n**This is the first thing to read**, because it comes from the engine rather than the connector: it still has data on Mooncake, which exports no transfer counters at all.\n\n100% = every token reused prefill's work. Near 0% = disaggregation has silently collapsed into aggregated inference.",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -70,7 +70,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -110,7 +114,7 @@
       "id": 3,
       "type": "stat",
       "title": "Decode Tokens Recomputed",
-      "description": "decode 自己重算的 prompt token 数。**健康的 PD 组这里应当是 0**。\n\n不为 0 意味着 KV 没送到或送晚了，decode 只好自己重算 —— 分离的成本付了，收益没拿到。",
+      "description": "Prompt tokens decode computed itself. **A healthy group sits at 0.**\n\nAnything else means KV did not arrive, or arrived late, and decode fell back to recomputing — the cost of disaggregation paid without the benefit.",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -131,7 +135,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -192,7 +200,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -232,7 +244,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prefill Cache Hit",
-      "description": "prefill 侧命中前缀缓存的 token 占比。与 PD 无关，但它会**削弱 PD 的收益** —— 前缀命中率高时 prefill 本来就便宜，分离省下的那部分算力也就没那么值钱。",
+      "description": "Share of prefill's prompt tokens served from the prefix cache. Unrelated to PD, but it **erodes PD's payoff**: when prefix hits are high, prefill was cheap to begin with, so the compute disaggregation saves is worth less.",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -253,7 +265,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -293,7 +309,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Prompt Tokens by Source",
-      "description": "每秒的 prompt token 按来源分解。健康的 PD 组只有两条线：`prefill · local_compute` 与 `decode · external_kv_transfer`，且两者基本重合。\n\n`decode · local_compute` 一旦抬头就是分离在退化。",
+      "description": "Prompt tokens per second, split by where they came from. A healthy group shows two lines that track each other: `prefill · local_compute` and `decode · external_kv_transfer`.\n\n`decode · local_compute` rising is disaggregation degrading.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -324,7 +340,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -392,7 +408,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -446,9 +462,9 @@
       },
       "id": 8,
       "panels": [],
-      "title": "配比是否合适 —— 引擎口径，所有连接器都有数据",
+      "title": "Is the prefill:decode ratio right — engine metrics, every connector reports these",
       "type": "row",
-      "description": "这一段读的是**引擎自己**的指标（不是连接器），所以 vLLM+NIXL、vLLM+Mooncake（昇腾）、SGLang 都有数据。空了通常只意味着这段时间没有实例在跑。"
+      "description": "Read from the ENGINE, not the connector, so vLLM+NIXL, vLLM+Mooncake (Ascend) and SGLang all populate it. Empty here usually means nothing was running."
     },
     {
       "datasource": {
@@ -485,7 +501,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -553,7 +569,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -621,7 +637,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -689,7 +705,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 这段时间没有实例在跑"
+          "noValue": "No data — nothing running"
         },
         "overrides": []
       },
@@ -732,9 +748,9 @@
       },
       "id": 13,
       "panels": [],
-      "title": "KV 传输：多快、多大、有没有丢 —— ⚠️ 取决于连接器，Mooncake 无、SGLang 仅时长",
+      "title": "KV transfer: how fast, how big, is any lost — ⚠️ connector-dependent: none on Mooncake, duration only on SGLang",
       "type": "row",
-      "description": "⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。"
+      "description": "⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill)."
     },
     {
       "datasource": {
@@ -744,10 +760,10 @@
       "id": 14,
       "type": "stat",
       "title": "KV Transfer Mean",
-      "description": "一次 KV 传输的平均耗时（sum/count）。\n\n这里用均值而不是 p99：⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "Mean time for one KV transfer (sum/count).\n\nMean rather than p99 here: ⚠️ The engine's histogram tops out at a 5 s bucket. When transfers are routinely slower than that (common cross-host without RDMA) every percentile pins to 5 — that is the bucket edge, not a measurement. Measured on a cross-host NIXL run: 1888 of 1919 transfers landed in `+Inf`, all three percentiles read 5 s, and the true mean from sum/count was 115 s. **When the percentiles pin, read the mean** — it is immune to bucketing.",
       "gridPos": {
         "h": 5,
-        "w": 6,
+        "w": 4,
         "x": 0,
         "y": 32
       },
@@ -765,7 +781,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -805,11 +825,11 @@
       "id": 15,
       "type": "stat",
       "title": "Bytes per Transfer",
-      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "Mean transfer size. A drop here precedes a slowdown: smaller chunks pay the per-transfer overhead more often for the same volume.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 6,
+        "w": 4,
+        "x": 4,
         "y": 32
       },
       "fieldConfig": {
@@ -826,7 +846,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -866,11 +890,11 @@
       "id": 16,
       "type": "stat",
       "title": "KV Transfer Throughput",
-      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Do not compare this to your link's nameplate speed. Measured effective bandwidth is 94% of line rate on 2.5GbE and ~9% on a 200G RoCE link, so a nameplate denominator calls one of those two broken. Compare it to this group's own history instead.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "Bytes moved divided by time spent moving them -- throughput WHILE transferring, not per wall-clock second. Dividing by wall clock would make a mostly-idle window read as a collapse.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 12,
+        "w": 4,
+        "x": 8,
         "y": 32
       },
       "fieldConfig": {
@@ -887,7 +911,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -927,11 +955,11 @@
       "id": 17,
       "type": "stat",
       "title": "KV Transfers per Request",
-      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "🔴 The one signal that separates 'PD is working' from 'PD silently collapsed to aggregated serving'. Around 1.0 on a healthy pair. Near 0 while requests are still being routed means the deployment answers correctly, logs nothing, shows every instance Running -- and is not disaggregating at all.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 18,
+        "w": 4,
+        "x": 12,
         "y": 32
       },
       "fieldConfig": {
@@ -956,7 +984,11 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
         },
         "overrides": []
       },
@@ -994,9 +1026,147 @@
         "uid": "${DS_PROMETHEUS}"
       },
       "id": 18,
+      "type": "stat",
+      "title": "Failed Transfers",
+      "description": "Cumulative. Any nonzero value is transfers that actually failed.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 19,
+      "type": "stat",
+      "title": "KV Leases Expired",
+      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).\n\n⚠️ Empty here is NOT zero. This counter does not exist on every connector (vLLM's mooncake/stats.py exports none), so a blank tile means unmeasured, not healthy.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "No data — see ⓘ",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "id": 20,
       "type": "timeseries",
       "title": "KV Transfer Duration Percentiles",
-      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ 引擎直方图的最大有限桶是 5 s。传输普遍慢于 5 s 时（跨机无 RDMA 很常见）所有分位数会一起贴在 5 —— 那是桶边界，不是测量值。实测一次跨机 NIXL：1919 次传输里 1888 次落在 +Inf，三个分位数都显示 5 s，而 sum/count 的真实均值是 115 s。**分位数贴住 5 就改读 mean**，它不受分桶影响。\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "p99 lifting away from p50 is the transport degrading under load; all three rising together is the transfers getting bigger.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1023,7 +1193,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ"
         },
         "overrides": []
       },
@@ -1083,7 +1253,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(gpustack:pd_kv_transfer_seconds_sum{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval])) / sum(rate(gpustack:pd_kv_transfer_seconds_count{cluster_name=\"$cluster_name\", model_name=\"$model_name\", role=\"$counted_role\"}[$__rate_interval]))",
-          "legendFormat": "mean (不受分桶影响)",
+          "legendFormat": "mean (immune to bucketing)",
           "range": true,
           "refId": "D"
         }
@@ -1094,10 +1264,10 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 19,
+      "id": 21,
       "type": "timeseries",
       "title": "KV Transfer Throughput over time",
-      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "Judge this against its own history. A step down that persists is the transport falling back -- RDMA to TCP being the case worth catching.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1124,7 +1294,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ"
         },
         "overrides": []
       },
@@ -1162,13 +1332,13 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "id": 20,
+      "id": 22,
       "type": "timeseries",
       "title": "KV Transfers per Request over time",
-      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
+      "description": "A step down to zero while traffic continues is the silent collapse. Gaps are windows with no traffic -- not zeros, which would read as 'KV stopped moving'.\n\n⚠️ Read from the CONNECTOR's own counters, and connectors differ sharply:\n· vLLM + NIXL — bytes, duration, failures and leases: all of it\n· vLLM + Mooncake (Ascend) — none of it. `mooncake/stats.py` exports zero counters where NIXL exports fifteen. Judge disaggregation from the token accounting in the first row instead\n· SGLang — duration only (`kv_transfer_bootstrap_ms`); no bytes counter since 0.5.15\nAlso: whichever side `KV counted on` does not name reads zero forever (NIXL/Mooncake count on decode, SGLang on prefill).",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 45
       },
@@ -1192,7 +1362,7 @@
               }
             ]
           },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
+          "noValue": "No data — see ⓘ"
         },
         "overrides": []
       },
@@ -1222,136 +1392,6 @@
           "legendFormat": "transfers / request",
           "range": true,
           "refId": "A"
-        }
-      ]
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 21,
-      "type": "stat",
-      "title": "Failed Transfers",
-      "description": "Cumulative. Any nonzero value is transfers that actually failed.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 0,
-        "y": 53
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_transfer_failed_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
-          "legendFormat": "",
-          "range": false,
-          "refId": "A",
-          "instant": true
-        }
-      ]
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 22,
-      "type": "stat",
-      "title": "KV Leases Expired",
-      "description": "Requests dropped between the two hops: prefill computed their KV and nobody ever read it. Rising means work is being thrown away.\n\nAbsent (no data) rather than zero on connectors that export no such counter -- Mooncake exports none, and '0 expired' there would be a claim we cannot make.\n\n⚠️ 这一段读的是**连接器**导出的计数器，各家差别很大：\n· vLLM + NIXL：字节/时长/失败/租约 **全都有**\n· vLLM + Mooncake（昇腾）：**一个都没有** —— `mooncake/stats.py` 导出 0 个计数器。判断分离是否生效请看上面第一段的 token 口径\n· SGLang：**只有时长**（`kv_transfer_bootstrap_ms`），0.5.15 起没有字节计数器\n另外：`KV counted on` 选反的那一侧恒为 0（NIXL/Mooncake 选 decode，SGLang 选 prefill）。",
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 6,
-        "y": 53
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "decimals": 2,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              }
-            ]
-          },
-          "noValue": "无数据 · 该连接器可能不导出此计数器（Mooncake 全无 / SGLang 无字节），或 KV counted on 选反了 · 见 ⓘ"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(gpustack:pd_kv_lease_expired_total{cluster_name=\"$cluster_name\", model_name=\"$model_name\"}[$__range]))",
-          "legendFormat": "",
-          "range": false,
-          "refId": "A",
-          "instant": true
         }
       ]
     }
@@ -1414,13 +1454,13 @@
         "refresh": 2,
         "regex": "/model_name=\"([^\"]+)\"/",
         "type": "query",
-        "description": "只列 PD 组。用的是 model_role_desired_instances（由模型的 roles 派生），所以聚合部署不会出现在这里 —— 拿 PD 面板看聚合部署会得到 19 个空图。停机的 PD 组仍会列出，因为这个指标来自 spec 而非流量。"
+        "description": "PD groups only. Sourced from `model_role_desired_instances`, which is derived from a model's roles, so aggregated deployments never appear here — pointing this dashboard at one used to produce nineteen empty panels. A stopped group still lists, because the metric comes from the spec rather than from traffic."
       },
       {
         "name": "counted_role",
         "label": "KV counted on",
         "type": "custom",
-        "description": "KV 传输计数在哪一侧，是连接器的属性、不是偏好：NIXL 是 decode PULL ⇒ 选 decode；SGLang 是 prefill PUSH ⇒ 选 prefill。选错的那一侧恒为 0，所有传输面板会静默显示 0/空。从模型页「监控」进来时这个值由目录自动带上，手动切模型时要自己对。",
+        "description": "Which side of a pair owns the KV transfer counters is a property of the connector, not a preference: NIXL PULLs so decode counts; SGLang PUSHes so prefill counts. The side you do not pick reads zero forever, and every transfer panel then shows an empty or zero value. Arriving from a model's Monitoring link sets this from the catalog; switching models by hand does not.",
         "query": "decode,prefill",
         "includeAll": false,
         "multi": false,

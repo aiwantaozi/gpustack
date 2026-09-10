@@ -63,7 +63,7 @@
           },
           "unit": "percentunit",
           "max": 1,
-          "noValue": "无数据 —— 不等于「命中率 0%」。可能是所选时间窗内没有查询（分母为 0），或这个缓存服务没有实例在跑 / 没被抓取。曾经这里会显示一个确定的 0%。"
+          "noValue": "No data — not the same as a 0% hit rate. Either no lookups happened in this window (the divisor is zero), or this cache service has no instance reporting."
         },
         "overrides": []
       },
@@ -132,7 +132,7 @@
           },
           "unit": "percentunit",
           "max": 1,
-          "noValue": "无数据 —— 不等于「缓存是空的」。该缓存服务没有实例在上报 `lmcache_mp_l1_usage_ratio`（未部署、未运行，或未被 Prometheus 抓到）。"
+          "noValue": "No data — not the same as an empty cache. No instance is reporting `lmcache_mp_l1_usage_ratio` (not deployed, not running, or not scraped)."
         },
         "overrides": []
       },
@@ -200,7 +200,7 @@
             ]
           },
           "unit": "bytes",
-          "noValue": "无数据 —— 不等于「没占内存」。该缓存服务没有实例在上报 `lmcache_mp_l1_memory_usage_bytes`（未部署、未运行，或未被 Prometheus 抓到）。"
+          "noValue": "No data — not the same as zero bytes. No instance is reporting `lmcache_mp_l1_memory_usage_bytes` (not deployed, not running, or not scraped)."
         },
         "overrides": []
       },
@@ -382,7 +382,7 @@
           },
           "unit": "percentunit",
           "max": 1,
-          "noValue": "无数据 —— 不等于「命中率 0%」。可能是所选时间窗内没有查询（分母为 0），或这个缓存服务没有实例在跑 / 没被抓取。曾经这里会显示一个确定的 0%。"
+          "noValue": "No data — not the same as a 0% hit rate. Either no lookups happened in this window (the divisor is zero), or this cache service has no instance reporting."
         },
         "overrides": []
       },
@@ -587,7 +587,7 @@
             ]
           },
           "unit": "bytes",
-          "noValue": "无数据 —— 不等于「没占内存」。该缓存服务没有实例在上报 `lmcache_mp_l1_memory_usage_bytes`（未部署、未运行，或未被 Prometheus 抓到）。"
+          "noValue": "No data — not the same as zero bytes. No instance is reporting `lmcache_mp_l1_memory_usage_bytes` (not deployed, not running, or not scraped)."
         },
         "overrides": []
       },
@@ -685,7 +685,7 @@
           },
           "unit": "percentunit",
           "max": 1,
-          "noValue": "无数据 —— 不等于「缓存是空的」。该缓存服务没有实例在上报 `lmcache_mp_l1_usage_ratio`（未部署、未运行，或未被 Prometheus 抓到）。"
+          "noValue": "No data — not the same as an empty cache. No instance is reporting `lmcache_mp_l1_usage_ratio` (not deployed, not running, or not scraped)."
         },
         "overrides": []
       },

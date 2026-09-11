@@ -447,6 +447,7 @@ class Scheduler:
                         workers,
                         model_instances,
                         role=model_instance.role,
+                        exclude_instance_id=model_instance.id,
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
@@ -637,6 +638,7 @@ async def find_candidate(
     workers: List[Worker],
     model_instances: List[ModelInstance],
     role: Optional[str] = None,
+    exclude_instance_id: Optional[int] = None,
 ) -> Tuple[Optional[ModelInstanceScheduleCandidate], List[str]]:
     """
     Find a schedule candidate for the model instance.
@@ -645,10 +647,41 @@ async def find_candidate(
     :param workers: List of workers to consider.
     :param role: Which role of a multi-role model is being placed. None for a
                  single-role deployment.
+    :param exclude_instance_id: The instance being placed, if any. Its own
+                 `computed_resource_claim` must not count against the GPUs it
+                 is asking for -- see below.
     :return: A tuple containing:
                 - The schedule candidate.
                 - A list of messages for the scheduling process.
     """
+
+    # 🔴 An instance may not be weighed against its own claim.
+    #
+    # `get_worker_allocatable_resource` derives a GPU's free VRAM as
+    # `total - sum(claims of every instance on it) - system_reserved`, and the
+    # caller hands it *every* row including the one being placed. A freshly
+    # created instance has `computed_resource_claim = None`, so the sum skips
+    # it and nothing goes wrong -- which is why this held for so long.
+    #
+    # It stops holding as soon as an instance is placed, written a claim, and
+    # then returns to PENDING (a retry, a re-deploy, a group re-solve). Now its
+    # own claim is counted against the very GPUs it wants, and because the
+    # claim is `gpu_memory_utilization x total`, allocatable collapses to the
+    # remaining 10%. The GPU then fails the `allocatable/total >=
+    # gpu_memory_utilization` test, every candidate is classed overcommit, and
+    # a multi-replica model refuses overcommit outright. The retry re-reads the
+    # same stale claim, so it never recovers on its own.
+    #
+    # Measured 2026-09-11 on `pdc-ascx-glm47-pd-1p2-7d2b`: the 7th decode
+    # replica sat PENDING against two *empty* cards, each reporting
+    # allocatable/total = 0.10 where its own claim was the only occupant.
+    # Deleting the row (dropping the claim) let it schedule immediately.
+    #
+    # Filtered here and not in `ModelInstance.all()` at the call site: the
+    # group path derives `group_instances` from that same list, and
+    # `is_group_forming` has to be able to see the triggering member.
+    if exclude_instance_id is not None:
+        model_instances = [mi for mi in model_instances if mi.id != exclude_instance_id]
 
     # Read before projecting: `cpu_only` is a role-OWN field, deliberately not
     # pushed up to the Model level — "this member takes no accelerator" is true

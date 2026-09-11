@@ -143,6 +143,16 @@ async def get_benchmarks(
     target_mode: Optional[BenchmarkTargetModeEnum] = Query(
         None, description="Filter by target mode (instance / route)."
     ),
+    worker_id: Optional[int] = Query(
+        None,
+        description=(
+            "Filter by the worker that owns the run. Every worker's 3-second "
+            "state poll sends this; without it each worker reconciles the "
+            "whole cluster's runs, and a run it does not own looks failed to "
+            "it because the workload and its result files live on the owning "
+            "host. That killed a healthy benchmark in the lab (round-2 D17)."
+        ),
+    ),
 ):
     return await _get_benchmarks(
         ctx=ctx,
@@ -155,6 +165,7 @@ async def get_benchmarks(
         profile=profile,
         load_type=load_type,
         target_mode=target_mode,
+        worker_id=worker_id,
     )
 
 
@@ -200,6 +211,7 @@ async def _get_benchmarks(  # noqa: C901
     profile: Optional[str] = None,
     load_type: Optional[BenchmarkLoadTypeEnum] = None,
     target_mode: Optional[BenchmarkTargetModeEnum] = None,
+    worker_id: Optional[int] = None,
 ):
     fuzzy_fields = {}
     if search:
@@ -211,6 +223,14 @@ async def _get_benchmarks(  # noqa: C901
 
     if dataset_name:
         fields["dataset_name"] = dataset_name
+
+    # Exact match, and deliberately in `fields` rather than `extra_conditions`:
+    # `fields` is the only one of the two that the `watch` streaming branch
+    # below also applies, and the worker watches as well as polls. Putting it
+    # in `extra_conditions` would fix the poll and silently leave the stream
+    # cluster-wide.
+    if worker_id is not None:
+        fields["worker_id"] = worker_id
 
     # `load_type` (fixed_rate / concurrency) filter (exact match; every row
     # carries a load_type).

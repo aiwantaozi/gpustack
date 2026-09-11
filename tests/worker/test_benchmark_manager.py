@@ -2303,10 +2303,18 @@ class TestVanishedWorkloadIsNotAutomaticallyAFailure:
     3-second state poll. Every point is already measured and written by then, so
     calling that ERROR puts a red badge on a complete curve."""
 
+    # This worker owns every row these tests feed in. Stated explicitly because
+    # `_sync_single_benchmark_state` now refuses rows owned by someone else
+    # (D17) -- without an owner the cases below would exit on that guard and
+    # pass for the wrong reason, never reaching the workload logic they exist
+    # to check.
+    OWNER = 7
+
     def _mgr(self, tmp_path, calls):
         mgr = object.__new__(BenchmarkManager)
         mgr._benchmark_dir = str(tmp_path)
         mgr._torn_down_ids = bm.OrderedDict()
+        mgr._worker_id_getter = lambda: self.OWNER
         mgr._is_benchmark_timed_out = lambda _b: False
         mgr._is_provisioning = lambda _b: False
         mgr._handle_benchmark_completion = lambda b: calls.append(("complete", b.id))
@@ -2318,7 +2326,7 @@ class TestVanishedWorkloadIsNotAutomaticallyAFailure:
     def _run(self, monkeypatch, mgr, workload):
         monkeypatch.setattr(bm, "get_workload", lambda *a, **k: workload)
         mgr._sync_single_benchmark_state(
-            SimpleNamespace(id=35, name="b", namespace=None)
+            SimpleNamespace(id=35, name="b", namespace=None, worker_id=self.OWNER)
         )
 
     def test_gone_after_writing_the_curve_counts_as_finished(
@@ -2510,3 +2518,59 @@ class TestMeasuredItlMapping:
 
         for name in kwargs:
             assert name in columns, f"{name} is not a BenchmarkMetricsLite column"
+
+
+class TestForeignBenchmarksAreLeftAlone:
+    """D17: a worker must not reconcile a run that belongs to another worker.
+
+    The 3-second state poll asks the server to filter by `worker_id`. That
+    filter did not exist, and FastAPI drops an unknown query parameter without
+    complaining, so every worker was handed the whole cluster's RUNNING rows.
+    For a foreign row the reconcile path is wrong at every step -- `get_workload`
+    reads the *local* runtime and returns None, `_is_workload_failed(None)` is
+    True, and the terminal-artifact escape hatch checks the *local* disk -- so it
+    ends in `_handle_benchmark_failure`. Measured: asc-w28 patched b155 to ERROR
+    and tore down its workload while asc-w22, the owner, was still writing stage
+    files at 66.6%.
+    """
+
+    @staticmethod
+    def _manager(worker_id):
+        mgr = _bare_manager()
+        mgr._worker_id_getter = lambda: worker_id
+
+        # Anything reached past the guard would have to go through these; they
+        # raise so the test fails loudly rather than quietly taking a branch.
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError("reconciled a benchmark owned by another worker")
+
+        mgr._is_torn_down = _boom
+        mgr._is_benchmark_timed_out = _boom
+        mgr._is_provisioning = _boom
+        return mgr
+
+    def test_a_run_owned_by_another_worker_is_skipped(self):
+        mgr = self._manager(worker_id=4)
+        foreign = SimpleNamespace(id=155, worker_id=3, name="pd-1p2-7d2-d3")
+
+        assert mgr._sync_single_benchmark_state(foreign) is None
+
+    def test_a_run_this_worker_owns_still_gets_reconciled(self):
+        """The guard must not swallow the worker's own rows."""
+        mgr = _bare_manager()
+        mgr._worker_id_getter = lambda: 3
+        seen = []
+        mgr._is_torn_down = lambda bid: seen.append(bid) or True
+
+        own = SimpleNamespace(id=155, worker_id=3, name="pd-1p2-7d2-d3")
+        mgr._sync_single_benchmark_state(own)
+
+        assert seen == [155], "own benchmark must reach the reconcile path"
+
+    def test_a_row_with_no_owner_is_not_claimed(self):
+        """`worker_id` is Optional on the schema. An unassigned row belongs to
+        nobody, so no worker may tear it down -- least of all every worker."""
+        mgr = self._manager(worker_id=4)
+        orphan = SimpleNamespace(id=200, worker_id=None, name="unassigned")
+
+        assert mgr._sync_single_benchmark_state(orphan) is None

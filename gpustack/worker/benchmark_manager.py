@@ -525,6 +525,25 @@ class BenchmarkManager:
 
     def _sync_single_benchmark_state(self, benchmark: Benchmark):
         """Synchronize a single benchmark's state."""
+        # Never reconcile another worker's run. The list above asks the server
+        # to filter by worker_id, but that filter did not exist until D17 was
+        # fixed, and an unknown query parameter is silently dropped rather than
+        # rejected -- so every worker was reconciling the whole cluster.
+        #
+        # For a run it does not own, this method is wrong at every step:
+        # `get_workload` reads the *local* container runtime and returns None,
+        # `_is_workload_failed(None)` is True by design, and the
+        # `_runner_left_terminal_artifact` escape hatch checks the *local*
+        # disk, where the owning worker's sidecar obviously is not. The result
+        # is `_handle_benchmark_failure`: a healthy run patched to ERROR and
+        # its workload torn down. Measured 2026-09-11: asc-w28 killed b155 at
+        # 66.6% while asc-w22, which owned it, was still writing stage files.
+        #
+        # Kept as a guard here and not only in the query because it costs one
+        # comparison and holds even if the server-side filter regresses.
+        if benchmark.worker_id != self._worker_id:
+            return
+
         if self._is_torn_down(benchmark.id):
             # The row can still read RUNNING here after a terminal handler has
             # patched it: this poll lists from the server, and the list can be

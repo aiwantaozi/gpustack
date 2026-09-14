@@ -272,16 +272,44 @@ class TopologyLayer(BaseModel):
     mixes them should not have to be relabelled before topology works at all.
     The first key present wins.
 
-    The layer's ``name`` reaches the deployment form's "at least in the same
-    ___" choices verbatim, so it is the operator-facing label as well as the
-    identifier — which is why there is no separate display field.
+    **Three fields for three jobs**, because one field could not hold them:
+    ``id`` is what other records point at, ``name`` is the canonical word and
+    the i18n lookup key, ``display_name`` is whatever the operator decided to
+    call it. Collapsing the first two is what left an operator unable to rename
+    a layer at all; collapsing the last two would mean a rename either breaks
+    every reference or is not a rename.
+
+    A row therefore reads on its own: which id, what it is, what they call it.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    id: str = PydanticField(
+        description=(
+            "Stable identity, fixed at creation and never changed. "
+            "`builtin-NNNNNN` for a vocabulary rung, `custom-<6 hex>` for one "
+            "the operator added. Referenced by `parentLayer` and by "
+            "`Model.gather.layer`, which is why renaming writes `displayName` "
+            "instead of touching this."
+        )
+    )
     name: str = PydanticField(
         description=(
-            "Operator-chosen layer name, shown verbatim in the deployment form."
+            "Canonical name: the vocabulary slug for a built-in rung, the "
+            "operator's original wording for a custom one. Set once at "
+            "creation and never rewritten — it is the i18n lookup key, so a "
+            "*translated* value here would freeze the row into whichever UI "
+            "language last saved it."
         )
+    )
+    display_name: Optional[str] = PydanticField(
+        default=None,
+        alias="displayName",
+        description=(
+            "What the operator renamed this layer to. Unset means never "
+            "renamed, which is the only way to say so — the effective label "
+            "is `displayName or t(name)`. Shown verbatim, never translated: "
+            "these are the operator's words, not ours."
+        ),
     )
     label_keys: List[str] = PydanticField(
         default_factory=list,
@@ -296,11 +324,21 @@ class TopologyLayer(BaseModel):
         default=None,
         alias="parentLayer",
         description=(
-            "The layer above this one. Left unset on the topmost layer, which "
-            "hangs off the implicit cluster root. Stored as a chain rather "
-            "than an ordered list so inserting a layer does not renumber the "
-            "layers below it — these names are referenced from saved model "
-            "configurations."
+            "The id of the layer above this one. Left unset on the topmost "
+            "layer, which hangs off the implicit cluster root. Stored as a "
+            "chain rather than an ordered list so inserting a layer does not "
+            "renumber the layers below it — these ids are referenced from "
+            "saved model configurations."
+        ),
+    )
+    disabled: bool = PydanticField(
+        default=False,
+        description=(
+            "Built-in rungs only: the operator does not want to group by this "
+            "layer even though workers carry its label. Distinct from a layer "
+            "nobody filled in, which is a fact about the data and comes back "
+            "the moment someone writes the label; this is a decision and "
+            "does not. A custom layer is deleted rather than disabled."
         ),
     )
 

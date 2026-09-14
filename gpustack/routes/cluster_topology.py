@@ -47,6 +47,7 @@ from gpustack.schemas.clusters import Cluster, ClusterTopology
 from gpustack.schemas.workers import Worker
 from gpustack.scheduler.topology import (
     NODE_LAYER,
+    NODE_LAYER_SLUG,
     TopologyError,
     TopologyNode,
 )
@@ -54,7 +55,9 @@ from gpustack.scheduler.topology_view import TopologyView, build_view
 from gpustack.scheduler.topology_vocabulary import (
     KNOWN_KEYS,
     VOCABULARY_IDS,
-    display_name,
+    VOCABULARY_SLUGS,
+    english_label,
+    labels_of,
     primary_key_for,
 )
 from gpustack.server.deps import SessionDep, TenantContextDep
@@ -97,8 +100,16 @@ class TopologyLayerPublic(BaseModel):
 
     id: str
     name: str
+    """Canonical name — the vocabulary slug, or a custom layer's original
+    wording. The UI's i18n key; clients that do not localise can fall back to
+    `english_label`."""
+    display_name: Optional[str] = None
+    """What the operator renamed it to; unset means never renamed. The
+    effective label is `display_name or t(name)`, and it is never translated —
+    these are the operator's words."""
     builtin: bool
     active: bool
+    disabled: bool = False
     label_keys: List[str] = []
     primary_key: Optional[str] = None
     domains: int = 0
@@ -162,7 +173,7 @@ class SuggestionPublic(BaseModel):
 class TopologyViewPublic(BaseModel):
     vocabulary: VocabularyPublic
     layers: List[TopologyLayerPublic]
-    """Root-to-leaf, the leaf (`NodeTopologyLayer`) last and always active."""
+    """Root-to-leaf, the host leaf last and always active."""
     workers: List[TopologyWorkerPublic]
     tree: TopologyDomainPublic
     total_workers: int = 0
@@ -228,8 +239,14 @@ def _layers_public(
     view: TopologyView,
     worker_count: int,
     gather_refs: Dict[str, List[str]],
+    host_display_name: Optional[str] = None,
 ) -> List[TopologyLayerPublic]:
-    """The chain's rungs, root-to-leaf, with the host leaf appended."""
+    """The chain's rungs, root-to-leaf, with the host leaf appended.
+
+    A *disabled* rung is in this list and absent from the tree. The panel has
+    to draw the switch that turns it back on, which it cannot do for a rung
+    `resolve()` left out entirely.
+    """
     active_ids = {layer.id for layer in view.active}
     out: List[TopologyLayerPublic] = []
     for layer in view.resolved.layers:
@@ -238,9 +255,11 @@ def _layers_public(
         out.append(
             TopologyLayerPublic(
                 id=layer.id,
-                name=display_name(layer.id),
+                name=layer.name,
+                display_name=layer.display_name,
                 builtin=layer.builtin,
                 active=active,
+                disabled=layer.disabled,
                 label_keys=list(layer.label_keys),
                 primary_key=layer.primary_key,
                 domains=view.domain_count(layer.id) if active else 0,
@@ -253,7 +272,8 @@ def _layers_public(
     out.append(
         TopologyLayerPublic(
             id=NODE_LAYER,
-            name=display_name(NODE_LAYER),
+            name=NODE_LAYER_SLUG,
+            display_name=host_display_name,
             builtin=True,
             active=True,
             domains=worker_count,
@@ -306,7 +326,7 @@ async def _view_public(
     return TopologyViewPublic(
         vocabulary=VocabularyPublic(
             fields=[
-                VocabularyFieldPublic(id=i, name=display_name(i))
+                VocabularyFieldPublic(id=i, name=english_label(VOCABULARY_SLUGS[i]))
                 for i in VOCABULARY_IDS
             ],
             known_keys=[
@@ -316,7 +336,9 @@ async def _view_public(
                 for k in KNOWN_KEYS
             ],
         ),
-        layers=_layers_public(view, len(workers), gather_refs),
+        layers=_layers_public(
+            view, len(workers), gather_refs, view.resolved.host_display_name
+        ),
         workers=workers_public,
         tree=_to_public(view.root, capacity),
         total_workers=len(by_id),
@@ -614,6 +636,9 @@ async def gather_feasibility(
     except TopologyError as e:
         raise BadRequestException(message=str(e))
     tiers_wanted = view.tiers()
+    # Resolved once for the whole answer: several rungs are named in one
+    # response, and each name is `displayName or the English fallback`.
+    labels = labels_of(view.resolved)
 
     # 🔴 The edge, and it has to be here rather than one frame deeper:
     # `role_demands` revalidates the whole model, so a form value the
@@ -630,13 +655,15 @@ async def gather_feasibility(
             tiers=[
                 GatherTierPublic(
                     layer=layer,
-                    name=display_name(layer),
+                    name=labels.get(layer, layer),
                     feasible=True,
                 )
                 for layer in tiers_wanted
             ],
             prefer=GatherTierPublic(
-                layer=NODE_LAYER, name=display_name(NODE_LAYER), feasible=True
+                layer=NODE_LAYER,
+                name=labels.get(NODE_LAYER, NODE_LAYER),
+                feasible=True,
             ),
         )
 
@@ -659,7 +686,7 @@ async def gather_feasibility(
             scopes,
             GatherRequest(layer=layer, must=True),
         )
-        tiers.append(_tier(layer, result, GroupPlacement))
+        tiers.append(_tier(layer, result, GroupPlacement, labels))
 
     # "As close as possible, deploy anyway": the same walk with no floor, which
     # widens to the cluster root and so cannot fail on gather grounds.
@@ -668,7 +695,7 @@ async def gather_feasibility(
     )
     return GatherFeasibilityPublic(
         tiers=tiers,
-        prefer=_tier(NODE_LAYER, prefer_result, GroupPlacement),
+        prefer=_tier(NODE_LAYER, prefer_result, GroupPlacement, labels),
     )
 
 
@@ -737,17 +764,22 @@ def _declares_a_list(annotation) -> bool:
     return False
 
 
-def _tier(layer: str, result, placement_cls) -> GatherTierPublic:
+def _tier(
+    layer: str, result, placement_cls, labels: Dict[str, str]
+) -> GatherTierPublic:
+    """One rung's answer. `labels` carries what the operator calls each rung,
+    so the form's "at least in the same ___" says «A区机柜» rather than the
+    registry number the layer is stored under."""
     if isinstance(result, placement_cls):
         return GatherTierPublic(
             layer=layer,
-            name=display_name(layer),
+            name=labels.get(layer, layer),
             feasible=True,
             domain=result.domain or None,
         )
     return GatherTierPublic(
         layer=layer,
-        name=display_name(layer),
+        name=labels.get(layer, layer),
         feasible=False,
         reason=result.reason,
         best_domain=result.best_domain or None,

@@ -13,6 +13,8 @@ import pytest
 from gpustack.schemas.clusters import GatherStrategyEnum
 from gpustack.schemas.models import GatherSpec, Model, ModelSpecBase
 from gpustack.server.controllers import _DIGEST_EXCLUDED_SPEC_FIELDS
+from gpustack.scheduler.topology import NODE_LAYER
+from tests.utils.topology_layers import layer_dict, lid
 
 
 def test_no_gather_at_all_means_inherit():
@@ -122,32 +124,31 @@ async def test_a_gather_layer_the_cluster_does_not_have_is_refused():
     from gpustack.schemas.clusters import ClusterTopology
 
     with pytest.raises(BadRequestException) as refused:
-        await _validate_gather("accelerator_domain", None)
+        await _validate_gather(lid("accelerator_domain"), None)
     assert "not a layer of this cluster" in refused.value.message
 
     # Declared, and it is accepted — the rung exists now.
     declared = ClusterTopology.model_validate(
         {
             "layers": [
-                {
-                    "name": "accelerator_domain",
-                    "labelKeys": ["topology.gpustack.ai/accelerator-domain"],
-                }
+                layer_dict(
+                    "accelerator_domain", ["topology.gpustack.ai/accelerator-domain"]
+                )
             ]
         }
     )
-    await _validate_gather("accelerator_domain", declared)
+    await _validate_gather(lid("accelerator_domain"), declared)
 
 
 @pytest.mark.asyncio
 async def test_the_host_is_accepted_without_the_cluster_declaring_anything():
     """The leaf is built in, so the tightest choice must never need a lookup."""
-    await _validate_gather("NodeTopologyLayer", None)
+    await _validate_gather(NODE_LAYER, None)
 
 
 @pytest.mark.asyncio
 async def test_a_builtin_rung_is_accepted_by_every_cluster():
-    await _validate_gather("rack", None)
+    await _validate_gather(lid("rack"), None)
 
 
 def test_gather_is_excluded_from_the_spec_digest():

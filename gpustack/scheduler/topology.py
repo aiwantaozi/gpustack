@@ -41,11 +41,18 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-# The two layer names the operator cannot use for a layer of their own. The
+# The two layer ids the operator cannot use for a layer of their own. The
 # root is implicit (every declared layer without a parent hangs off it) and the
 # leaf is the worker itself.
+#
+# The leaf carries a registry number like every other built-in rung, because it
+# IS one: it shows up in the chain, it is renameable, and `Model.gather.layer`
+# stores it whenever a deployment asks to stay on one host. The root does not —
+# it is never a gather tier (`group_solver` filters it out), cannot be
+# declared, and never reaches the wire.
 ROOT_LAYER = "ClusterTopologyLayer"
-NODE_LAYER = "NodeTopologyLayer"
+NODE_LAYER = "builtin-000004"
+NODE_LAYER_SLUG = "host"
 
 RESERVED_LAYERS = frozenset({ROOT_LAYER, NODE_LAYER})
 

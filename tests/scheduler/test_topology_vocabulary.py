@@ -19,13 +19,17 @@ import pytest
 
 from gpustack.scheduler.topology import (
     NODE_LAYER,
+    NODE_LAYER_SLUG,
+    ROOT_LAYER,
     TopologyError,
     UNCLASSIFIED,
 )
 from gpustack.scheduler.topology_view import build_view
+from tests.utils.topology_layers import layer_obj, lid
 from gpustack.scheduler.topology_vocabulary import (
     KNOWN_KEYS,
     RESERVED_IDS,
+    VOCABULARY,
     VOCABULARY_IDS,
     gather_layer_names,
     primary_key_for,
@@ -56,8 +60,23 @@ def worker(id_, name, labels=None, facts=None):
     )
 
 
-def layer(name, keys=(), parent=None):
-    return SimpleNamespace(name=name, label_keys=list(keys), parent_layer=parent)
+# Tests go on naming layers in domain terms ("rack", "Hall"); `layer_obj`
+# turns a name into the id/name pair the resolver actually reads. See
+# tests/utils/topology_layers.py.
+layer = layer_obj
+
+
+def layer_host(**kw):
+    """The leaf's own entry, which exists only so it can be renamed."""
+    return layer_obj(NODE_LAYER_SLUG, **kw)
+
+
+def layer_root():
+    """An entry claiming the implicit root's id — refused, since the root is
+    not a layer at all. Built by hand: `lid` only knows real layers."""
+    entry = layer_obj("root")
+    entry.id = ROOT_LAYER
+    return entry
 
 
 def topology(layers=()):
@@ -75,25 +94,25 @@ def domain_layer(parent="rack"):
 def test_no_declaration_is_the_vocabulary_as_is():
     resolved = resolve(None)
     assert [x.id for x in resolved.layers] == list(VOCABULARY_IDS)
-    assert [x.id for x in resolved.layers] == ["room", "row", "rack"]
-    assert resolved.layer("rack").label_keys == (RACK, K8S_RACK)
+    assert [x.name for x in resolved.layers] == ["room", "row", "rack"]
+    assert resolved.layer(lid("rack")).label_keys == (RACK, K8S_RACK)
 
 
 def test_naming_a_vocabulary_field_overrides_its_keys_but_keeps_the_owned_key_first():
     """The owned key is what the table writes; if it were not tried first a
     hand-filled value could lose to a discovered one."""
     resolved = resolve(topology([layer("rack", ["dc/rack"])]))
-    assert resolved.layer("rack").label_keys == (RACK, "dc/rack")
+    assert resolved.layer(lid("rack")).label_keys == (RACK, "dc/rack")
 
     resolved = resolve(topology([layer("rack", ["dc/rack", RACK])]))
-    assert resolved.layer("rack").label_keys == (RACK, "dc/rack")
+    assert resolved.layer(lid("rack")).label_keys == (RACK, "dc/rack")
 
 
 def test_a_custom_layer_slots_in_below_its_parent():
     resolved = resolve(topology([layer("Pod", ["dc/pod"], parent="row")]))
-    ids = [x.id for x in resolved.layers]
+    ids = [x.name for x in resolved.layers]
     assert ids.index("Pod") == ids.index("row") + 1
-    assert resolved.layer("Pod").builtin is False
+    assert resolved.layer(lid("Pod")).builtin is False
 
 
 def test_the_accelerator_domain_is_declared_as_an_ordinary_custom_layer():
@@ -101,10 +120,10 @@ def test_the_accelerator_domain_is_declared_as_an_ordinary_custom_layer():
     a second chain; it is now a layer the operator inserts where their hardware
     puts it, reading the keys the runtime already writes."""
     resolved = resolve(topology([domain_layer(parent="row")]))
-    ids = [x.id for x in resolved.layers]
+    ids = [x.name for x in resolved.layers]
     assert ids == ["room", "row", DOMAIN_LAYER, "rack"]
-    assert resolved.layer(DOMAIN_LAYER).builtin is False
-    assert resolved.layer(DOMAIN_LAYER).label_keys == (DOMAIN, CLIQUE)
+    assert resolved.layer(lid(DOMAIN_LAYER)).builtin is False
+    assert resolved.layer(lid(DOMAIN_LAYER)).label_keys == (DOMAIN, CLIQUE)
 
 
 def test_tiers_inside_a_domain_chain_under_it_with_no_schema_change():
@@ -119,20 +138,20 @@ def test_tiers_inside_a_domain_chain_under_it_with_no_schema_change():
             ]
         )
     )
-    ids = [x.id for x in resolved.layers]
+    ids = [x.name for x in resolved.layers]
     assert ids == ["room", "row", DOMAIN_LAYER, "cabinet", "blade", "rack"]
 
 
 def test_a_parentless_custom_layer_sits_above_the_vocabulary():
     resolved = resolve(topology([layer("Campus", ["dc/campus"])]))
-    assert [x.id for x in resolved.layers][:2] == ["Campus", "room"]
+    assert [x.name for x in resolved.layers][:2] == ["Campus", "room"]
 
 
 def test_custom_layers_chain_under_each_other():
     resolved = resolve(
         topology([layer("B", parent="A"), layer("A", parent="rack")]),
     )
-    ids = [x.id for x in resolved.layers]
+    ids = [x.name for x in resolved.layers]
     assert ids[ids.index("rack") + 1 :][:2] == ["A", "B"]
 
 
@@ -140,8 +159,8 @@ def test_a_name_is_looked_up_once_because_there_is_one_chain():
     resolved = validate_declaration(
         topology([layer("cage", ["dc/cage"], parent="rack")])
     )
-    assert resolved.layer("cage") is not None
-    assert resolved.layer("nonsense") is None
+    assert resolved.layer(lid("cage")) is not None
+    assert resolved.layer(lid("nonsense")) is None
 
 
 # --- active ----------------------------------------------------------------- #
@@ -150,8 +169,10 @@ def test_a_name_is_looked_up_once_because_there_is_one_chain():
 def test_a_field_is_active_only_once_a_worker_has_a_value():
     resolved = resolve(None)
     assert resolved.active([worker(1, "w1")]) == []
-    assert [x.id for x in resolved.active([worker(1, "w1", {RACK: "R1"})])] == ["rack"]
-    assert [x.id for x in resolved.active([worker(1, "w1", {K8S_RACK: "R1"})])] == [
+    assert [x.name for x in resolved.active([worker(1, "w1", {RACK: "R1"})])] == [
+        "rack"
+    ]
+    assert [x.name for x in resolved.active([worker(1, "w1", {K8S_RACK: "R1"})])] == [
         "rack"
     ]
 
@@ -161,13 +182,13 @@ def test_a_discovered_fact_activates_a_declared_domain_layer_too():
     whole of `topology_facts`), so declaring the rung is all an operator does."""
     resolved = resolve(topology([domain_layer()]))
     active = resolved.active([worker(1, "w1", facts={CLIQUE: "u.1"})])
-    assert [x.id for x in active] == [DOMAIN_LAYER]
+    assert [x.name for x in active] == [DOMAIN_LAYER]
 
 
 def test_a_custom_layer_stays_visible_when_nobody_matches_it():
     """An operator who wrote it down wants to see that nobody matches."""
     resolved = resolve(topology([layer("Pod", ["dc/pod"], parent="row")]))
-    assert [x.id for x in resolved.active([worker(1, "w1")])] == ["Pod"]
+    assert [x.name for x in resolved.active([worker(1, "w1")])] == ["Pod"]
 
 
 def test_active_layers_chain_in_vocabulary_order_whatever_is_skipped():
@@ -175,8 +196,8 @@ def test_active_layers_chain_in_vocabulary_order_whatever_is_skipped():
     active = resolved.active([worker(1, "w1", {ROOM: "hall-1", RACK: "r"})])
     specs = resolved.specs(active)
     assert [(s.layer, s.parent_layer) for s in specs] == [
-        ("room", None),
-        ("rack", "room"),
+        (lid("room"), None),
+        (lid("rack"), lid("room")),
     ]
 
 
@@ -192,13 +213,13 @@ def test_primary_keys_are_found_by_name_alone():
             ]
         )
     )
-    assert primary_key_for(resolved, "rack") == RACK
-    assert primary_key_for(resolved, "room") == ROOM
-    assert primary_key_for(resolved, "row") == ROW
-    assert primary_key_for(resolved, DOMAIN_LAYER) == DOMAIN
-    assert primary_key_for(resolved, "Pod") == "dc/pod"
+    assert primary_key_for(resolved, lid("rack")) == RACK
+    assert primary_key_for(resolved, lid("room")) == ROOM
+    assert primary_key_for(resolved, lid("row")) == ROW
+    assert primary_key_for(resolved, lid(DOMAIN_LAYER)) == DOMAIN
+    assert primary_key_for(resolved, lid("Pod")) == "dc/pod"
     assert primary_key_for(resolved, NODE_LAYER) is None
-    assert primary_key_for(resolved, "nonsense") is None
+    assert primary_key_for(resolved, lid("nonsense")) is None
 
 
 # --- validation: the same refusals everywhere ------------------------------- #
@@ -210,8 +231,14 @@ def test_primary_keys_are_found_by_name_alone():
         ([layer("A", parent="nope")], "unknown parent"),
         ([layer("A"), layer("B")], "share a parent"),
         ([layer("A", parent="B"), layer("B", parent="A")], "not reachable"),
-        ([layer(NODE_LAYER)], "reserved"),
-        ([layer("ClusterTopologyLayer")], "reserved"),
+        # The root is not a layer at all. The leaf IS one — declarable, but
+        # only to rename: it takes the worker's own name, which is what lets a
+        # tree survive a fleet with no labels, so it may not read a key, move,
+        # or be switched off.
+        ([layer_root()], "reserved"),
+        ([layer_host(keys=[RACK])], "cannot read label keys"),
+        ([layer_host(parent="rack")], "cannot name a parent"),
+        ([layer_host(disabled=True)], "cannot be disabled"),
         ([layer("A"), layer("A")], "Duplicate"),
     ],
 )
@@ -234,7 +261,7 @@ def test_only_the_root_and_the_leaf_are_reserved_names():
 def test_a_custom_layer_may_be_called_accelerator_domain():
     """Which is the recommended spelling, now that it is just a name."""
     resolved = validate_declaration(topology([domain_layer()]))
-    assert resolved.layer(DOMAIN_LAYER) is not None
+    assert resolved.layer(lid(DOMAIN_LAYER)) is not None
 
 
 def test_a_parent_on_a_vocabulary_entry_is_ignored():
@@ -244,17 +271,17 @@ def test_a_parent_on_a_vocabulary_entry_is_ignored():
         topology([layer("rack", ["dc/rack"], parent="room")])
     )
     assert [x.id for x in resolved.layers] == list(VOCABULARY_IDS)
-    assert resolved.layer("rack").label_keys == (RACK, "dc/rack")
+    assert resolved.layer(lid("rack")).label_keys == (RACK, "dc/rack")
 
 
 def test_a_valid_declaration_is_returned_resolved():
     resolved = validate_declaration(topology([layer("Pod", ["dc/pod"], parent="row")]))
-    assert resolved.layer("Pod") is not None
+    assert resolved.layer(lid("Pod")) is not None
 
 
 def test_gather_layer_names_are_the_host_then_the_chain():
     names = gather_layer_names(resolve(None))
-    assert names == [NODE_LAYER, "room", "row", "rack"]
+    assert names == [NODE_LAYER, lid("room"), lid("row"), lid("rack")]
     assert len(names) == len(set(names))
 
 
@@ -262,8 +289,8 @@ def test_an_undeclared_domain_is_not_a_gather_target():
     """🔴 The contract change the deployment form has to see: `gather.layer`
     has no `accelerator_domain` special value any more. A cluster that did not
     declare the rung does not offer it."""
-    assert DOMAIN_LAYER not in gather_layer_names(resolve(None))
-    assert DOMAIN_LAYER in gather_layer_names(resolve(topology([domain_layer()])))
+    assert lid(DOMAIN_LAYER) not in gather_layer_names(resolve(None))
+    assert lid(DOMAIN_LAYER) in gather_layer_names(resolve(topology([domain_layer()])))
 
 
 # --- the candidate keys the second chain left behind ------------------------ #
@@ -289,7 +316,7 @@ def test_every_candidate_key_fits_a_rung_that_exists():
     only name the three built-ins that survive."""
     for known in KNOWN_KEYS:
         assert known.fits, known.key
-        assert set(known.fits) <= set(VOCABULARY_IDS), known.key
+        assert set(known.fits) <= {f.slug for f in VOCABULARY}, known.key
 
 
 # --- the domain is an ordinary tree rung ------------------------------------ #
@@ -303,7 +330,7 @@ def test_a_declared_domain_is_a_tree_rung_with_an_unclassified_bucket():
         worker(4, "w4"),
     ]
     view = build_view(topology([domain_layer()]), workers)
-    groups = view.nodes(DOMAIN_LAYER)
+    groups = view.nodes(lid(DOMAIN_LAYER))
 
     by_name = {g.name: sorted(g.descendant_worker_ids()) for g in groups}
     assert by_name == {"u.1": [1, 2], "u.2": [3], UNCLASSIFIED: [4]}
@@ -314,7 +341,7 @@ def test_a_hand_filled_domain_wins_over_the_discovered_one():
         topology([domain_layer()]),
         [worker(1, "w1", {DOMAIN: "hccs-b"}, facts={CLIQUE: "u.1"})],
     )
-    assert [g.name for g in view.nodes(DOMAIN_LAYER)] == ["hccs-b"]
+    assert [g.name for g in view.nodes(lid(DOMAIN_LAYER))] == ["hccs-b"]
 
 
 def test_a_tier_inside_the_domain_nests_under_it_not_beside_it():
@@ -337,14 +364,14 @@ def test_a_tier_inside_the_domain_nests_under_it_not_beside_it():
         workers,
     )
 
-    cabinets = view.nodes("cabinet")
+    cabinets = view.nodes(lid("cabinet"))
     named = {
         (c.parent.name, c.name): sorted(c.descendant_worker_ids())
         for c in cabinets
         if not c.is_unclassified
     }
     assert named == {("spod-3", "R1"): [1, 2], ("spod-4", "R1"): [3]}
-    assert view.unclassified_at("cabinet") == [4]
+    assert view.unclassified_at(lid("cabinet")) == [4]
 
 
 # --- the view's scopes: one list, and it comes out of the tree --------------- #
@@ -359,9 +386,9 @@ def test_the_search_runs_host_first_then_the_declared_rungs_outward():
 
     assert [s.name for s in view.scopes()] == [
         NODE_LAYER,
-        DOMAIN_LAYER,
-        "rack",
-        "room",
+        lid(DOMAIN_LAYER),
+        lid("rack"),
+        lid("room"),
     ]
 
 
@@ -376,7 +403,7 @@ def test_the_domain_is_a_scope_like_any_other():
     view = build_view(topology([domain_layer()]), workers)
 
     names = [s.name for s in view.scopes()]
-    assert names.index(DOMAIN_LAYER) < names.index("rack")
+    assert names.index(lid(DOMAIN_LAYER)) < names.index(lid("rack"))
     assert view.tiers() == names
 
 
@@ -390,5 +417,108 @@ def test_a_custom_layer_nobody_matches_is_shown_but_not_offered():
     view = build_view(
         topology([layer("Pod", ["dc/pod"], parent="row")]), [worker(1, "w1")]
     )
-    assert [x.id for x in view.active] == ["Pod"]
+    assert [x.name for x in view.active] == ["Pod"]
     assert "Pod" not in view.tiers()
+
+
+# --- identity, renaming, disabling ----------------------------------------- #
+
+
+def test_a_layers_id_is_its_identity_and_its_name_is_not():
+    """The split the whole structure exists for. Two layers may read the same
+    keys and be called the same thing by two different clusters; what a
+    `parentLayer` and a `Model.gather.layer` point at is neither."""
+    resolved = resolve(None)
+    assert [x.id for x in resolved.layers] == [
+        "builtin-000001",
+        "builtin-000002",
+        "builtin-000003",
+    ]
+    assert [x.name for x in resolved.layers] == ["room", "row", "rack"]
+    assert NODE_LAYER == "builtin-000004"
+
+
+def test_renaming_a_builtin_changes_what_it_is_called_and_nothing_else():
+    resolved = resolve(topology([layer("rack", display_name="A区机柜")]))
+    rung = resolved.layer(lid("rack"))
+
+    assert rung.display_name == "A区机柜"
+    assert rung.label == "A区机柜"
+    # The three things a rename must not touch: what points at it, what it
+    # reads, and the key the table writes.
+    assert rung.id == lid("rack")
+    assert rung.name == "rack"
+    assert rung.label_keys == (RACK, K8S_RACK)
+
+
+def test_an_unrenamed_layer_has_no_display_name_at_all():
+    """Absence is the only way to say "never renamed", which is why there is
+    no boolean beside it: a flag and a string can contradict each other, and
+    one of the two states would then be unreachable."""
+    rung = resolve(None).layer(lid("rack"))
+    assert rung.display_name is None
+    assert rung.label == "rack"
+
+
+def test_a_builtin_cannot_be_renamed_by_rewriting_its_canonical_name():
+    """The failure this refuses is silent: a client that puts the *translated*
+    label in `name` freezes the row into one person's UI language, and every
+    other reader gets it. Refused rather than corrected, so the bug surfaces
+    where it is made."""
+    bad = layer("rack")
+    bad.name = "机柜"
+    with pytest.raises(TopologyError, match="must keep the name 'rack'"):
+        validate_declaration(topology([bad]))
+
+
+def test_the_host_can_be_renamed_too():
+    resolved = resolve(topology([layer_host(display_name="裸机")]))
+    assert resolved.host_display_name == "裸机"
+    # And it stays the leaf rather than becoming a rung of the chain.
+    assert [x.name for x in resolved.layers] == ["room", "row", "rack"]
+
+
+def test_two_layers_cannot_end_up_with_the_same_label():
+    """The deployment form's "at least in the same ___" is a list of these,
+    so a duplicate is two options a deployer cannot tell apart."""
+    with pytest.raises(TopologyError, match="both called 'rack'"):
+        validate_declaration(topology([layer("Rack")]))
+
+    with pytest.raises(TopologyError, match="both called"):
+        validate_declaration(
+            topology([layer("room", display_name="X"), layer("row", display_name="X")])
+        )
+
+
+def test_a_disabled_builtin_leaves_the_chain_entirely():
+    """Distinct from a rung nobody filled in: that one is a fact about the
+    data and comes back the moment a worker grows the label, this one is a
+    decision and does not."""
+    resolved = resolve(topology([layer("row", disabled=True)]))
+    assert [x.name for x in resolved.layers] == ["room", "rack"]
+
+    labelled = [worker(1, "w1", {ROW: "H", RACK: "R1"})]
+    view = build_view(topology([layer("row", disabled=True)]), labelled)
+    assert lid("row") not in view.tiers()
+    assert lid("rack") in view.tiers()
+
+
+def test_only_a_builtin_can_be_disabled():
+    """A custom layer is deleted instead — there is no vocabulary entry for it
+    to fall back to, so a disabled one would be a row that means nothing."""
+    with pytest.raises(TopologyError, match="cannot be disabled"):
+        validate_declaration(topology([layer("Pod", ["dc/pod"], disabled=True)]))
+
+
+def test_disabling_a_rung_that_a_custom_layer_hangs_from_is_refused():
+    """Silently detaching the layer below is the kind of thing an operator
+    finds out about from a deployment that stopped gathering."""
+    with pytest.raises(TopologyError, match="not reachable"):
+        validate_declaration(
+            topology(
+                [
+                    layer("row", disabled=True),
+                    layer("Pod", ["dc/pod"], parent="row"),
+                ]
+            )
+        )

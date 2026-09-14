@@ -2,7 +2,7 @@ import logging
 import math
 import random
 import secrets
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from urllib.parse import urlencode
 
 import aiohttp
@@ -14,6 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
+    BadRequestException,
     ForbiddenException,
     InternalServerErrorException,
     NotFoundException,
@@ -745,6 +746,7 @@ async def update_cluster(
         enforce_data_dir_mounts(input)
         await check_cluster_purpose_switch(session, cluster, input)
     hoist_system_default_container_registry(input)
+    await check_topology_layers_not_stranded(session, cluster, input)
 
     try:
         await cluster.update(session=session, source=input)
@@ -755,6 +757,56 @@ async def update_cluster(
         session,
         id,
         options=CLUSTER_LOAD_OPTIONS,
+    )
+
+
+async def check_topology_layers_not_stranded(
+    session, cluster: Cluster, input: ClusterUpdate
+):
+    """Refuse a save that deletes a topology layer a model still gathers on.
+
+    Saving the whole chain is the only delete there is — a layer is gone when
+    the next PUT arrives without it — so the check belongs here rather than
+    behind a delete endpoint that does not exist.
+
+    Refusing is the only honest option. Dropping the models' requirement
+    silently rewrites what someone asked for; leaving them pointing at nothing
+    is worse, because the solver stands an unresolvable gather down rather
+    than failing, so a `MustGather` would go on being stored while enforcing
+    nothing — a promise with no mechanism behind it, which is exactly what
+    `GatherSpec` refuses to allow anywhere else.
+    """
+    from gpustack.schemas.models import Model
+    from gpustack.scheduler.topology import NODE_LAYER
+    from gpustack.scheduler.topology_vocabulary import VOCABULARY_IDS
+
+    if "topology" not in input.model_fields_set:
+        return
+
+    # Built-in rungs cannot be deleted, only disabled, and a disabled rung
+    # keeps its id — so only custom layers can go missing.
+    surviving = {
+        layer.id for layer in (input.topology.layers if input.topology else [])
+    }
+    surviving |= set(VOCABULARY_IDS) | {NODE_LAYER}
+
+    stranded: Dict[str, List[str]] = {}
+    for model in await Model.all_by_field(session, "cluster_id", cluster.id):
+        layer = getattr(getattr(model, "gather", None), "layer", None)
+        if layer and layer not in surviving:
+            stranded.setdefault(layer, []).append(model.name)
+    if not stranded:
+        return
+
+    detail = "; ".join(
+        f"{layer} is used by {', '.join(sorted(names))}"
+        for layer, names in sorted(stranded.items())
+    )
+    raise BadRequestException(
+        message=(
+            "Cannot remove a topology layer that models still gather on: "
+            f"{detail}. Change those models first."
+        )
     )
 
 

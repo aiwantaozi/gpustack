@@ -118,14 +118,18 @@ def test_the_converted_shape_is_inert_rather_than_invalid():
     """🔴 The property that lets this migration stay.
 
     `acceleratorLayers` is a key the single-chain `ClusterTopology` does not
-    declare, and the model is `extra="ignore"` — so a row this migration wrote
-    loads, keeps its `layers`, and drops the second chain silently. That is the
-    §3 decision ("no data migration, no compatibility fallback") landing on an
-    already-written row: the declaration stops meaning anything, and nothing
-    breaks.
-    """
-    from gpustack.schemas.clusters import ClusterTopology
+    declare, and the model is `extra="ignore"` — so nothing downstream has to
+    know the second chain ever existed. That is the §3 decision ("no data
+    migration, no compatibility fallback") landing on an already-written row:
+    the declaration stops meaning anything, and nothing breaks.
 
+    🔴 What this test no longer claims is that such a row *loads*. It cannot:
+    a layer grew an `id` separate from its name, and a row of this vintage has
+    only the name. Nothing has to load it either — a later step of the same
+    unreleased bundle (`_clear_layer_identity`) empties `layers` on every
+    cluster, so by the time any code reads one of these rows it carries no
+    layers at all. Asserting on `_convert` alone is what is left that is true.
+    """
     converted = migration._convert(
         {
             "layers": [{"name": "rack", "labelKeys": ["dc/rack"]}],
@@ -139,7 +143,5 @@ def test_the_converted_shape_is_inert_rather_than_invalid():
         "accelerator_domain",
         "accelerator_sub_domain",
     ]
-
-    topology = ClusterTopology.model_validate(converted)
-    assert not hasattr(topology, "accelerator_layers")
-    assert [layer.name for layer in topology.layers] == ["rack"]
+    # The first chain is carried through untouched; only the second is folded.
+    assert [layer["name"] for layer in converted["layers"]] == ["rack"]

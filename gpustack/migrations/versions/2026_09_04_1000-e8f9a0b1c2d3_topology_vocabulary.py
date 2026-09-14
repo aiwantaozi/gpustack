@@ -124,8 +124,54 @@ def upgrade() -> None:
                         {"g": json.dumps(gather), "id": model_id},
                     )
 
+    _clear_layer_identity(conn)
+
+
+def _clear_layer_identity(conn) -> None:
+    """Drop every stored layer declaration and every model's gather target.
+
+    A layer grew an identity separate from its name: `{id, name, displayName}`
+    where there used to be one `name` doing all three jobs. Old rows key both
+    `parentLayer` and `Model.gather.layer` off that single field, and a custom
+    layer's value there is free text an operator typed — there is no rule that
+    turns it into a registry id, only a fresh one per cluster.
+
+    Remapped rather than cleared, that would mean building a per-cluster table
+    and applying it to two tables in step; get one row out of sync and a model
+    gathers on a layer that no longer exists, which the solver stands down
+    silently. This structure has never shipped (`git tag --contains` on the
+    commit that introduced it is empty), so the rows being discarded are
+    development ones, and clearing is the option that cannot half-apply.
+
+    What is lost: custom layers, label-key overrides, and every model's gather
+    requirement. What is not touched: `Worker.labels`. A worker's position has
+    always been a label keyed by the *label key*
+    (`topology.gpustack.ai/rack`), never by the layer id, so every value an
+    operator filled in survives and re-resolves against the vocabulary.
+    """
+    if table_exists("clusters") and column_exists("clusters", "topology"):
+        rows = conn.execute(
+            sa.text("SELECT id, topology FROM clusters WHERE topology IS NOT NULL")
+        ).fetchall()
+        for cluster_id, raw in rows:
+            topology = _load(raw)
+            if not isinstance(topology, dict) or not topology.get("layers"):
+                continue
+            topology = dict(topology)
+            topology["layers"] = []
+            conn.execute(
+                sa.text("UPDATE clusters SET topology = :t WHERE id = :id"),
+                {"t": json.dumps(topology), "id": cluster_id},
+            )
+
+    if table_exists("models") and column_exists("models", "gather"):
+        conn.execute(sa.text("UPDATE models SET gather = NULL WHERE gather IS NOT NULL"))
+
 
 def downgrade() -> None:
     # The folded declaration is a valid input to the previous code too (it
     # simply reads empty layers as "no topology"), so there is nothing to undo.
+    # `_clear_layer_identity` is likewise not reversible — the values it drops
+    # are gone — and deliberately so: the structure it migrates away from has
+    # never been released, so there is no deployed version to go back to.
     pass

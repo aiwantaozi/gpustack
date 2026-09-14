@@ -22,6 +22,7 @@ from gpustack.scheduler.group_solver import (
     GroupPlacement,
 )
 from gpustack.scheduler.topology import NODE_LAYER
+from tests.utils.topology_layers import layer_dict, layer_obj, lid
 
 RACK = "topology.gpustack.ai/rack"
 
@@ -76,11 +77,9 @@ def _domain_topology():
     return ClusterTopology.model_validate(
         {
             "layers": [
-                {
-                    "name": "accelerator_domain",
-                    "labelKeys": ["nvidia.com/gpu.clique"],
-                    "parentLayer": "rack",
-                }
+                layer_dict(
+                    "accelerator_domain", ["nvidia.com/gpu.clique"], parent="rack"
+                )
             ]
         }
     )
@@ -118,7 +117,7 @@ async def test_tiers_are_leaf_first():
     tightest choice is the one that exists unconditionally."""
     result, _ = await _feasibility(_pd_spec())
 
-    assert [t.layer for t in result.tiers] == [NODE_LAYER, "rack"]
+    assert [t.layer for t in result.tiers] == [NODE_LAYER, lid("rack")]
     assert [t.name for t in result.tiers] == ["Host", "Rack"]
 
 
@@ -149,14 +148,14 @@ async def test_a_declared_domain_is_a_tier_in_the_one_ranking():
 
     assert [t.layer for t in result.tiers] == [
         NODE_LAYER,
-        "accelerator_domain",
-        "rack",
+        lid("accelerator_domain"),
+        lid("rack"),
     ]
     assert not hasattr(result.tiers[0], "chain")
     assert [c.layer for c in calls[:-1]] == [
         NODE_LAYER,
-        "accelerator_domain",
-        "rack",
+        lid("accelerator_domain"),
+        lid("rack"),
     ]
 
 
@@ -198,9 +197,9 @@ async def test_every_tier_is_solved_against_the_one_scope_list():
             body=route.GatherFeasibilityRequest(model_spec=_pd_spec()),
         )
 
-    one_list = [NODE_LAYER, "accelerator_domain", "rack"]
-    assert seen["rack"] == one_list
-    assert seen["accelerator_domain"] == one_list
+    one_list = [NODE_LAYER, lid("accelerator_domain"), lid("rack")]
+    assert seen[lid("rack")] == one_list
+    assert seen[lid("accelerator_domain")] == one_list
 
 
 @pytest.mark.asyncio
@@ -211,7 +210,7 @@ async def test_every_tier_is_asked_as_a_must():
     _, calls = await _feasibility(
         _pd_spec(),
         topology=ClusterTopology.model_validate(
-            {"layers": [{"name": "Rack", "labelKeys": [RACK]}]}
+            {"layers": [layer_dict("Cabinet", [RACK])]}
         ),
     )
     tier_calls = [c for c in calls if c.layer is not None]
@@ -348,9 +347,7 @@ async def test_a_spec_that_cannot_be_a_model_is_a_400():
 
 @pytest.mark.asyncio
 async def test_a_declaration_that_cannot_become_a_tree_is_a_400():
-    bad = SimpleNamespace(
-        layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
-    )
+    bad = SimpleNamespace(layers=[layer_obj("A", parent="nope")])
     with pytest.raises(BadRequestException):
         await _feasibility(_pd_spec(), topology=bad)
 

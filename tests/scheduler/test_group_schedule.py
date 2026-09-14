@@ -21,6 +21,7 @@ from gpustack.scheduler.group_schedule import (
     schedule_group,
 )
 from gpustack.scheduler.group_solver import GroupInfeasible, GroupPlacement
+from tests.utils.topology_layers import layer_dict, layer_obj
 
 RACK = "topology.gpustack.ai/rack"
 
@@ -149,7 +150,7 @@ def test_a_stale_cluster_level_default_has_no_effect():
     never showed."""
     topology = ClusterTopology.model_validate(
         {
-            "layers": [{"name": "Rack", "labelKeys": [RACK]}],
+            "layers": [layer_dict("Cabinet", [RACK])],
             "defaultGatherStrategy": "MustGather",
             "defaultGatherLayer": "Rack",
         }
@@ -321,7 +322,7 @@ async def test_an_invalid_cluster_topology_refuses_with_the_reason():
     """An operator error, not a capacity one — and refusing beats placing the
     group against a tree built from a guess."""
     bad = SimpleNamespace(
-        layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
+        layers=[layer_obj("A", parent="nope")],
     )
     by_instance, messages = await _run(
         GroupPlacement(layer="Rack", domain="rack-a", assignments={}), topology=bad

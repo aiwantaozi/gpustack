@@ -783,12 +783,16 @@ async def check_topology_layers_not_stranded(
     if "topology" not in input.model_fields_set:
         return
 
-    # Built-in rungs cannot be deleted, only disabled, and a disabled rung
-    # keeps its id — so only custom layers can go missing.
-    surviving = {
-        layer.id for layer in (input.topology.layers if input.topology else [])
-    }
-    surviving |= set(VOCABULARY_IDS) | {NODE_LAYER}
+    # A layer stops being a gather tier two ways, and both strand the models
+    # pointing at it: a custom one is deleted, a built-in one is switched off.
+    # The second is the easy one to miss because the row survives — but
+    # `ResolvedTopology.active()` drops it, so a `MustGather` on it would be a
+    # promise with no mechanism behind it, which is exactly what `GatherSpec`
+    # refuses to allow anywhere else.
+    declared = list(input.topology.layers) if input.topology else []
+    disabled = {layer.id for layer in declared if layer.disabled}
+    surviving = {layer.id for layer in declared if not layer.disabled}
+    surviving |= (set(VOCABULARY_IDS) | {NODE_LAYER}) - disabled
 
     stranded: Dict[str, List[str]] = {}
     for model in await Model.all_by_field(session, "cluster_id", cluster.id):
@@ -804,8 +808,8 @@ async def check_topology_layers_not_stranded(
     )
     raise BadRequestException(
         message=(
-            "Cannot remove a topology layer that models still gather on: "
-            f"{detail}. Change those models first."
+            "Cannot remove or disable a topology layer that models still "
+            f"gather on: {detail}. Change those models first."
         )
     )
 

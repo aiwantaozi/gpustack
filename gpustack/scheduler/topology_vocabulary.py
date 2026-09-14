@@ -350,6 +350,12 @@ class ResolvedTopology:
         labels = [effective_topology_labels(w) for w in workers]
         out: List[ResolvedLayer] = []
         for layer in self.layers:
+            # Switched off by the operator: not a tier, not a rung of the
+            # tree, however many workers carry its label. This is the one
+            # difference from "nobody filled it in" — that one comes back by
+            # itself the moment a label appears, and this one does not.
+            if layer.disabled:
+                continue
             if not layer.builtin or any(
                 _has_value(lb, layer.label_keys) for lb in labels
             ):
@@ -384,11 +390,12 @@ def resolve(topology) -> ResolvedTopology:
     layer with no parent sits at the top, above the vocabulary. The vocabulary
     itself never moves.
 
-    A disabled built-in rung is left out entirely, as if the vocabulary did not
-    have it. That is the difference between it and a rung nobody filled in:
-    ``active()`` drops the latter and would take it back the moment a worker
-    grew the label, whereas this one stays gone until the operator says
-    otherwise.
+    A disabled built-in rung is kept here and dropped by ``active()``. Both
+    kinds of absence end at the same place — not a rung of the tree, not a
+    gather tier — but only one of them comes back by itself: a rung nobody
+    filled in returns the moment a worker grows the label, a disabled one
+    stays gone until the operator says otherwise. Keeping it in this list is
+    also what leaves the Advanced panel a row to draw the switch on.
     """
     builtin_ids = {v.id for v in VOCABULARY}
 
@@ -413,8 +420,12 @@ def resolve(topology) -> ResolvedTopology:
     layers: List[ResolvedLayer] = []
     for vocab in VOCABULARY:
         entry = declared.get(vocab.id)
-        if entry is not None and getattr(entry, "disabled", False):
-            continue
+        # 🔴 A disabled rung stays in this list. It is dropped from `active()`
+        # instead, which is what keeps it out of the tree and out of the
+        # gather tiers. Skipping it here removed it from `GET /topology` as
+        # well, and the Advanced panel draws its rows from that — so the rung
+        # vanished on the next open and there was no switch left to turn it
+        # back on. Disabling was a one-way door.
         keys = tuple(getattr(entry, "label_keys", None) or ()) or vocab.label_keys
         # The owned key stays first whatever the override said: it is the key
         # the table writes, and if it were not tried first a hand-filled value
@@ -430,6 +441,7 @@ def resolve(topology) -> ResolvedTopology:
                 keys,
                 builtin=True,
                 display_name=getattr(entry, "display_name", None),
+                disabled=bool(getattr(entry, "disabled", False)),
             )
         )
 
@@ -574,11 +586,6 @@ def validate_declaration(topology) -> ResolvedTopology:
         )
 
     placed = {layer.id for layer in resolved.layers}
-    # A custom layer under a *disabled* built-in rung is unreachable, and that
-    # is the one way this fires without the declaration itself being malformed.
-    # Refused rather than dropped: disabling a rung and thereby silently
-    # detaching the layer below it is the kind of thing an operator finds out
-    # about from a deployment that stopped gathering.
     unreachable = sorted(cid for cid in custom_ids if cid not in placed)
     if unreachable:
         raise TopologyError(
@@ -606,8 +613,14 @@ def validate_declaration(topology) -> ResolvedTopology:
 
 
 def gather_layer_names(resolved: ResolvedTopology) -> List[str]:
-    """Every layer a saved ``gather.layer`` may name: the host, then the chain."""
-    return [NODE_LAYER] + [layer.id for layer in resolved.layers]
+    """Every layer a saved ``gather.layer`` may name: the host, then the chain.
+
+    Disabled rungs are not among them. They stay in ``layers`` so the panel
+    can switch them back on, but they are not tiers — offering one would let
+    a `MustGather` name a rung the solver never groups by, which is the
+    unenforceable promise `GatherSpec` exists to prevent.
+    """
+    return [NODE_LAYER] + [layer.id for layer in resolved.layers if not layer.disabled]
 
 
 def primary_key_for(resolved: ResolvedTopology, field_id: str) -> Optional[str]:

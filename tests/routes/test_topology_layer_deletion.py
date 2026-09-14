@@ -68,12 +68,19 @@ async def test_dropping_a_layer_a_model_gathers_on_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_a_builtin_rung_is_never_stranded_by_a_save():
-    """It cannot be deleted, only disabled, and a disabled rung keeps its id —
-    so a model gathering on `rack` survives a save that switches `rack` off.
-    Whether that *should* also be refused is a separate question; what this
-    pins is that the delete guard does not fire on it."""
-    await _check([_model("pd-a", lid("rack"))], [layer_dict("rack", disabled=True)])
+async def test_switching_off_a_rung_a_model_gathers_on_is_refused_too():
+    """The second way a tier disappears, and the easy one to miss: the row
+    survives, so it does not look like a removal — but `active()` drops it,
+    so the model's `MustGather` would name a rung the solver never groups
+    by."""
+    with pytest.raises(BadRequestException) as e:
+        await _check([_model("pd-a", lid("rack"))], [layer_dict("rack", disabled=True)])
+    assert "pd-a" in str(e.value.message)
+
+
+@pytest.mark.asyncio
+async def test_an_untouched_builtin_rung_is_never_stranded():
+    await _check([_model("pd-a", lid("rack"))], [])
     await _check([_model("pd-a", NODE_LAYER)], [])
 
 

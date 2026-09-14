@@ -490,15 +490,24 @@ def test_two_layers_cannot_end_up_with_the_same_label():
         )
 
 
-def test_a_disabled_builtin_leaves_the_chain_entirely():
+def test_a_disabled_builtin_leaves_the_tree_but_stays_in_the_list():
     """Distinct from a rung nobody filled in: that one is a fact about the
     data and comes back the moment a worker grows the label, this one is a
-    decision and does not."""
-    resolved = resolve(topology([layer("row", disabled=True)]))
-    assert [x.name for x in resolved.layers] == ["room", "rack"]
+    decision and does not.
 
+    🔴 It stays in `layers`. That list is what `GET /topology` renders the
+    Advanced panel from, so dropping it here took away the very switch that
+    turns it back on — disabling became a one-way door. Only `active()`
+    excludes it, which is what keeps it out of the tree and the tiers."""
+    declared = topology([layer("row", disabled=True)])
+    resolved = resolve(declared)
+    assert [x.name for x in resolved.layers] == ["room", "row", "rack"]
+    assert resolved.layer(lid("row")).disabled is True
+
+    # Labelled, so "not a tier" can only be the switch and not missing data.
     labelled = [worker(1, "w1", {ROW: "H", RACK: "R1"})]
-    view = build_view(topology([layer("row", disabled=True)]), labelled)
+    view = build_view(declared, labelled)
+    assert [x.name for x in view.active] == ["rack"]
     assert lid("row") not in view.tiers()
     assert lid("rack") in view.tiers()
 
@@ -510,15 +519,23 @@ def test_only_a_builtin_can_be_disabled():
         validate_declaration(topology([layer("Pod", ["dc/pod"], disabled=True)]))
 
 
-def test_disabling_a_rung_that_a_custom_layer_hangs_from_is_refused():
-    """Silently detaching the layer below is the kind of thing an operator
-    finds out about from a deployment that stopped gathering."""
-    with pytest.raises(TopologyError, match="not reachable"):
-        validate_declaration(
-            topology(
-                [
-                    layer("row", disabled=True),
-                    layer("Pod", ["dc/pod"], parent="row"),
-                ]
-            )
-        )
+def test_a_custom_layer_under_a_disabled_rung_survives_and_the_chain_closes_up():
+    """Not refused, and not stranded either.
+
+    🔴 It *was* refused, back when disabling removed the rung from `layers`:
+    the child then had no parent to be placed under and came out unreachable.
+    With the rung kept, the child is placed as usual and simply drops out of
+    `active` along with its parent — the chain closes over the gap instead of
+    breaking at it, so there is nothing to refuse."""
+    declared = topology(
+        [
+            layer("row", disabled=True),
+            layer("Pod", ["dc/pod"], parent="row"),
+        ]
+    )
+    resolved = validate_declaration(declared)
+    assert [x.name for x in resolved.layers] == ["room", "row", "Pod", "rack"]
+
+    labelled = [worker(1, "w1", {ROW: "H", "dc/pod": "P1", RACK: "R1"})]
+    view = build_view(declared, labelled)
+    assert [x.name for x in view.active] == ["Pod", "rack"]

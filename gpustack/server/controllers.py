@@ -2308,6 +2308,92 @@ def pairing_locality(
     )
 
 
+async def _gather_unmet(
+    session: AsyncSession, model: Model, instances: Sequence[ModelInstance]
+) -> bool:
+    """Whether the group landed looser than the layer it asked for.
+
+    Only meaningful under `PreferGather` with a layer: that pair means "aim
+    for this, ship it either way", and without an answer afterwards the ask
+    is recorded in the spec while the outcome is recorded nowhere.
+    `MustGather` never reaches here — it refused at admission instead.
+
+    Computed from where the members actually are, not from what the solver
+    decided. The solver's verdict is not kept, and it would go stale anyway:
+    a rescheduled member can loosen a group that was placed tightly, and this
+    runs on every reconcile.
+    """
+    from gpustack.schemas.models import GatherStrategyEnum, role_takes_no_accelerator
+    from gpustack.scheduler.topology import ROOT_LAYER, common_layer, order_layers
+    from gpustack.scheduler.topology_view import build_view
+
+    gather = getattr(model, "gather", None)
+    layer = getattr(gather, "layer", None)
+    strategy = getattr(gather, "strategy", None)
+    if not layer or strategy != GatherStrategyEnum.PREFER_GATHER:
+        return False
+
+    # 🔴 Accelerator-bearing members only, which for today's shapes means
+    # prefill and decode. The router is excluded for the same reason the
+    # solver excludes it (`role_demands`): it holds no weights, so it
+    # "neither competes for cards nor constrains which domain the group lands
+    # in". Counting it here would report a group as having missed its target
+    # because the *proxy* landed on another host — a placement the solver
+    # never constrained and would make again.
+    worker_ids = {
+        instance.worker_id
+        for instance in instances
+        if instance.worker_id is not None
+        and instance.state == ModelInstanceStateEnum.RUNNING
+        and not role_takes_no_accelerator(model, instance.role)
+    }
+    # One member, or none placed yet: there is no distance between members to
+    # be wrong about. Silence rather than a pass — the question has not been
+    # asked yet.
+    if len(worker_ids) < 2:
+        return False
+
+    cluster = await Cluster.one_by_id(session, model.cluster_id)
+    workers = await Worker.all_by_field(session, "cluster_id", model.cluster_id)
+    try:
+        view = build_view(getattr(cluster, "topology", None), workers)
+    except Exception:
+        # A declaration that cannot become a tree is the cluster's problem and
+        # is reported there. Claiming a placement degradation off the back of
+        # it would point at the wrong thing.
+        return False
+
+    placed = [
+        node
+        for node in _leaves_of(view.root)
+        if worker_ids.intersection(node.worker_ids)
+    ]
+    if len(placed) < 2:
+        return False
+
+    # The tightest layer containing every member: fold pairwise and keep the
+    # LOOSEST answer, since a layer holding all of them has to hold each pair.
+    order = [spec.layer for spec in order_layers(view.specs)] + [ROOT_LAYER]
+    rank = {name: index for index, name in enumerate(order)}
+    actual = placed[0].layer
+    for node in placed[1:]:
+        shared = common_layer(placed[0], node) or ROOT_LAYER
+        if rank.get(shared, 0) < rank.get(actual, len(order)):
+            actual = shared
+
+    # Looser means *earlier* in a root-to-leaf order.
+    return rank.get(actual, 0) < rank.get(layer, len(order))
+
+
+def _leaves_of(node) -> List:
+    """Every host node under `node`."""
+    if not node:
+        return []
+    if not node.children:
+        return [node]
+    return [leaf for child in node.children for leaf in _leaves_of(child)]
+
+
 def _pairing_remote(model: Model, instances: Sequence[ModelInstance]) -> bool:
     """Whether *no* request can keep its KV off the network.
 
@@ -2372,6 +2458,10 @@ async def _degradation_reasons(
         # disaggregating, and the user should not have to learn that from a
         # TTFT regression.
         reasons.append(DegradationReasonEnum.PAIRING_REMOTE.value)
+
+    if await _gather_unmet(session, model, instances):
+        # Says what the spec cannot: the ask is stored, the outcome was not.
+        reasons.append(DegradationReasonEnum.GATHER_UNMET.value)
 
     if instances and placement_drifted(
         instances,

@@ -667,32 +667,47 @@ PD_MODE_BACKENDS: Dict[str, List[str]] = {
 
 
 class GatherSpec(BaseModel):
-    """How tightly this deployment's members must sit together.
+    """How tightly this deployment's members should sit together.
 
     The only source of the requirement. This used to be the model-level
     *override* of a cluster-wide default, but a cluster-level failure policy
     meant an operator could arm a rejection the deployer never saw stated;
     the default is gone and absent now means absent — no constraint.
 
-    Read as a *failure* policy, not a placement one. The group solver already
-    places into the tightest domain that fits, so `MustGather` adds exactly
-    one behaviour: refuse rather than quietly deliver a slower deployment.
-    That is why the form asks "below what would you rather not deploy" instead
-    of "which layer do you want" — the layer is the operator's own string and
-    a deployer may not know what it means, while "does it fit" is universal.
+    **Two independent questions, and they were one field for too long.**
+
+    - ``layer`` — how close do you want them? A *target*.
+    - ``strategy`` — and if that cannot be met? ``MustGather`` refuses;
+      ``PreferGather`` deploys anyway.
+
+    Read the pair as a failure policy layered on a target, not as a placement
+    instruction: the solver always takes the tightest domain that fits, so
+    neither field makes a group land any closer than it otherwise would.
+    What they decide is what happens when the target is missed.
+
+    🆕 ``PreferGather`` **with** a ``layer`` used to be inexpressible — the
+    form offered "as close as possible" (no target, lenient) or "at least X,
+    or refuse" (target, strict), and the combination most deployments
+    actually want, "aim for X but ship it either way", had nowhere to go.
+    It now means: place as usual, and if the group ends up looser than
+    ``layer``, say so on the model as a ``gather_unmet`` degradation. A target
+    without a threat attached, which is the normal way to ask for something.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     strategy: Optional[GatherStrategyEnum] = None
-    """None means no gather requirement. `PreferGather` keeps widening to the
-    cluster root; `MustGather` stops at `layer` and refuses the deployment
-    instead."""
+    """None means no gather requirement at all. `PreferGather` keeps widening
+    to the cluster root and reports a miss; `MustGather` stops at `layer` and
+    refuses the deployment instead."""
 
     layer: Optional[str] = None
     """The layer `strategy` applies to: a layer id of the cluster's chain, or
-    the built-in node layer, which is the leaf. Only meaningful with
-    `MustGather`.
+    the built-in node layer, which is the leaf.
+
+    Required under `MustGather` — a refusal needs something to refuse below.
+    Optional under `PreferGather`, where it is the target a miss is reported
+    against; omitted there, nothing is reported and any placement is fine.
 
     🔴 There is no `accelerator_domain` special value any more. It used to name
     the built-in rung of a second, parallel chain; a domain is now an ordinary
@@ -719,6 +734,10 @@ class GatherSpec(BaseModel):
                 "gather layer is set without a strategy; there is nothing to "
                 "apply it to"
             )
+        # `PreferGather` + a layer is deliberately NOT refused: that pair is
+        # "aim for this, ship it anyway, tell me if you missed" and is the
+        # common case. It is also why this check is one-directional — a
+        # strategy needs no layer, only `MustGather` does.
         return self
 
 
@@ -835,6 +854,17 @@ class DegradationReasonEnum(str, Enum):
     # bandwidth markers above which need traffic to have happened.
     PAIRING_REMOTE = "pairing_remote"
     NO_ATOMIC_ADMISSION = "no_atomic_admission"
+
+    GATHER_UNMET = "gather_unmet"
+    """The group is serving, but looser than the layer it asked to sit in.
+
+    Only ever set under `PreferGather`: that strategy ships whatever it can
+    place, so without this marker "I wanted same-rack" and "I got same-rack"
+    are indistinguishable afterwards — the request is in the spec and the
+    outcome is nowhere. `MustGather` needs no marker, having refused instead.
+
+    Placement-only and knowable as soon as the members are bound, like
+    `PAIRING_REMOTE` beside it: no traffic has to happen for it to be true."""
 
     PLACEMENT_DRIFTED = "placement_drifted"
     """Members are deployed somewhere other than where one created now would

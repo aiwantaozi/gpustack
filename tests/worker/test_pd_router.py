@@ -312,7 +312,7 @@ def _pd_model(router_role=None):
         roles=[
             RoleSpec(name="prefill", replicas=1),
             RoleSpec(name="decode", replicas=1),
-            router_role or RoleSpec(name="router", replicas=1, cpu_only=True),
+            router_role or RoleSpec(name="router", replicas=1),
         ],
         disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
     )
@@ -371,7 +371,6 @@ def test_a_user_supplied_router_keeps_its_own_command():
         RoleSpec(
             name="router",
             replicas=1,
-            cpu_only=True,
             image_name="me/my-router:1",
             run_command="my-router --serve",
         )
@@ -556,9 +555,7 @@ def test_a_role_image_survives_the_catalogs():
 
     from gpustack.schemas.models import role_effective_model
 
-    model = _pd_model(
-        RoleSpec(name="router", replicas=1, cpu_only=True, image_name="me/has-router:1")
-    )
+    model = _pd_model(RoleSpec(name="router", replicas=1, image_name="me/has-router:1"))
     assert is_managed_router(model, "router") is True
 
     # The projection runs first in production, so the role's image is already
@@ -584,9 +581,7 @@ def test_a_role_command_survives_the_catalogs():
 
     from gpustack.schemas.models import role_effective_model
 
-    model = _pd_model(
-        RoleSpec(name="router", replicas=1, cpu_only=True, run_command="my-router --go")
-    )
+    model = _pd_model(RoleSpec(name="router", replicas=1, run_command="my-router --go"))
 
     projected = apply_managed_router(
         role_effective_model(model, "router"),
@@ -685,7 +680,6 @@ def test_catalog_env_is_a_default_the_deployment_can_override():
         RoleSpec(
             name="router",
             replicas=1,
-            cpu_only=True,
             env={"TORCH_DEVICE_BACKEND_AUTOLOAD": "1", "MY_OWN": "x"},
         )
     )

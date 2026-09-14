@@ -262,7 +262,7 @@ async def test_pd_group_weights_only_the_router():
     model.roles = [
         RoleSpec(name=RoleNameEnum.PREFILL.value, replicas=1),
         RoleSpec(name=RoleNameEnum.DECODE.value, replicas=1),
-        RoleSpec(name=RoleNameEnum.ROUTER.value, replicas=1, cpu_only=True),
+        RoleSpec(name=RoleNameEnum.ROUTER.value, replicas=1),
     ]
     prefill = _running_instance(1)
     prefill.role = RoleNameEnum.PREFILL.value
@@ -316,7 +316,7 @@ async def test_group_without_a_running_router_weights_nothing():
     model.roles = [
         RoleSpec(name=RoleNameEnum.PREFILL.value, replicas=1),
         RoleSpec(name=RoleNameEnum.DECODE.value, replicas=1),
-        RoleSpec(name=RoleNameEnum.ROUTER.value, replicas=1, cpu_only=True),
+        RoleSpec(name=RoleNameEnum.ROUTER.value, replicas=1),
     ]
     prefill = _running_instance(1)
     prefill.role = RoleNameEnum.PREFILL.value

@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from gpustack.policies.scorers.group_locality_scorer import GroupLocalityScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.policies.scorers.model_file_locality_scorer import (
     ModelFileLocalityScorer,
@@ -448,6 +449,7 @@ class Scheduler:
                         model_instances,
                         role=model_instance.role,
                         exclude_instance_id=model_instance.id,
+                        group_id=getattr(model_instance, "group_id", None),
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
@@ -639,6 +641,7 @@ async def find_candidate(
     model_instances: List[ModelInstance],
     role: Optional[str] = None,
     exclude_instance_id: Optional[int] = None,
+    group_id: Optional[str] = None,
 ) -> Tuple[Optional[ModelInstanceScheduleCandidate], List[str]]:
     """
     Find a schedule candidate for the model instance.
@@ -650,6 +653,9 @@ async def find_candidate(
     :param exclude_instance_id: The instance being placed, if any. Its own
                  `computed_resource_claim` must not count against the GPUs it
                  is asking for -- see below.
+    :param group_id: The generation this instance belongs to, when it is a
+                 member of a role group. Used to place an accelerator-free
+                 member near the siblings it forwards to.
     :return: A tuple containing:
                 - The schedule candidate.
                 - A list of messages for the scheduling process.
@@ -683,9 +689,9 @@ async def find_candidate(
     if exclude_instance_id is not None:
         model_instances = [mi for mi in model_instances if mi.id != exclude_instance_id]
 
-    # Read before projecting: `cpu_only` is a role-OWN field, deliberately not
-    # pushed up to the Model level — "this member takes no accelerator" is true
-    # of one role, and a Model-level flag would say it of all of them.
+    # Read before projecting: the answer is a property of the ROLE — the router
+    # is a proxy and loads no weights — and the projection flattens the role's
+    # overrides onto the model, after which there is no role left to ask.
     cpu_only = role_takes_no_accelerator(model, role)
     # Same reason, same moment: `resources` is role-OWN too, and only the
     # accelerator-free branch consumes it.
@@ -737,6 +743,18 @@ async def find_candidate(
                 model,
                 draft_model_source=await get_draft_model_source(session, model),
                 max_score=locality_max_score,
+            )
+        )
+    # Only for the accelerator-free member, and only within a group: everyone
+    # else is placed by the group solver, which answers "how close" through
+    # `gather` and answers it for the whole group at once. The router is the
+    # one member that solve deliberately leaves out.
+    if cpu_only and group_id:
+        candidate_scorers.append(
+            GroupLocalityScorer(
+                group_id,
+                model_instances,
+                max_score=envs.SCHEDULER_GROUP_LOCALITY_MAX_SCORE,
             )
         )
     candidates = await CandidateScoreChain(candidate_scorers).score(candidates)

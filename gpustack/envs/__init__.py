@@ -293,6 +293,13 @@ MODEL_EVALUATION_CACHE_TTL = int(os.getenv("GPUSTACK_MODEL_EVALUATION_CACHE_TTL"
 SCHEDULER_SCALE_UP_PLACEMENT_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_UP_PLACEMENT_MAX_SCORE", 100)
 )
+# Same scale as the placement score, not the file-locality tiebreaker above:
+# bin-packing has nothing to weigh for a 2 GiB proxy, and a candidate only
+# reaches a scorer once it has been found to fit. Set to 0 to place a group's
+# router by resource fit alone.
+SCHEDULER_GROUP_LOCALITY_MAX_SCORE = float(
+    os.getenv("GPUSTACK_SCHEDULER_GROUP_LOCALITY_MAX_SCORE", 100)
+)
 SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE", 5)
 )

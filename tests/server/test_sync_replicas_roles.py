@@ -60,7 +60,7 @@ def _pd_roles(prefill=1, decode=1, router=1):
     return [
         RoleSpec(name="prefill", replicas=prefill),
         RoleSpec(name="decode", replicas=decode),
-        RoleSpec(name="router", replicas=router, cpu_only=True),
+        RoleSpec(name="router", replicas=router),
     ]
 
 
@@ -465,7 +465,7 @@ async def test_a_deployment_shaping_change_does_change_the_digest():
                 roles=[
                     RoleSpec(name="prefill", replicas=1, backend_parameters=["--x"]),
                     RoleSpec(name="decode", replicas=1),
-                    RoleSpec(name="router", replicas=1, cpu_only=True),
+                    RoleSpec(name="router", replicas=1),
                 ]
             ),
         )

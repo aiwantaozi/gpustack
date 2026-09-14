@@ -42,7 +42,7 @@ def _model(mode=PDModeEnum.VLLM_NIXL, roles=None, **kwargs) -> Model:
         roles = [
             RoleSpec(name="prefill", replicas=1),
             RoleSpec(name="decode", replicas=1),
-            RoleSpec(name="router", replicas=1, cpu_only=True),
+            RoleSpec(name="router", replicas=1),
         ]
     return Model(
         id=1,
@@ -660,7 +660,7 @@ def test_the_ascend_recipe_asks_for_the_hccn_map_on_both_sides():
         RoleSpec(
             name="decode", replicas=1, backend_parameters=["--tensor-parallel-size=2"]
         ),
-        RoleSpec(name="router", replicas=1, cpu_only=True),
+        RoleSpec(name="router", replicas=1),
     ]
     for role in ("prefill", "decode"):
         injection = render_pd_injection(

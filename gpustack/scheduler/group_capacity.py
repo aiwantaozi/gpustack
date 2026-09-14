@@ -55,7 +55,8 @@ class _RoleProjection(NamedTuple):
     """What `_eligible_for` worked out for a role, read back by two callers.
 
     A NamedTuple rather than a bare tuple because the role-OWN fields read
-    before projection are a growing set — `cpu_only`, now `ram_claim` — and a
+    before projection are a growing set — the accelerator-free flag, now
+    `ram_claim` — and a
     positional tuple couples every read site, plus every test that builds one,
     to that count. `ram_claim` defaults so a caller that only cares about
     placement need not spell it.
@@ -229,7 +230,7 @@ class GroupCapacity:
         if role in self._eligible:
             return self._eligible[role]
 
-        # Read before projecting: `cpu_only` is a role-OWN field and the
+        # Read before projecting: the answer is a property of the ROLE, and the
         # projection flattens the role's overrides onto the model.
         cpu_only = role_takes_no_accelerator(self._model, role)
         # `resources` is role-OWN as well, and only the accelerator-free

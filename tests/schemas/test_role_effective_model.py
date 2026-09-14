@@ -59,7 +59,7 @@ def _pd_roles():
             backend_parameters=["--max-num-batched-tokens=120"],
             env={"HCCL_CONNECT_TIMEOUT": "1200", "HCCL_BUFFSIZE": "1024"},
         ),
-        RoleSpec(name="router", cpu_only=True, dependencies=["prefill", "decode"]),
+        RoleSpec(name="router", dependencies=["prefill", "decode"]),
     ]
 
 
@@ -286,7 +286,7 @@ def test_a_managed_router_takes_no_accelerator_without_being_told():
     model = _model(
         roles=[
             RoleSpec(name="prefill", replicas=1),
-            RoleSpec(name="router", replicas=1, cpu_only=False),
+            RoleSpec(name="router", replicas=1),
         ]
     )
 
@@ -294,40 +294,47 @@ def test_a_managed_router_takes_no_accelerator_without_being_told():
     assert role_takes_no_accelerator(model, "prefill") is False
 
 
-def test_a_user_supplied_router_governs_itself():
-    """It identifies itself by carrying an image AND a command, and it may
-    legitimately want a GPU. The model-level image does not count — that one
-    is the engine's, not this router's."""
+def test_a_user_supplied_router_takes_no_accelerator_either():
+    """🔴 It used to govern itself, through `RoleSpec.cpu_only`, on the theory
+    that a router someone brings themselves may legitimately want a card.
 
-    def _with(cpu_only):
-        return _model(
-            roles=[
-                RoleSpec(
-                    name="router",
-                    replicas=1,
-                    cpu_only=cpu_only,
-                    image_name="me/router:1",
-                    run_command="my-router",
-                )
-            ]
-        )
+    It could not. The only sizing reachable on that path is
+    `estimate_model_vram`, which returns the MODEL'S WEIGHTS — so «a custom
+    router with a GPU» meant booking a proxy at 164 GiB for a 72B model, and
+    there was no per-role way to override it (`GPUSTACK_MODEL_VRAM_CLAIM` is
+    model-level and would mis-size prefill and decode too). An unimplementable
+    branch, not an unused one.
 
-    assert role_takes_no_accelerator(_with(False), "router") is False
-    assert role_takes_no_accelerator(_with(True), "router") is True
-
-
-def test_a_half_specified_router_is_still_managed():
-    """An image with no command cannot be launched on its own, so it is not
-    the user bringing their own router."""
+    So the answer is the role's name now, image and command or not. A
+    GPU-bearing role that is neither prefill nor decode comes back as a new
+    role NAME."""
     model = _model(
-        roles=[RoleSpec(name="router", replicas=1, image_name="me/router:1")]
+        roles=[
+            RoleSpec(
+                name="router",
+                replicas=1,
+                image_name="me/router:1",
+                run_command="my-router",
+            )
+        ]
     )
     assert role_takes_no_accelerator(model, "router") is True
 
 
-def test_an_explicit_flag_wins_for_any_role():
-    model = _model(roles=[RoleSpec(name="prefill", replicas=1, cpu_only=True)])
-    assert role_takes_no_accelerator(model, "prefill") is True
+def test_a_stale_cpu_only_on_a_gpu_role_is_read_straight_past():
+    """`RoleSpec` takes pydantic's default `extra="ignore"`, so an old row or
+    an old client still sending the flag loads without error — and no longer
+    has any effect. Worth pinning because the flag was accepted on ANY role:
+    `cpu_only: true` on prefill was never refused at admission, and it
+    produced a prefill placed with no card. That footgun closes here."""
+    model = _model(
+        roles=[
+            RoleSpec.model_validate(
+                {"name": "prefill", "replicas": 1, "cpu_only": True}
+            )
+        ]
+    )
+    assert role_takes_no_accelerator(model, "prefill") is False
 
 
 def test_a_role_less_model_takes_accelerators():

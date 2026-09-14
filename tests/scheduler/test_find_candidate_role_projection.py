@@ -46,7 +46,7 @@ def _pd_model():
         roles=[
             RoleSpec(name="prefill", replicas=1),
             RoleSpec(name="decode", replicas=1),
-            RoleSpec(name="router", replicas=1, cpu_only=True),
+            RoleSpec(name="router", replicas=1),
         ],
         disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
     )
@@ -221,21 +221,29 @@ async def test_find_candidate_does_not_mutate_the_model(harness):
     assert model.replicas == 1
 
 
-# --- a cpu_only role takes no accelerator ---------------------------------- #
+# --- the router takes no accelerator --------------------------------------- #
 
 
-def test_cpu_only_is_a_role_own_field():
-    """It must not be pushed to the Model level: "this member takes no
-    accelerator" is true of one role, and a Model-level flag would say it of
-    all of them — which is why `find_candidate` reads it before projecting."""
+def test_the_answer_is_read_off_the_role_not_off_the_projection():
+    """`role_takes_no_accelerator` asks the ROLE, and the projection flattens
+    the role's overrides onto the model — after which there is no role left to
+    ask. So `find_candidate` has to read it first, which is what this pins.
+
+    🔴 There used to be a `cpu_only` field to check here as well. It was a
+    boolean standing in for a quantity: the scheduler needs a VRAM claim, and
+    the flag only decided whether to go ask `estimate_model_vram`, which sizes
+    the model's WEIGHTS. So its `False` branch meant "book this proxy at the
+    whole model" — 164 GiB for a 72B — with no per-role way to override it.
+    Unimplementable rather than unused, and gone."""
     from gpustack.schemas.models import _ROLE_OVERRIDE_FIELDS, _ROLE_OWN_FIELDS
 
-    assert "cpu_only" in _ROLE_OWN_FIELDS
+    assert "cpu_only" not in _ROLE_OWN_FIELDS
     assert "cpu_only" not in _ROLE_OVERRIDE_FIELDS
+    assert "resources" in _ROLE_OWN_FIELDS
 
 
 @pytest.mark.asyncio
-async def test_a_cpu_only_role_uses_the_cpu_only_selector(harness):
+async def test_the_router_uses_the_cpu_only_selector(harness):
     """Observed live: the router inherited the group's vLLM backend, so a vLLM
     selector sized the model's weights for a process that never loads them —
     and it sat unschedulable on a host whose cards its own peers had filled."""
@@ -256,7 +264,7 @@ async def test_a_gpu_role_keeps_its_engines_selector(harness):
 
 
 @pytest.mark.asyncio
-async def test_a_role_less_model_never_takes_the_cpu_only_path(harness):
+async def test_a_role_less_model_never_takes_the_accelerator_free_path(harness):
     await _run(_model())
 
     assert len(harness.selectors["VLLMResourceFitSelector"].seen) == 1

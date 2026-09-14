@@ -587,8 +587,28 @@ class RoleSpec(BaseModel):
 
     dependencies: Optional[List[str]] = None
     """Roles that must be ready before this one starts. Must not cycle."""
-    cpu_only: bool = False
-    """A router takes no GPU."""
+    # 🔴 No `cpu_only`. It was a boolean standing in for a quantity: the
+    # scheduler needs a VRAM claim, and the flag only decided whether to go ask
+    # `estimate_model_vram` — which sizes the MODEL'S WEIGHTS and is therefore
+    # the wrong number for any role that does not load them. So the `False`
+    # branch had no correct implementation for a router: the only way to say
+    # "give this router a card" booked it at the whole model, and there was no
+    # per-role way to override that (`GPUSTACK_MODEL_VRAM_CLAIM` is
+    # model-level, so setting it would mis-size prefill and decode too).
+    #
+    # Deleting it makes "a router takes no accelerator" a property of the role
+    # rather than a checkbox someone had to remember, which matters because
+    # `role_takes_no_accelerator` gates three separate things — the VRAM claim,
+    # whether the CONTAINER asks for devices, and gang membership — each with
+    # its own recorded incident from getting it wrong.
+    #
+    # Old rows and old clients still carrying it are read straight past:
+    # `RoleSpec` takes pydantic's default `extra="ignore"`, and the value they
+    # carried (`False` on every group the UI ever produced) now means what it
+    # already meant in practice.
+    #
+    # A GPU-bearing role that is not prefill or decode comes back as a new role
+    # NAME, not as a flag on the router.
     resources: Optional[RoleResources] = None
     """CPU and memory for a role that claims no accelerator — the router.
 
@@ -1122,7 +1142,7 @@ class RoleEffectiveModel(ModelBase):
 # The RoleSpec fields that describe the role itself rather than override a
 # Model field. Everything else is an override, derived rather than listed so
 # that adding one to RoleSpec cannot silently fail to be projected.
-_ROLE_OWN_FIELDS = frozenset({"name", "dependencies", "cpu_only", "resources"})
+_ROLE_OWN_FIELDS = frozenset({"name", "dependencies", "resources"})
 
 _ROLE_OVERRIDE_FIELDS = frozenset(RoleSpec.model_fields) - _ROLE_OWN_FIELDS
 
@@ -1168,29 +1188,31 @@ def servable_instances(model, instances):
 def role_takes_no_accelerator(model, role_name: Optional[str]) -> bool:
     """Whether this role should be placed without claiming any GPU.
 
-    `cpu_only` on the role is the explicit answer, but it cannot be the only
-    one. A router GPUStack assembles from the mode catalog is a proxy — it
-    forwards requests to the members that hold the weights and loads none
-    itself — so "takes no accelerator" is a property of what it *is*, not a
-    preference someone remembered to tick. Measured consequence of relying on
-    the flag alone: the router inherited the group's engine, a vLLM selector
-    sized the model's weights for it, and it sat unschedulable on a two-card
-    host whose cards its own prefill and decode had just filled. The deploy
-    form only registers the flag on the hand-written branch, so every group
-    the UI has produced carries `cpu_only: false` on its router.
+    The router, and only the router. It is a proxy — it forwards requests to
+    the members that hold the weights and loads none itself — so this is a
+    property of what the role *is*, and the answer cannot depend on anyone
+    remembering to tick anything.
 
-    A router the user brings themselves is the exception, and it identifies
-    itself by carrying an image *and* a command. That one may legitimately
-    want a GPU, so its own `cpu_only` governs.
+    🔴 It used to. `RoleSpec.cpu_only` was consulted first, and a router the
+    user brought themselves (image *and* command) was governed by it alone, on
+    the theory that such a router might legitimately want a card. It could not:
+    the only sizing available on that path is `estimate_model_vram`, which
+    returns the model's weights, so "a custom router with a GPU" meant booking
+    a proxy at 164 GiB for a 72B model. The branch was unreachable in any
+    correct sense and is gone with the flag.
+
+    Measured consequences of the old shape, both from relying on the flag:
+    a router inherited the group's engine, a vLLM selector sized the weights
+    for it, and it sat unschedulable on a two-card host whose cards its own
+    prefill and decode had just filled; and separately, a router the scheduler
+    had correctly placed with no VRAM claim asked for a device anyway and the
+    plugin handed it 40% of a card its siblings were sharing — because the
+    container-side gate read the same flag, and nothing failed.
     """
     role = find_role(model, role_name)
     if role is None:
         return False
-    if role.cpu_only:
-        return True
-    if role.name != RoleNameEnum.ROUTER.value:
-        return False
-    return not (role.image_name and role.run_command)
+    return role.name == RoleNameEnum.ROUTER.value
 
 
 def role_container_resources(model, role_name: Optional[str]) -> RoleResources:

@@ -49,7 +49,7 @@ def _model(roles=True, gather=None, cluster_id=1):
         model.roles = [
             RoleSpec(name="prefill", replicas=2),
             RoleSpec(name="decode", replicas=2),
-            RoleSpec(name="router", replicas=1, cpu_only=True),
+            RoleSpec(name="router", replicas=1),
         ]
     return model
 

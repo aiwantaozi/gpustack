@@ -72,7 +72,6 @@ _ROLE_SCALAR_FIELDS = (
     "backend",
     "backend_version",
     "image_name",
-    "cpu_only",
 )
 
 

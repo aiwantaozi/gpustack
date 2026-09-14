@@ -154,7 +154,7 @@ def test_the_servability_gate_reads_the_recorded_outcome():
 
     model.roles = [
         RoleSpec(name="prefill", replicas=1),
-        RoleSpec(name="router", replicas=1, cpu_only=True),
+        RoleSpec(name="router", replicas=1),
     ]
     pd_membership.forget(42)
     assert upstream_registration_ready(model) is True, "unrecorded: command-line path"

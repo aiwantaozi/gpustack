@@ -63,7 +63,7 @@ def _pd_roles(prefill=3, decode=1, router=1):
     return [
         RoleSpec(name="prefill", replicas=prefill),
         RoleSpec(name="decode", replicas=decode),
-        RoleSpec(name="router", replicas=router, cpu_only=True),
+        RoleSpec(name="router", replicas=router),
     ]
 
 

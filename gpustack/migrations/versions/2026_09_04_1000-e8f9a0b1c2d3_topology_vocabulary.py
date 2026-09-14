@@ -82,9 +82,10 @@ def _fold(topology: dict):
             layer["parentLayer"] = renames[parent]
     topology = dict(topology)
     topology["layers"] = kept
-    for field in ("defaultGatherLayer", "default_gather_layer"):
-        if topology.get(field) in renames:
-            topology[field] = renames[topology[field]]
+    # Nothing else in the declaration points at a layer name any more. This
+    # loop used to also rewrite `defaultGatherLayer`, the cluster-level gather
+    # default; that field is gone, and `ClusterTopology` ignores unknown keys,
+    # so an old row that still carries one is read straight past.
     return topology, renames
 
 

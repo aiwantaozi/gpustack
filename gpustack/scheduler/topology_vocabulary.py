@@ -1,21 +1,28 @@
 """The fixed vocabulary of places a worker can be, and how a worker's place is read.
 
 An operator describes a machine room, not a schema: "node-9 is in rack R3".
-The layers a machine room has are a small, stable set — region, zone, room,
-row, rack, the access switch, the host — so they are declared once here, in
-order, and a cluster only ever fills in *values*. A field with a value on at
-least one worker is a layer of that cluster's tree; a field nobody filled in is
-not. There is no "declare a layer" step.
+The layers a machine room has are a small, stable set — the room, the row of
+cabinets, the cabinet, the host — so they are declared once here, in order, and
+a cluster only ever fills in *values*. A field with a value on at least one
+worker is a layer of that cluster's tree; a field nobody filled in is not.
+There is no "declare a layer" step for the built-in three.
 
-Two things sit beside the tree rather than in it:
+🔴 **There used to be two vocabularies, because there were two chains** — the
+network one above and an accelerator one whose single built-in rung was the
+NVLink/HCCS/UB domain, held apart from the network chain because the domain's
+containment direction versus a rack comes out three different ways across four
+shipping hardware generations. Review overturned that. A domain whose boundary
+is a run of contiguous cabinets is expressible as one rung of the one chain,
+and on every generation that ships it is contiguous; where the domain sits
+*inside* one machine (910B2), "same domain" and "same host" are the same
+constraint and the built-in leaf already covers it. So there is one chain, the
+operator decides where the domain rung goes on it, and the keys the domain is
+published under survive as **candidate keys** (``KNOWN_KEYS``) rather than as a
+second vocabulary.
 
-- **The accelerator domain** (NVLink / HCCS / UB reach). It nests in no fixed
-  place — inside a host on an 8-card server, across sixteen racks on a
-  CloudMatrix384 — so it is a flat grouping with its own keys, consulted by the
-  solver as its own candidate set.
-- **Custom layers**, for the fleet whose fabric has a rung this list does not
-  name. They live in ``Cluster.topology.layers`` with the parent chain the tree
-  has always used, and slot between the vocabulary's fields.
+**Custom layers** are for every rung this list does not name — the accelerator
+domain among them. They live in ``Cluster.topology.layers`` with the parent
+chain the tree has always used, and slot between the vocabulary's fields.
 
 Every field owns one key under ``topology.gpustack.ai/``, listed first among its
 candidates. That is what the table writes when an operator fills in a value,
@@ -26,25 +33,16 @@ cloud, a device or a discovery tool wrote under another key.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from gpustack.scheduler.topology import (
-    ACCELERATOR_DOMAIN_LAYER,
-    ACCELERATOR_SUB_DOMAIN_LAYER,
     NODE_LAYER,
+    ROOT_LAYER,
     TopologyLayerSpec,
     effective_topology_labels,
 )
 
 GPUSTACK_PREFIX = "topology.gpustack.ai/"
-
-ACCELERATOR_DOMAIN = ACCELERATOR_DOMAIN_LAYER
-"""The id of the domain field, in the same namespace as layer ids so a saved
-``gather.layer`` can name it."""
-
-ACCELERATOR_SUB_DOMAIN = ACCELERATOR_SUB_DOMAIN_LAYER
-"""The solver's scope for "same domain and same sub-domain"; never a field an
-operator fills in directly (its keys point at another field's)."""
 
 
 @dataclass(frozen=True)
@@ -63,50 +61,55 @@ class VocabularyField:
 # recognises, and a fixed order is what lets two clusters mean the same thing
 # by "rack".
 #
-# 🔴 `room` and `row` were removed in review. Five builtins pre-offered in the
-# UI's field list read as five things to fill in, while the only one a PD group
-# actually needs is `rack` (and `switch`, which the worker discovers by
-# itself). Anyone who does organise by machine room or rack row declares it as
-# a custom layer — that path exists, is named "Add layer" in the UI, and now
-# accepts these two ids because they are no longer reserved. Placement loses
-# nothing either way: a tier means "no worse than X", so a rack inside an
-# undeclared room still satisfies "same rack".
+# 🔴 `region`, `zone` and `switch` were removed in review, and `room`/`row`
+# restored. `region`/`zone` are cloud words for a failure domain, not for a
+# distance a KV transfer notices; `switch` is a fact the worker discovers by
+# itself and writes as a label, so it needs no built-in rung — an operator who
+# wants to place by it adds a layer pointing at its key, which is the same
+# operation as adding one for the accelerator domain.
 VOCABULARY: Tuple[VocabularyField, ...] = (
-    VocabularyField(
-        "region",
-        (GPUSTACK_PREFIX + "region", "topology.kubernetes.io/region"),
-    ),
-    VocabularyField(
-        "zone",
-        (GPUSTACK_PREFIX + "zone", "topology.kubernetes.io/zone"),
-    ),
+    VocabularyField("room", (GPUSTACK_PREFIX + "room",)),
+    VocabularyField("row", (GPUSTACK_PREFIX + "row",)),
     VocabularyField(
         "rack",
         (GPUSTACK_PREFIX + "rack", "topology.kubernetes.io/rack"),
-    ),
-    # The leaf switch a worker's ports are cabled to, as its LLDP neighbour
-    # reports itself. Discovered by the worker, not filled in, and the closest
-    # thing to a rack a host can learn on its own.
-    VocabularyField(
-        "switch",
-        (GPUSTACK_PREFIX + "switch", "fabric.topograph.run/tier-0"),
     ),
 )
 
 VOCABULARY_IDS = tuple(f.id for f in VOCABULARY)
 
-ACCELERATOR_DOMAIN_KEYS: Tuple[str, ...] = (
-    GPUSTACK_PREFIX + "accelerator-domain",
-    "nvidia.com/gpu.clique",
-)
+SWITCH_KEY = GPUSTACK_PREFIX + "switch"
+"""The leaf switch a worker's ports are cabled to, as its LLDP neighbour
+reports itself. Written by the worker, never built in: it is a *fact*, and a
+fact becomes a place only when an operator declares a layer that reads it."""
 
 SWITCH_NAME_KEY = GPUSTACK_PREFIX + "switch-name"
 """Where the worker records the switch's own name beside its chassis id, so the
 UI can show ``CE8875-50`` instead of a MAC. Read for display only; membership
 is decided by the chassis id."""
 
-RESERVED_IDS = frozenset(VOCABULARY_IDS) | {ACCELERATOR_DOMAIN, ACCELERATOR_SUB_DOMAIN}
-"""Ids a custom layer may not take."""
+RESERVED_IDS = frozenset({ROOT_LAYER, NODE_LAYER})
+"""Names no declared layer may take: the implicit root, and the leaf.
+
+🔴 It used to also hold the *other* chain's built-in ids — with two chains,
+``rack`` on the accelerator chain and ``accelerator_domain`` on the network one
+had to be refused, or a layer name could not be read without first asking which
+chain it came from. With one chain there is no "other chain" to protect a name
+from, and a vocabulary id was never reserved against its own chain anyway:
+naming ``rack`` in the declaration is how an operator overrides that field's
+keys. So the set collapses to the two names that are not layers at all.
+
+``accelerator_domain`` in particular is now free, and using it is the
+recommended way to spell the domain rung as a custom layer."""
+
+
+def declared_layers(topology) -> List:
+    """The entries a cluster declared.
+
+    One accessor rather than every call site reaching for the attribute, so a
+    ``ClusterTopology`` and a test stub are read the same way.
+    """
+    return list(getattr(topology, "layers", None) or [])
 
 
 @dataclass(frozen=True)
@@ -120,65 +123,88 @@ class KnownKey:
     note: str = ""
 
 
+# 🔴 ``fits`` names the built-in rung a key is *nearest* to, and that is all it
+# is: a hint for where to insert the layer that reads it. The accelerator-domain
+# and switch keys are in here rather than in ``VOCABULARY`` for the reason at
+# the top of this module — they are facts the fleet publishes, and which rung
+# they amount to is the operator's call, not ours.
 KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
-        "fabric.topograph.run/tier-0",
-        "Topograph",
-        ("switch", "rack"),
-        "The switch closest to the node.",
+        GPUSTACK_PREFIX + "accelerator-domain",
+        "GPUStack",
+        ("rack", "row"),
+        "NVLink/HCCS/UB domain, as the worker's runtime reports it.",
     ),
     KnownKey(
-        "fabric.topograph.run/tier-1",
-        "Topograph",
-        ("rack", "zone"),
-        "One tier above the leaf switch.",
-    ),
-    KnownKey(
-        "fabric.topograph.run/tier-2",
-        "Topograph",
-        ("zone",),
-        "Two tiers above the leaf switch.",
+        "nvidia.com/gpu.clique",
+        "NVIDIA",
+        ("rack", "row"),
+        "NVLink domain, written by the driver.",
     ),
     KnownKey(
         "accelerator.topograph.run/domain",
         "Topograph",
-        (ACCELERATOR_DOMAIN,),
+        ("rack", "row"),
         "NVLink domain as Topograph discovers it.",
     ),
     KnownKey(
         "network.topology.nvidia.com/accelerator",
         "NVIDIA",
-        (ACCELERATOR_DOMAIN,),
+        ("rack", "row"),
         "NVLink domain.",
+    ),
+    KnownKey(
+        GPUSTACK_PREFIX + "switch",
+        "GPUStack",
+        ("rack",),
+        "The switch closest to the node, as the worker's LLDP probe heard it.",
+    ),
+    KnownKey(
+        "fabric.topograph.run/tier-0",
+        "Topograph",
+        ("rack",),
+        "The switch closest to the node.",
+    ),
+    KnownKey(
+        "fabric.topograph.run/tier-1",
+        "Topograph",
+        ("row", "room"),
+        "One tier above the leaf switch.",
+    ),
+    KnownKey(
+        "fabric.topograph.run/tier-2",
+        "Topograph",
+        ("room",),
+        "Two tiers above the leaf switch.",
     ),
     KnownKey(
         "network.topology.nvidia.com/block",
         "NVIDIA",
-        ("rack",),
+        ("rack", "row"),
         "IB fabric block.",
     ),
     KnownKey(
         "network.topology.nvidia.com/spine",
         "NVIDIA",
-        ("zone",),
+        ("room",),
         "IB fabric spine.",
     ),
     KnownKey(
         "network.topology.nvidia.com/datacenter",
         "NVIDIA",
-        ("zone", "region"),
+        ("room",),
         "IB fabric datacenter.",
     ),
     KnownKey(
         "cloud.google.com/gce-topology-subblock",
         "GKE",
-        ("rack", ACCELERATOR_DOMAIN),
+        ("rack",),
         "On A4X this is the NVL72 domain.",
     ),
     KnownKey(
         "cloud.google.com/gce-topology-block",
         "GKE",
-        ("rack", "zone"),
+        ("row", "room"),
         "One fast network.",
     ),
     KnownKey(
@@ -190,22 +216,25 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "topology.k8s.aws/ultraserver-id",
         "EKS",
-        (ACCELERATOR_DOMAIN,),
+        ("rack",),
         "GB200 UltraServer NVL72 domain.",
     ),
     KnownKey(
         "ds.coreweave.com/nvlink.domain",
         "CoreWeave",
-        (ACCELERATOR_DOMAIN,),
+        ("rack",),
         "NVL72 domain.",
     ),
     KnownKey(
-        "topology.kubernetes.io/zone", "Kubernetes", ("zone",), "Well-known zone label."
+        "topology.kubernetes.io/zone",
+        "Kubernetes",
+        ("room",),
+        "Well-known zone label.",
     ),
     KnownKey(
         "topology.kubernetes.io/region",
         "Kubernetes",
-        ("region",),
+        ("room",),
         "Well-known region label.",
     ),
 )
@@ -219,7 +248,7 @@ def source_of(worker, key: str) -> str:
 
 @dataclass(frozen=True)
 class ResolvedLayer:
-    """One rung of a cluster's tree, vocabulary or custom, keys resolved."""
+    """One rung of a cluster's chain, vocabulary or custom, keys resolved."""
 
     id: str
     label_keys: Tuple[str, ...]
@@ -235,31 +264,18 @@ class ResolvedLayer:
         )
 
 
-@dataclass(frozen=True)
-class ResolvedDomain:
-    label_keys: Tuple[str, ...]
-    sub_domain_keys: Tuple[str, ...]
-
-    @property
-    def primary_key(self) -> str:
-        return self.label_keys[0] if self.label_keys else ACCELERATOR_DOMAIN_KEYS[0]
-
-
 @dataclass
 class ResolvedTopology:
-    """A cluster's declaration with the vocabulary filled in.
+    """A cluster's declaration with the vocabulary filled in, root-to-leaf.
 
-    ``chain`` is every layer root-to-leaf (leaf excluded) whether or not any
-    worker has a value for it; ``active`` is the subset the tree is built from.
+    ``layers`` is every rung whether or not any worker has a value for it;
+    ``active`` is the subset a tree is built from.
     """
 
-    chain: List[ResolvedLayer] = field(default_factory=list)
-    domain: ResolvedDomain = field(
-        default_factory=lambda: ResolvedDomain(ACCELERATOR_DOMAIN_KEYS, ())
-    )
+    layers: List[ResolvedLayer] = field(default_factory=list)
 
     def layer(self, layer_id: str) -> Optional[ResolvedLayer]:
-        for layer in self.chain:
+        for layer in self.layers:
             if layer.id == layer_id:
                 return layer
         return None
@@ -275,7 +291,7 @@ class ResolvedTopology:
         """
         labels = [effective_topology_labels(w) for w in workers]
         out: List[ResolvedLayer] = []
-        for layer in self.chain:
+        for layer in self.layers:
             if not layer.builtin or any(
                 _has_value(lb, layer.label_keys) for lb in labels
             ):
@@ -299,36 +315,37 @@ def _has_value(labels: Mapping[str, str], keys: Sequence[str]) -> bool:
 def resolve(topology) -> ResolvedTopology:
     """Fill the vocabulary into a cluster's ``ClusterTopology`` (or None).
 
-    ``layers`` empty is the common case and means the vocabulary as-is. A
-    non-empty ``layers`` is the Advanced panel's work: an entry named after a
-    vocabulary field replaces that field's keys; any other entry is a custom
-    layer whose place in the chain is fixed by its ``parent_layer``.
+    Empty declarations are the common case and mean the vocabulary as-is:
+    room/row/rack. A non-empty list is the Advanced panel's work — an entry
+    named after a vocabulary field replaces that field's keys, and any other
+    entry is a custom layer whose place is fixed by its ``parent_layer``.
 
     Custom layers are spliced in by their parent: right below the parent they
     name, which may be a vocabulary field or another custom layer. A custom
     layer with no parent sits at the top, above the vocabulary. The vocabulary
     itself never moves.
     """
-    declared = list(getattr(topology, "layers", None) or [])
-    overrides = {}
+    vocabulary_ids = {v.id for v in VOCABULARY}
+
+    overrides: Dict[str, Tuple[str, ...]] = {}
     customs = []
-    for entry in declared:
+    for entry in declared_layers(topology):
         name = getattr(entry, "name", None)
         if not name:
             continue
-        if name in VOCABULARY_IDS:
+        if name in vocabulary_ids:
             overrides[name] = tuple(getattr(entry, "label_keys", None) or ())
         else:
             customs.append(entry)
 
-    chain: List[ResolvedLayer] = []
+    layers: List[ResolvedLayer] = []
     for vocab in VOCABULARY:
         keys = overrides.get(vocab.id, vocab.label_keys)
         # The owned key stays first whatever the override said: it is the key
         # the table writes, and if it were not tried first a hand-filled value
         # could lose to a discovered one — the one ordering this design forbids.
         keys = (vocab.primary_key,) + tuple(k for k in keys if k != vocab.primary_key)
-        chain.append(ResolvedLayer(vocab.id, keys, builtin=True))
+        layers.append(ResolvedLayer(vocab.id, keys, builtin=True))
 
     # Splice customs below their parent. Repeated until stable so a custom
     # layer under another custom layer lands after both are placed.
@@ -340,12 +357,12 @@ def resolve(topology) -> ResolvedTopology:
             keys = tuple(getattr(entry, "label_keys", None) or ())
             layer = ResolvedLayer(entry.name, keys, builtin=False)
             if parent is None:
-                chain.insert(0, layer)
+                layers.insert(0, layer)
             else:
-                index = next((i for i, x in enumerate(chain) if x.id == parent), None)
+                index = next((i for i, x in enumerate(layers) if x.id == parent), None)
                 if index is None:
                     continue
-                chain.insert(index + 1, layer)
+                layers.insert(index + 1, layer)
             pending.remove(entry)
             progressed = True
         if not progressed:
@@ -354,35 +371,30 @@ def resolve(topology) -> ResolvedTopology:
             # scheduler down.
             break
 
-    domain_spec = getattr(topology, "accelerator_domain", None)
-    domain_keys = (
-        tuple(getattr(domain_spec, "label_keys", None) or ()) or ACCELERATOR_DOMAIN_KEYS
-    )
-    domain_keys = (ACCELERATOR_DOMAIN_KEYS[0],) + tuple(
-        k for k in domain_keys if k != ACCELERATOR_DOMAIN_KEYS[0]
-    )
-    sub_keys = tuple(getattr(domain_spec, "sub_domain_keys", None) or ())
-    return ResolvedTopology(chain=chain, domain=ResolvedDomain(domain_keys, sub_keys))
+    return ResolvedTopology(layers)
 
 
 def validate_declaration(topology) -> ResolvedTopology:
     """Refuse a declaration that cannot become a tree; return it resolved.
 
     Only the declaration is judged, never the data: a custom layer naming a
-    parent that does not exist, taking a vocabulary id as its name, or forking
-    the chain means the operator's intent is unknowable, while a worker missing
-    a value is a normal state the tree has a place for. Raised as
-    ``TopologyError`` so the schema validator and the scheduler refuse the
-    same declarations for the same reasons.
+    parent that does not exist, taking a reserved id as its name or forking the
+    chain means the operator's intent is unknowable, while a worker missing a
+    value is a normal state the tree has a place for. Raised as
+    ``TopologyError`` so the schema validator and the scheduler refuse the same
+    declarations for the same reasons.
     """
     from gpustack.scheduler.topology import TopologyError, layer_names
 
-    layers = list(getattr(topology, "layers", None) or [])
+    resolved = resolve(topology)
+
+    vocabulary_ids = {v.id for v in VOCABULARY}
+    layers = declared_layers(topology)
     seen = set()
     custom_names = {
         layer_.name
         for layer_ in layers
-        if layer_.name and layer_.name not in VOCABULARY_IDS
+        if layer_.name and layer_.name not in vocabulary_ids
     }
     for layer in layers:
         if not layer.name:
@@ -390,16 +402,16 @@ def validate_declaration(topology) -> ResolvedTopology:
         if layer.name in seen:
             raise TopologyError(f"Duplicate topology layer {layer.name!r}.")
         seen.add(layer.name)
-        if layer.name in RESERVED_IDS and layer.name not in VOCABULARY_IDS:
+        if layer.name in RESERVED_IDS:
             raise TopologyError(f"{layer.name!r} is reserved and cannot be a layer.")
         # A vocabulary entry's `parent_layer` is ignored rather than refused:
         # its place in the chain is fixed, and a client that serialises the
         # whole chain uniformly (each entry pointing at its predecessor) is
         # not wrong about anything that matters.
         if (
-            layer.name not in VOCABULARY_IDS
+            layer.name not in vocabulary_ids
             and layer.parent_layer
-            and layer.parent_layer not in VOCABULARY_IDS
+            and layer.parent_layer not in vocabulary_ids
             and layer.parent_layer not in custom_names
         ):
             raise TopologyError(
@@ -411,7 +423,7 @@ def validate_declaration(topology) -> ResolvedTopology:
     # The tree the scheduler walks has one path from root to leaf, and a fork
     # would make "how many layers up" have no single answer.
     parents = [
-        layer_.parent_layer for layer_ in layers if layer_.name not in VOCABULARY_IDS
+        layer_.parent_layer for layer_ in layers if layer_.name not in vocabulary_ids
     ]
     if len(parents) != len(set(parents)):
         raise TopologyError(
@@ -419,23 +431,21 @@ def validate_declaration(topology) -> ResolvedTopology:
             "single chain."
         )
 
-    resolved = resolve(topology)
-    placed = {layer.id for layer in resolved.chain}
+    placed = {layer.id for layer in resolved.layers}
     unreachable = sorted(name for name in custom_names if name not in placed)
     if unreachable:
         raise TopologyError(
             f"Topology layers {', '.join(unreachable)} are not reachable from the "
             "cluster root; the layers must form a single chain."
         )
-    layer_names(resolved.specs(resolved.chain))
+
+    layer_names(resolved.specs(resolved.layers))
     return resolved
 
 
 def gather_layer_names(resolved: ResolvedTopology) -> List[str]:
-    """Everything a `gather.layer` may name: the chain, the leaf, the domain."""
-    from gpustack.scheduler.topology import layer_names
-
-    return layer_names(resolved.specs(resolved.chain)) + [ACCELERATOR_DOMAIN]
+    """Every layer a saved ``gather.layer`` may name: the host, then the chain."""
+    return [NODE_LAYER] + [layer.id for layer in resolved.layers]
 
 
 def primary_key_for(resolved: ResolvedTopology, field_id: str) -> Optional[str]:
@@ -445,8 +455,6 @@ def primary_key_for(resolved: ResolvedTopology, field_id: str) -> Optional[str]:
     it writes, which is why the Advanced panel tells an operator to put the
     key they mean to write first.
     """
-    if field_id == ACCELERATOR_DOMAIN:
-        return resolved.domain.primary_key
     if field_id == NODE_LAYER:
         return None
     layer = resolved.layer(field_id)
@@ -456,10 +464,8 @@ def primary_key_for(resolved: ResolvedTopology, field_id: str) -> Optional[str]:
 def display_name(field_id: str) -> str:
     """An English fallback for the UI, which localises the builtin ids itself."""
     return {
-        "region": "Region",
-        "zone": "Zone",
+        "room": "Room",
+        "row": "Row",
         "rack": "Rack",
-        "switch": "Access switch",
-        ACCELERATOR_DOMAIN: "Accelerator domain",
         NODE_LAYER: "Host",
     }.get(field_id, field_id)

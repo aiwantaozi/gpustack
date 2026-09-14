@@ -952,6 +952,7 @@ async def validate_model_in(
     await validate_pd_mode_runtime(
         session, model_in, cluster_id=cluster_id, stored=stored
     )
+    await validate_gather_layer(session, model_in, cluster_id=cluster_id, stored=stored)
 
     if getattr(model_in, "gpu_type_selector", None) is not None:
         await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
@@ -1135,6 +1136,73 @@ async def validate_pd_mode_runtime(
             message=(
                 f"pd mode '{mode_name}' cannot run here: "
                 f"{verdict.ineligible_reason}"
+            )
+        )
+
+
+async def validate_gather_layer(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    *,
+    cluster_id: Optional[int] = None,
+    stored: Optional[Model] = None,
+):
+    """Refuse a `gather.layer` this cluster has no rung for.
+
+    🔴 The failure this prevents is silence, not a crash. The solver's
+    `_enforced_gather` stands an unknown layer down and places the group as if
+    nothing had been asked for — correct behaviour there (a layer renamed under
+    a *running* deployment must not take it down) and exactly the wrong
+    behaviour at submit time, where it would accept a `MustGather` under a
+    promise nothing enforces.
+
+    It is checked here rather than on `GatherSpec` because the answer depends
+    on the cluster: the layer names are the cluster's own declaration, which a
+    field validator on the model has no access to. This is also where
+    `accelerator_domain` stops being accepted — it was the built-in rung of a
+    second chain and is now just a name, so it is valid only for a cluster that
+    actually declared a layer called that.
+
+    A cluster that cannot be read is left alone rather than guessed at:
+    scheduling still stands the requirement down, so the cost is the old
+    behaviour, not a wrong refusal.
+    """
+    gather = getattr(model_in, "gather", None)
+    if gather is None and stored is not None:
+        if "gather" not in getattr(model_in, "model_fields_set", set()):
+            gather = getattr(stored, "gather", None)
+    layer = getattr(gather, "layer", None)
+    if not layer:
+        return
+
+    from gpustack.schemas.clusters import Cluster
+    from gpustack.scheduler.topology import NODE_LAYER, TopologyError
+    from gpustack.scheduler.topology_vocabulary import (
+        gather_layer_names,
+        validate_declaration,
+    )
+
+    if layer == NODE_LAYER:
+        return
+
+    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
+    if effective_cluster_id is None:
+        return
+    cluster = await Cluster.one_by_id(session, effective_cluster_id)
+    if cluster is None:
+        return
+
+    try:
+        names = gather_layer_names(validate_declaration(cluster.topology))
+    except TopologyError:
+        # The cluster's own declaration is broken; refusing the *model* for it
+        # would send the operator to the wrong page.
+        return
+    if layer not in names:
+        raise BadRequestException(
+            message=(
+                f"gather layer {layer!r} is not a layer of this cluster. "
+                f"Available: {', '.join(names)}."
             )
         )
 

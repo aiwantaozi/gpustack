@@ -51,6 +51,19 @@ def test_a_layer_without_a_strategy_is_refused():
         GatherSpec(layer="Rack")
 
 
+def test_any_rung_is_named_the_same_way_including_the_accelerator_domain():
+    """🔴 There is no `accelerator_domain` special value any more — the name is
+    accepted here exactly like `Rack` is, as a plain layer id, and whether the
+    cluster actually has a rung by that name is checked against the cluster
+    (`routes.models.validate_gather_layer`). The schema cannot do it: it has no
+    cluster in hand."""
+    spec = GatherSpec(
+        strategy=GatherStrategyEnum.MUST_GATHER, layer="accelerator_domain"
+    )
+    assert spec.layer == "accelerator_domain"
+    assert not hasattr(spec, "chain")
+
+
 def test_the_wire_form_accepts_the_enum_values_verbatim():
     """The two spellings the form sends."""
     assert (
@@ -69,6 +82,72 @@ def test_gather_round_trips_on_the_model():
         gather=GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer="Rack"),
     )
     assert model.gather.layer == "Rack"
+
+
+# ---------------------------------------------------------------------------
+# The layer has to name a rung the cluster actually has.
+# ---------------------------------------------------------------------------
+
+
+async def _validate_gather(layer, topology):
+    """Run the route-level check against a stubbed cluster."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from gpustack.routes.models import validate_gather_layer
+
+    cluster = SimpleNamespace(id=1, topology=topology)
+    with patch(
+        "gpustack.schemas.clusters.Cluster.one_by_id",
+        new=AsyncMock(return_value=cluster),
+    ):
+        await validate_gather_layer(
+            None,
+            Model(
+                name="m1",
+                gather=GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer=layer),
+            ),
+            cluster_id=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_gather_layer_the_cluster_does_not_have_is_refused():
+    """🔴 The silence this closes. The solver's `_enforced_gather` *ignores* an
+    unknown layer and places the group anyway — right at schedule time, wrong
+    at submit time, where it would accept a `MustGather` under a promise
+    nothing enforces. `accelerator_domain` is the name that used to be
+    universally valid, so it is the one worth naming in the test."""
+    from gpustack.api.exceptions import BadRequestException
+    from gpustack.schemas.clusters import ClusterTopology
+
+    with pytest.raises(BadRequestException) as refused:
+        await _validate_gather("accelerator_domain", None)
+    assert "not a layer of this cluster" in refused.value.message
+
+    # Declared, and it is accepted — the rung exists now.
+    declared = ClusterTopology.model_validate(
+        {
+            "layers": [
+                {
+                    "name": "accelerator_domain",
+                    "labelKeys": ["topology.gpustack.ai/accelerator-domain"],
+                }
+            ]
+        }
+    )
+    await _validate_gather("accelerator_domain", declared)
+
+
+@pytest.mark.asyncio
+async def test_the_host_is_accepted_without_the_cluster_declaring_anything():
+    """The leaf is built in, so the tightest choice must never need a lookup."""
+    await _validate_gather("NodeTopologyLayer", None)
+
+
+@pytest.mark.asyncio
+async def test_a_builtin_rung_is_accepted_by_every_cluster():
+    await _validate_gather("rack", None)
 
 
 def test_gather_is_excluded_from_the_spec_digest():

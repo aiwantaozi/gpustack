@@ -305,44 +305,29 @@ class TopologyLayer(BaseModel):
     )
 
 
-class AcceleratorDomainSpec(BaseModel):
-    """Where a worker's accelerator domain (NVLink / HCCS / UB reach) is read from.
-
-    Beside the layers rather than among them: the domain nests in no fixed
-    place in the tree — inside a host on an 8-card server, across sixteen racks
-    on a CloudMatrix384 — so the solver consults it as a candidate set of its
-    own rather than as a rung.
-    """
-
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    label_keys: List[str] = PydanticField(
-        default_factory=list,
-        alias="labelKeys",
-        description=(
-            "Any-of, first present wins. Empty means the built-in keys "
-            "(`topology.gpustack.ai/accelerator-domain`, `nvidia.com/gpu.clique`)."
-        ),
-    )
-    sub_domain_keys: List[str] = PydanticField(
-        default_factory=list,
-        alias="subDomainKeys",
-        description=(
-            "Any-of keys of a tier *inside* the domain (Atlas 950: the compute "
-            "cabinet, whose bandwidth to a neighbour is twice that across "
-            "cabinets). Usually the rack field's own keys. Empty means no tier."
-        ),
-    )
-
-
 class ClusterTopology(BaseModel):
     """How far apart this cluster's workers are, for the group scheduler.
 
-    The layers are a fixed vocabulary (region, zone, room, row, rack, access
-    switch, host — see `scheduler.topology_vocabulary`); a cluster fills in
-    values, it does not declare layers. `layers` is therefore empty in the
-    common case. A non-empty `layers` is the Advanced panel's work: an entry
-    named after a vocabulary field replaces that field's label keys, and any
-    other entry is a custom layer placed by its `parent_layer`.
+    **One chain, root to leaf.** The built-in rungs are room, row, rack and the
+    host; anything else the fabric has — an NVLink/HCCS/UB domain, a blade, a
+    cage — is a custom layer the operator inserts where it belongs.
+
+    🔴 There used to be a second field beside `layers`, `accelerator_layers`,
+    holding the accelerator domain as a chain of its own. The argument was that
+    a domain and a rack cannot be ordered: containment runs the other way on
+    some hardware. Review overturned it — a domain whose boundary is a run of
+    contiguous cabinets is a rung like any other, and on every shipping
+    generation it is contiguous. The field is deleted rather than deprecated:
+    this is a JSON column with `extra="ignore"`, so an old declaration is
+    simply not read, and no migration pretends to rewrite it into something it
+    was never shaped like.
+
+    The built-in rungs are a fixed vocabulary (see
+    `scheduler.topology_vocabulary`); a cluster fills in values, it does not
+    declare them. `layers` is therefore empty in the common case. A non-empty
+    list is the Advanced panel's work: an entry named after a vocabulary field
+    replaces that field's label keys, and any other entry is a custom layer
+    placed by its `parent_layer`.
 
     Only the root and the leaf are built in. The leaf takes the worker's name
     rather than a label, so a cluster that declares nothing still gets a usable
@@ -355,31 +340,25 @@ class ClusterTopology(BaseModel):
         default_factory=list,
         description=(
             "Key overrides for vocabulary fields and custom layers, as a "
-            "parent chain. Empty means the vocabulary as-is."
+            "parent chain. Empty means the vocabulary as-is (room, row, rack)."
         ),
     )
-    accelerator_domain: Optional[AcceleratorDomainSpec] = PydanticField(
-        default=None,
-        alias="acceleratorDomain",
-        description="Where the accelerator domain is read from. None means the built-in keys.",
-    )
-    default_gather_strategy: Optional[GatherStrategyEnum] = PydanticField(
-        default=None,
-        alias="defaultGatherStrategy",
-        description=(
-            "Inherited by models deployed into this cluster that do not "
-            "declare their own. An operator who knows the fabric can make the "
-            "strict choice the default here rather than on every model."
-        ),
-    )
-    default_gather_layer: Optional[str] = PydanticField(
-        default=None,
-        alias="defaultGatherLayer",
-        description=(
-            "The layer `default_gather_strategy` applies to. Must name a "
-            "declared layer, or the built-in node layer."
-        ),
-    )
+    # 🔴 No `default_gather_strategy` / `default_gather_layer`.
+    #
+    # The cluster used to carry a gather default that every model without one
+    # inherited, so "the operator who knows the fabric chooses once". Review
+    # dropped it, and the deciding argument was asymmetry of failure: with no
+    # default the worst case is a group placed looser than ideal, which costs
+    # performance; with one, the worst case is a deployment REFUSED for a floor
+    # the deploy form never showed — `MustGather` is a failure policy, so a
+    # cluster-level default is an operator pre-setting a rejection condition
+    # whose reason the deployer cannot see. The form already derives its tiers
+    # from this declaration, so the fabric knowledge reaches the deployer
+    # anyway; what is gone is only the silent override.
+    #
+    # It also dissolved an upgrade trap: a saved `defaultGatherLayer` naming a
+    # layer a later release removed made the whole cluster unsaveable, on a
+    # field nobody was editing.
 
 
 class K8sOptions(BaseModel):
@@ -732,27 +711,14 @@ class ClusterUpdate(SQLModel):
         if v is None:
             return v
 
-        from gpustack.scheduler.topology import NODE_LAYER, TopologyError
-        from gpustack.scheduler.topology_vocabulary import (
-            gather_layer_names,
-            validate_declaration,
-        )
+        from gpustack.scheduler.topology import TopologyError
+        from gpustack.scheduler.topology_vocabulary import validate_declaration
 
         try:
-            names = gather_layer_names(validate_declaration(v))
+            validate_declaration(v)
         except TopologyError as e:
             raise ValueError(str(e)) from e
 
-        if v.default_gather_layer and v.default_gather_layer not in names:
-            raise ValueError(
-                f"default_gather_layer {v.default_gather_layer!r} is not a "
-                f"known layer. Available: {', '.join(names)}."
-            )
-        if v.default_gather_strategy and not v.default_gather_layer:
-            raise ValueError(
-                "default_gather_strategy needs default_gather_layer to say "
-                f"which layer it applies to (e.g. {NODE_LAYER!r})."
-            )
         return v
 
     @field_validator("server_url")

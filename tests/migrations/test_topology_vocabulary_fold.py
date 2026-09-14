@@ -29,7 +29,11 @@ def test_preset_layers_fold_and_the_gather_layer_is_renamed():
 
     assert renames == {"Zone": "zone", "Rack": "rack"}
     assert folded["layers"] == []
-    assert folded["defaultGatherLayer"] == "rack"
+    # `defaultGatherLayer` is carried through untouched. The fold used to
+    # rewrite it too — it named a layer, and the layer was being renamed — but
+    # the field has since been removed from `ClusterTopology` and unknown keys
+    # are ignored on read, so there is no longer a reader to keep consistent.
+    assert folded["defaultGatherLayer"] == "Rack"
 
 
 def test_a_custom_layer_under_a_preset_is_re_parented_to_the_vocabulary():

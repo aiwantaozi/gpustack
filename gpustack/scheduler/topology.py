@@ -1,19 +1,36 @@
-"""The cluster's network topology, as a tree of workers.
+"""A cluster's topology, as *one* tree of workers.
 
-The tree answers one question for the group scheduler: *how far apart are two
+A tree answers one question for the group scheduler: *how far apart are two
 workers*. Everything else here exists to build that tree out of the only source
 of truth a worker has for where it physically sits — its labels.
 
-**Layers are declared, not discovered.** Only the root and the leaf are built
-in; every layer between them is named by the operator, because no vendor's
-label scheme is universal and hard-coding one would exclude the rest.
+**One chain, root to leaf, and the operator says what is on it.** The built-in
+rungs are room → row → rack, and anything else an operator's fabric has — an
+NVLink/HCCS domain, a blade, a cage — is a custom layer they insert wherever it
+belongs. ``order_layers``, ``build_topology``, ``common_layer``,
+``nodes_at_layer`` and ``unclassified_at`` each run once, over that one chain.
+
+🔴 **The accelerator domain used to be a second, parallel chain here**, on the
+argument that the containment direction between a domain and a rack comes out
+differently across hardware generations, so the two could not be ordered.
+Review overturned it: as long as a domain's boundary is a run of *contiguous*
+cabinets it is expressible as a rung on the one chain, and on every shipping
+generation it is (NVL72 = 1 cabinet, NVL36×2 = 2, CloudMatrix384 = 16, Atlas
+950 = 160). Where the domain sits *inside* a machine — 910B2 — "same domain"
+and "same host" are the same constraint, and the built-in leaf already covers
+it. Declaring the rung in the wrong place is then an operator error, not
+something the model cannot say.
+
+**A layer name identifies a rung on its own**, which is what lets the whole
+product treat it as a key: one column per name in the table, one entry per name
+in a worker's location map, one `gather.layer`.
 
 **The leaf never collapses.** ``NodeTopologyLayer`` takes the worker's name
 rather than a label, so a cluster with no topology declared at all still gets a
 usable tree: one leaf per worker under the root. That is what makes every
 failure here a loss of *resolution* rather than a loss of *service* — a missing
 or mistyped label can only make two workers look equally distant, never make a
-worker unschedulable. The scheduler reads distance to score, not to filter.
+worker unschedulable.
 """
 
 from __future__ import annotations
@@ -36,12 +53,6 @@ RESERVED_LAYERS = frozenset({ROOT_LAYER, NODE_LAYER})
 # rather than dropped: an unclassified worker is still schedulable, and the UI
 # needs something to hang "20 workers are missing this label" off.
 UNCLASSIFIED = "<unclassified>"
-
-# The accelerator domain is not a layer of the tree; it is its own flat grouping
-# (see ``group_by_domain``). Named here so a ``TopologyNode`` can say which
-# grouping it belongs to.
-ACCELERATOR_DOMAIN_LAYER = "accelerator_domain"
-ACCELERATOR_SUB_DOMAIN_LAYER = "accelerator_sub_domain"
 
 
 @dataclass(frozen=True)
@@ -257,55 +268,6 @@ def _child(
     return node
 
 
-def group_by_domain(
-    workers: Iterable,
-    label_keys: Sequence[str],
-    sub_domain_keys: Sequence[str] = (),
-) -> List[TopologyNode]:
-    """Group workers by accelerator domain, flat, beside the tree.
-
-    A domain is the set of workers whose accelerators can address each other's
-    memory (NVLink, HCCS, UB). It nests nowhere fixed in the tree — inside a
-    host on an 8-card server, across sixteen racks on a CloudMatrix384 — so it
-    is not a layer of it. Each returned node is one domain holding leaf nodes
-    for its workers; workers with no domain value are collected under the
-    unclassified bucket, which the solver excludes like any other.
-
-    With ``sub_domain_keys`` the grouping is by *(domain, sub-domain)* pair
-    instead, and only workers carrying both values take part. The pair, not
-    the sub-domain value alone: a rack named ``R1`` may exist in two super pods,
-    and only the one inside the same domain is "closer".
-    """
-    layer = (
-        ACCELERATOR_SUB_DOMAIN_LAYER if sub_domain_keys else ACCELERATOR_DOMAIN_LAYER
-    )
-    root = TopologyNode(layer=ROOT_LAYER, name=ROOT_LAYER)
-    domain_spec = TopologyLayerSpec(layer=layer, label_keys=tuple(label_keys))
-    sub_spec = TopologyLayerSpec(layer=layer, label_keys=tuple(sub_domain_keys))
-
-    for worker in workers:
-        worker_id = getattr(worker, "id", None)
-        if worker_id is None:
-            continue
-        labels = effective_topology_labels(worker)
-        name, matched = _domain_of(labels, domain_spec)
-        if name is not None and sub_domain_keys:
-            sub_name, _ = _domain_of(labels, sub_spec)
-            if sub_name is None:
-                # No sub-domain value: this worker is not "closer" to anyone
-                # at this scope. It still counts at the domain scope.
-                continue
-            name = f"{name}/{sub_name}"
-        if name is None:
-            name = UNCLASSIFIED
-        domain = _child(root, layer, name, matched)
-        leaf_name = getattr(worker, "name", None) or str(worker_id)
-        leaf = _child(domain, NODE_LAYER, leaf_name, None)
-        leaf.worker_ids.append(worker_id)
-
-    return root.children
-
-
 def layer_names(specs: Sequence[TopologyLayerSpec]) -> List[str]:
     """Root-to-leaf layer names, leaf included.
 
@@ -326,8 +288,8 @@ def common_layer(a: TopologyNode, b: TopologyNode) -> Optional[str]:
     differently from a real domain.
     """
     # Walk b upward and stop at the first node a also sits under. By identity
-    # rather than by position, so the answer does not depend on the two chains
-    # having equal depth.
+    # rather than by position, so the answer does not depend on the two
+    # branches having equal depth.
     ancestors_of_a = {id(node) for node in _ancestry(a)}
     for node in reversed(_ancestry(b)):
         if id(node) not in ancestors_of_a:

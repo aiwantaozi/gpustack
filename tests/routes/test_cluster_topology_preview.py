@@ -18,10 +18,25 @@ from gpustack.schemas.clusters import ClusterTopology
 from gpustack.scheduler.topology import NODE_LAYER, UNCLASSIFIED
 
 RACK = "topology.gpustack.ai/rack"
-ZONE = "topology.kubernetes.io/zone"
+ROOM = "topology.gpustack.ai/room"
 CLIQUE = "nvidia.com/gpu.clique"
+DOMAIN = "topology.gpustack.ai/accelerator-domain"
 SWITCH = "topology.gpustack.ai/switch"
 SWITCH_NAME = "topology.gpustack.ai/switch-name"
+
+# The two layers an operator declares for facts the fleet publishes. Neither is
+# built in any more, which is the whole of the change: the worker still writes
+# the label, the operator decides it names a place.
+DOMAIN_LAYER = {
+    "name": "accelerator_domain",
+    "labelKeys": [DOMAIN, CLIQUE],
+    "parentLayer": "rack",
+}
+SWITCH_LAYER = {
+    "name": "switch",
+    "labelKeys": [SWITCH],
+    "parentLayer": "rack",
+}
 
 
 def _worker(id: int, name: str, labels=None, gpus=2, facts=None):
@@ -122,10 +137,9 @@ async def test_every_vocabulary_field_is_listed_inactive_until_someone_fills_it(
     result = await _get([_worker(1, "w1")])
 
     assert [layer.id for layer in result.layers] == [
-        "region",
-        "zone",
+        "room",
+        "row",
         "rack",
-        "switch",
         NODE_LAYER,
     ]
     assert not any(layer.active for layer in result.layers[:-1])
@@ -152,6 +166,11 @@ async def test_a_value_on_one_worker_brings_the_layer_into_the_tree():
 
 @pytest.mark.asyncio
 async def test_locations_report_where_each_value_came_from():
+    """One flat map keyed by layer name, which is what lets the table keep one
+    column per name."""
+    # rack → switch → domain, one chain: a fork would be refused, and the
+    # refusal is the point of the chain being single.
+    saved = _topology(layers=[SWITCH_LAYER, dict(DOMAIN_LAYER, parentLayer="switch")])
     workers = [
         _worker(
             1,
@@ -160,25 +179,39 @@ async def test_locations_report_where_each_value_came_from():
             facts={CLIQUE: "u.3", SWITCH: "aa:bb", SWITCH_NAME: "leaf-3"},
         ),
     ]
-    result = await _get(workers)
+    result = await _get(workers, saved=saved)
     location = result.workers[0].location
 
     assert location["rack"].value == "R1"
     assert location["rack"].source == "user"
+    assert location["switch"].value == "aa:bb"
     assert location["accelerator_domain"].value == "u.3"
     assert location["accelerator_domain"].source == "discovered"
-    assert location["switch"].value == "aa:bb"
-    assert location["switch"].display == "leaf-3"
+
+
+@pytest.mark.asyncio
+async def test_the_switch_name_is_carried_beside_the_chassis_id():
+    """🔴 Keyed off the label key, not the layer's name. `switch` used to be a
+    built-in id and the display name hung off that id; the rung is now whatever
+    the operator called it, so the only thing that says "this value is a switch
+    chassis id" is the key it came from."""
+    saved = _topology(
+        layers=[{"name": "Leaf switch", "labelKeys": [SWITCH], "parentLayer": "rack"}]
+    )
+    workers = [_worker(1, "w1", facts={SWITCH: "aa:bb", SWITCH_NAME: "leaf-3"})]
+    result = await _get(workers, saved=saved)
+
+    assert result.workers[0].location["Leaf switch"].display == "leaf-3"
 
 
 @pytest.mark.asyncio
 async def test_a_hand_filled_value_hides_the_discovered_one_and_says_so():
     """Clearing the label must be able to promise "nvl-a comes back", which
     needs the hidden value carried alongside."""
-    domain_key = "topology.gpustack.ai/accelerator-domain"
-    workers = [_worker(1, "w1", {domain_key: "hccs-b"}, facts={CLIQUE: "nvl-a"})]
+    saved = _topology(layers=[DOMAIN_LAYER])
+    workers = [_worker(1, "w1", {DOMAIN: "hccs-b"}, facts={CLIQUE: "nvl-a"})]
 
-    result = await _get(workers)
+    result = await _get(workers, saved=saved)
     location = result.workers[0].location["accelerator_domain"]
 
     assert location.value == "hccs-b"
@@ -187,31 +220,64 @@ async def test_a_hand_filled_value_hides_the_discovered_one_and_says_so():
 
 
 @pytest.mark.asyncio
-async def test_a_discovered_domain_makes_the_domain_field_active():
+async def test_a_discovered_domain_makes_the_declared_domain_rung_active():
+    """The fact is published by the worker either way; declaring the rung is
+    what turns it into a place, and then it counts like every other layer."""
+    saved = _topology(layers=[DOMAIN_LAYER])
     workers = [
         _worker(1, "w1", facts={CLIQUE: "u.1"}),
         _worker(2, "w2", facts={CLIQUE: "u.1"}),
         _worker(3, "w3"),
     ]
-    result = await _get(workers)
+    result = await _get(workers, saved=saved)
+    domain = _layer(result, "accelerator_domain")
 
-    assert result.accelerator_domain.active is True
-    assert result.accelerator_domain.domains == 1
-    assert result.accelerator_domain.classified == 2
-    assert result.accelerator_domain.unclassified == 1
+    assert domain.active is True
+    assert domain.domains == 1
+    assert domain.classified == 2
+    assert domain.unclassified == 1
+    assert result.unclassified_workers == 1
 
 
 @pytest.mark.asyncio
-async def test_a_rack_lists_the_domains_inside_it():
-    """Two domains in one rack is exactly what an operator checks the tree
-    for, so the rack row carries them."""
+async def test_an_undeclared_domain_is_not_a_layer_at_all():
+    """🔴 §2: the built-in list is room/row/rack and nothing else. A fleet whose
+    runtime publishes a clique gets no layer for it until someone says so —
+    which is the cost the redesign accepts in exchange for the domain being
+    placeable anywhere on the chain."""
+    result = await _get([_worker(1, "w1", facts={CLIQUE: "u.1"})])
+
+    assert "accelerator_domain" not in [layer.id for layer in result.layers]
+    assert "accelerator_domain" not in result.workers[0].location
+    # And the key is still offered, so declaring the layer is one click.
+    assert any(k.key == CLIQUE for k in result.vocabulary.known_keys)
+
+
+@pytest.mark.asyncio
+async def test_there_is_one_tree_and_the_domain_is_a_rung_of_it():
+    """🔴 The redesign. There used to be a second tree here, over the same
+    workers, because a domain could span racks and no single tree could hold
+    both facts. The operator now says which contains which — here, the domain
+    sits under the rack — and one tree holds it."""
+    saved = _topology(layers=[DOMAIN_LAYER])
     workers = [
         _worker(1, "w1", {RACK: "R1"}, facts={CLIQUE: "u.1"}),
         _worker(2, "w2", {RACK: "R1"}, facts={CLIQUE: "u.2"}),
     ]
-    result = await _get(workers)
+    result = await _get(workers, saved=saved)
 
-    assert _find(result.tree, "R1").accelerator_domains == ["u.1", "u.2"]
+    assert not hasattr(result, "accelerator_tree")
+    assert not hasattr(result, "accelerator_layers")
+    assert [c.name for c in result.tree.children] == ["R1"]
+    assert [c.name for c in _find(result.tree, "R1").children] == ["u.1", "u.2"]
+
+
+@pytest.mark.asyncio
+async def test_the_host_is_the_leaf_and_carries_no_chain_marker():
+    result = await _get([_worker(1, "w1")])
+
+    assert result.layers[-1].id == NODE_LAYER
+    assert not hasattr(result.layers[-1], "chain")
 
 
 # --- counts ----------------------------------------------------------------- #
@@ -273,11 +339,11 @@ async def test_unfilled_workers_are_deduplicated_across_layers():
     """One worker missing two values is one worker to go and fill in."""
     workers = [
         _worker(1, "w1"),
-        _worker(2, "w2", {ZONE: "z1"}),
+        _worker(2, "w2", {ROOM: "hall-1"}),
         _worker(3, "w3", {RACK: "R1"}),
     ]
     result = await _get(workers)
-    # w1 is unfilled at zone *and* at rack; w2 only at rack; w3 only at zone.
+    # w1 is unfilled at room *and* at rack; w2 only at rack; w3 only at room.
     assert result.unclassified_workers == 3
 
 
@@ -344,12 +410,12 @@ async def test_no_body_falls_back_to_the_saved_mapping():
 @pytest.mark.asyncio
 async def test_a_custom_layer_appears_where_its_parent_puts_it():
     saved = _topology(
-        layers=[{"name": "Pod", "parentLayer": "zone", "labelKeys": ["dc/pod"]}]
+        layers=[{"name": "Pod", "parentLayer": "row", "labelKeys": ["dc/pod"]}]
     )
     result = await _get([_worker(1, "w1", {"dc/pod": "p1", RACK: "R1"})], saved=saved)
 
     ids = [layer.id for layer in result.layers]
-    assert ids.index("Pod") == ids.index("zone") + 1
+    assert ids.index("Pod") == ids.index("row") + 1
     assert _layer(result, "Pod").builtin is False
     assert _find(result.tree, "p1") is not None
     assert result.workers[0].location["Pod"].value == "p1"
@@ -362,7 +428,6 @@ async def test_a_custom_layer_appears_where_its_parent_puts_it():
 async def test_a_mapping_that_cannot_become_a_tree_is_refused():
     bad = SimpleNamespace(
         layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
-        accelerator_domain=None,
     )
     with pytest.raises(BadRequestException):
         await _preview([_worker(1, "w1")], body=None, saved=bad)
@@ -392,47 +457,96 @@ async def test_layers_name_the_models_that_gather_into_them():
     """A custom layer with references cannot be deleted without stranding
     them, and the Advanced panel says which."""
     models = [
-        SimpleNamespace(name="pd-a", gather=SimpleNamespace(layer="rack")),
-        SimpleNamespace(name="pd-b", gather=SimpleNamespace(layer="rack")),
+        SimpleNamespace(name="pd-a", gather=SimpleNamespace(layer="rack", chain=None)),
+        SimpleNamespace(
+            name="pd-b", gather=SimpleNamespace(layer="rack", chain="network")
+        ),
         SimpleNamespace(name="plain", gather=None),
     ]
     result = await _get([_worker(1, "w1", {RACK: "R1"})], models=models)
 
     assert _layer(result, "rack").referenced_by_models == ["pd-a", "pd-b"]
-    assert _layer(result, "zone").referenced_by_models == []
+    assert _layer(result, "room").referenced_by_models == []
 
 
 @pytest.mark.asyncio
-async def test_workers_carry_their_labels_and_the_domain_its_sub_count():
-    domain = _topology(acceleratorDomain={"subDomainKeys": [RACK]})
-    workers = [
-        _worker(
-            1,
-            "w1",
-            {RACK: "R1"},
-            facts={"topology.gpustack.ai/accelerator-domain": "spod-3"},
-        ),
-        _worker(2, "w2", facts={"topology.gpustack.ai/accelerator-domain": "spod-3"}),
-    ]
-    result = await _get(workers, saved=domain)
-
-    assert result.workers[0].labels == {RACK: "R1"}
-    assert result.accelerator_domain.sub_classified == 1
-    assert result.accelerator_domain.sub_domain_field == "rack"
-
-
-@pytest.mark.asyncio
-async def test_the_vocabulary_ships_with_the_view():
-    result = await _get([_worker(1, "w1")])
-    assert [f.id for f in result.vocabulary.fields] == [
-        "region",
-        "zone",
-        "rack",
-        "switch",
-    ]
-    assert any(
-        k.key == "fabric.topograph.run/tier-0" for k in result.vocabulary.known_keys
+async def test_a_reference_to_a_custom_rung_lands_on_it():
+    saved = _topology(
+        layers=[
+            DOMAIN_LAYER,
+            {
+                "name": "cabinet",
+                "labelKeys": ["hw/cabinet"],
+                "parentLayer": "accelerator_domain",
+            },
+        ],
     )
+    models = [
+        SimpleNamespace(name="pd-domain", gather=SimpleNamespace(layer="cabinet")),
+        SimpleNamespace(name="pd-net", gather=SimpleNamespace(layer="rack")),
+    ]
+    result = await _get([_worker(1, "w1")], saved=saved, models=models)
+
+    assert _layer(result, "rack").referenced_by_models == ["pd-net"]
+    assert _layer(result, "cabinet").referenced_by_models == ["pd-domain"]
+
+
+@pytest.mark.asyncio
+async def test_workers_carry_their_labels_and_a_domain_tier_counts_like_any_rung():
+    """A tier *inside* the domain is an ordinary layer, so it reports the same
+    numbers every other layer does — which is the property the second chain
+    existed to provide and the one chain keeps."""
+    saved = _topology(
+        layers=[
+            DOMAIN_LAYER,
+            {
+                "name": "cabinet",
+                "labelKeys": ["hw/cabinet"],
+                "parentLayer": "accelerator_domain",
+            },
+        ]
+    )
+    workers = [
+        _worker(1, "w1", {"hw/cabinet": "C1"}, facts={DOMAIN: "spod-3"}),
+        _worker(2, "w2", facts={DOMAIN: "spod-3"}),
+    ]
+    result = await _get(workers, saved=saved)
+
+    assert result.workers[0].labels == {"hw/cabinet": "C1"}
+    cabinet = _layer(result, "cabinet")
+    assert cabinet.classified == 1
+    assert cabinet.unclassified == 1
+    assert cabinet.domains == 1
+    assert _find(result.tree, "C1").workers == 1
+
+
+@pytest.mark.asyncio
+async def test_the_vocabulary_ships_with_the_view_root_to_leaf():
+    """§5: three built-in fields, no chain marker on any of them."""
+    result = await _get([_worker(1, "w1")])
+    assert [f.id for f in result.vocabulary.fields] == ["room", "row", "rack"]
+    assert not hasattr(result.vocabulary.fields[0], "chain")
+
+
+@pytest.mark.asyncio
+async def test_the_domain_and_switch_keys_are_offered_as_candidates():
+    """§2: the built-in layers shrink, the candidate keys do not. Adding the
+    layer has to produce values at once, or the automatic collection the worker
+    still does would be wasted."""
+    result = await _get([_worker(1, "w1")])
+    offered = {k.key for k in result.vocabulary.known_keys}
+
+    assert {
+        DOMAIN,
+        CLIQUE,
+        "accelerator.topograph.run/domain",
+        "network.topology.nvidia.com/accelerator",
+        SWITCH,
+        "fabric.topograph.run/tier-0",
+    } <= offered
+    # And every `fits` points at a rung that still exists.
+    for known in result.vocabulary.known_keys:
+        assert set(known.fits) <= {"room", "row", "rack"}, known.key
 
 
 # --- locations: filling a value in ----------------------------------------- #
@@ -518,13 +632,59 @@ async def test_a_blank_value_clears():
 
 
 @pytest.mark.asyncio
-async def test_the_domain_can_be_filled_by_hand():
+async def test_a_declared_domain_can_be_filled_by_hand():
+    """Ascend has no standard label for the super pod — `superPodID` is a node
+    *annotation* — so hand-filling is the only source there, and it goes
+    through the one "set position" call like a rack does."""
+    saved = _topology(layers=[DOMAIN_LAYER])
     workers = [_worker(1, "w1")]
     result = await _set(
-        workers, [{"worker_ids": [1], "layer": "accelerator_domain", "value": "hccs-b"}]
+        workers,
+        [{"worker_ids": [1], "layer": "accelerator_domain", "value": "hccs-b"}],
+        saved=saved,
     )
-    assert workers[0].labels == {"topology.gpustack.ai/accelerator-domain": "hccs-b"}
-    assert result.topology.accelerator_domain.domains == 1
+    assert workers[0].labels == {DOMAIN: "hccs-b"}
+    assert _layer(result.topology, "accelerator_domain").domains == 1
+
+
+@pytest.mark.asyncio
+async def test_a_custom_rung_is_filled_in_by_the_same_call():
+    """⭐ No chain argument, no second endpoint: the layer name is the key."""
+    saved = _topology(
+        layers=[
+            DOMAIN_LAYER,
+            {
+                "name": "cabinet",
+                "labelKeys": ["hw/cabinet"],
+                "parentLayer": "accelerator_domain",
+            },
+        ],
+    )
+    workers = [_worker(1, "w1"), _worker(2, "w2")]
+    result = await _set(
+        workers,
+        [
+            {"worker_ids": [1], "layer": "rack", "value": "R1"},
+            {"worker_ids": [2], "layer": "cabinet", "value": "C1"},
+        ],
+        saved=saved,
+    )
+
+    assert workers[0].labels == {RACK: "R1"}
+    assert workers[1].labels == {"hw/cabinet": "C1"}
+    assert _find(result.topology.tree, "C1") is not None
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_domain_cannot_be_filled_in():
+    """The refusal that replaces the built-in rung: there is no field to write
+    until the operator has said the fleet has one."""
+    workers = [_worker(1, "w1")]
+    with pytest.raises(BadRequestException):
+        await _set(
+            workers,
+            [{"worker_ids": [1], "layer": "accelerator_domain", "value": "hccs-b"}],
+        )
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,26 @@ async def _feasibility(spec, workers=None, topology=None, solve=None):
     return result, calls
 
 
+def _domain_topology():
+    """The declaration an operator writes to make the domain a rung.
+
+    There is no built-in domain any more, so a test that wants one says so —
+    which is itself the contract: the fleet publishes the fact, the operator
+    decides it is a place.
+    """
+    return ClusterTopology.model_validate(
+        {
+            "layers": [
+                {
+                    "name": "accelerator_domain",
+                    "labelKeys": ["nvidia.com/gpu.clique"],
+                    "parentLayer": "rack",
+                }
+            ]
+        }
+    )
+
+
 def _pd_spec(prefill=2, decode=2, router=True):
     """A group as the deployment form would post it.
 
@@ -109,10 +129,12 @@ async def test_a_cluster_with_no_values_still_offers_the_tightest_tier():
 
 
 @pytest.mark.asyncio
-async def test_a_discovered_domain_is_a_tier_right_after_the_host():
-    """Between the host and the tree: inside the domain the transfer runs over
-    the accelerator fabric, faster than any switch hop whatever the domain's
-    physical extent."""
+async def test_a_declared_domain_is_a_tier_in_the_one_ranking():
+    """🔴 The redesign, stated as a contract. The domain used to arrive as a
+    tier of a second chain, carrying a `chain` / `chain_name` so the form could
+    show it under its own heading and nobody would read the list as a ranking.
+    Now the operator has said where the rung goes, so the list *is* a ranking
+    and the domain sits in it."""
     workers = [
         SimpleNamespace(
             id=1,
@@ -121,10 +143,64 @@ async def test_a_discovered_domain_is_a_tier_right_after_the_host():
             status=SimpleNamespace(topology_facts={"nvidia.com/gpu.clique": "u.1"}),
         ),
     ]
-    result, calls = await _feasibility(_pd_spec(), workers=workers)
+    result, calls = await _feasibility(
+        _pd_spec(), workers=workers, topology=_domain_topology()
+    )
 
-    assert [t.layer for t in result.tiers] == [NODE_LAYER, "accelerator_domain", "rack"]
-    assert [c.layer for c in calls[:-1]] == [NODE_LAYER, "accelerator_domain", "rack"]
+    assert [t.layer for t in result.tiers] == [
+        NODE_LAYER,
+        "accelerator_domain",
+        "rack",
+    ]
+    assert not hasattr(result.tiers[0], "chain")
+    assert [c.layer for c in calls[:-1]] == [
+        NODE_LAYER,
+        "accelerator_domain",
+        "rack",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_tier_is_solved_against_the_one_scope_list():
+    """🔴 The candidate set the redesign removes. Each tier used to be solved
+    against its own chain's scopes, so "same rack" and "same domain" saw
+    different lists and neither could widen into the other. There is one tree,
+    so there is one list, and widening from the domain continues to the rack."""
+    workers = [
+        SimpleNamespace(
+            id=1,
+            name="w1",
+            labels={RACK: "rack-a"},
+            status=SimpleNamespace(topology_facts={"nvidia.com/gpu.clique": "u.1"}),
+        ),
+    ]
+    seen = {}
+
+    async def fake_solve(root, demands, capacity, scopes, gather):
+        seen[gather.layer] = [s.name for s in scopes]
+        return GroupPlacement(layer=gather.layer or "root", domain="rack-a")
+
+    cluster = SimpleNamespace(id=1, topology=_domain_topology())
+    with (
+        patch.object(route.Cluster, "one_by_id", AsyncMock(return_value=cluster)),
+        patch.object(route.Worker, "all_by_field", AsyncMock(return_value=workers)),
+        patch.object(route, "assert_cluster_visible", lambda *a, **k: None),
+        patch(
+            "gpustack.schemas.models.ModelInstance.all", new=AsyncMock(return_value=[])
+        ),
+        patch("gpustack.config.config.get_global_config", lambda: SimpleNamespace()),
+        patch("gpustack.scheduler.group_solver.solve_group_placement", new=fake_solve),
+    ):
+        await route.gather_feasibility(
+            session=None,
+            ctx=None,
+            id=1,
+            body=route.GatherFeasibilityRequest(model_spec=_pd_spec()),
+        )
+
+    one_list = [NODE_LAYER, "accelerator_domain", "rack"]
+    assert seen["rack"] == one_list
+    assert seen["accelerator_domain"] == one_list
 
 
 @pytest.mark.asyncio
@@ -274,7 +350,6 @@ async def test_a_spec_that_cannot_be_a_model_is_a_400():
 async def test_a_declaration_that_cannot_become_a_tree_is_a_400():
     bad = SimpleNamespace(
         layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
-        accelerator_domain=None,
     )
     with pytest.raises(BadRequestException):
         await _feasibility(_pd_spec(), topology=bad)

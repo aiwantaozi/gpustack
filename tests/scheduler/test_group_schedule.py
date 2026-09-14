@@ -124,49 +124,63 @@ def test_a_router_already_placed_does_not_block_forming():
     assert is_group_forming(model, instances) is True
 
 
-# --- gather inheritance ----------------------------------------------------- #
+# --- where the gather requirement comes from -------------------------------- #
 
 
-def test_the_models_gather_wins_over_the_clusters_default():
-    cluster = SimpleNamespace(
-        topology=ClusterTopology.model_validate(
-            {
-                "layers": [{"name": "Rack", "labelKeys": [RACK]}],
-                "defaultGatherStrategy": "PreferGather",
-            }
-        )
-    )
+def test_the_models_gather_is_the_requirement():
     model = _model(
         gather=GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer="Rack")
     )
-    request = _gather_request(model, cluster)
+    request = _gather_request(model)
     assert request.must is True
     assert request.layer == "Rack"
 
 
-def test_the_cluster_default_applies_when_the_model_is_silent():
-    """The point of a cluster default: an operator who knows the fabric sets
-    the strict choice once rather than on every deployment."""
-    cluster = SimpleNamespace(
-        topology=ClusterTopology.model_validate(
-            {
-                "layers": [{"name": "Rack", "labelKeys": [RACK]}],
-                "defaultGatherStrategy": "MustGather",
-                "defaultGatherLayer": "Rack",
-            }
-        )
+def test_a_stale_cluster_level_default_has_no_effect():
+    """Clusters used to carry `defaultGatherStrategy` / `defaultGatherLayer`,
+    and a model that said nothing inherited them. Old rows still hold those
+    keys; `ClusterTopology` ignores unknown ones, and nothing reads them. A
+    silent model is unconstrained no matter what its cluster stored.
+
+    The reason the inheritance went is that the two ways of being wrong are
+    not the same size: without a default, a group that wanted `rack` and did
+    not say so is merely placed looser than ideal. With one, it inherits
+    `MustGather` and the deployment is *refused*, for a floor the deploy form
+    never showed."""
+    topology = ClusterTopology.model_validate(
+        {
+            "layers": [{"name": "Rack", "labelKeys": [RACK]}],
+            "defaultGatherStrategy": "MustGather",
+            "defaultGatherLayer": "Rack",
+        }
     )
-    request = _gather_request(_model(), cluster)
-    assert request.must is True
-    assert request.layer == "Rack"
+    assert not hasattr(topology, "default_gather_strategy")
+    assert "defaultGatherStrategy" not in topology.model_dump(by_alias=True)
 
-
-def test_no_gather_anywhere_is_a_preference_not_a_requirement():
-    """Absent must never mean "refuse": the solver's own default is to widen
-    to the cluster root rather than fail."""
-    request = _gather_request(_model(), SimpleNamespace(topology=None))
+    request = _gather_request(_model())
     assert request.must is False
     assert request.layer is None
+
+
+def test_no_gather_is_a_preference_not_a_requirement():
+    """Absent must never mean "refuse": the solver's own default is to widen
+    to the cluster root rather than fail."""
+    request = _gather_request(_model())
+    assert request.must is False
+    assert request.layer is None
+
+
+def test_an_accelerator_domain_layer_is_named_like_any_other():
+    """The layer name travels alone. It used to travel alone *because* names
+    were unique across two chains and the chain was derived from the name;
+    with one chain there is nothing to derive, and a domain rung is requested
+    exactly the way a rack is."""
+    model = _model(
+        gather=GatherSpec(
+            strategy=GatherStrategyEnum.MUST_GATHER, layer="accelerator_domain"
+        )
+    )
+    assert _gather_request(model).layer == "accelerator_domain"
 
 
 # --- the solve, and what it hands back -------------------------------------- #
@@ -308,7 +322,6 @@ async def test_an_invalid_cluster_topology_refuses_with_the_reason():
     group against a tree built from a guess."""
     bad = SimpleNamespace(
         layers=[SimpleNamespace(name="A", parent_layer="nope", label_keys=[])],
-        accelerator_domain=None,
     )
     by_instance, messages = await _run(
         GroupPlacement(layer="Rack", domain="rack-a", assignments={}), topology=bad

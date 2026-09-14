@@ -51,7 +51,11 @@ class RoleDemand:
 
 @dataclass(frozen=True)
 class GatherRequest:
-    """Where the group must fit, and whether "must" is meant literally."""
+    """Where the group must fit, and whether "must" is meant literally.
+
+    ``layer`` is a bare name: a name identifies one rung of the cluster's one
+    chain, so there is nothing to carry beside it.
+    """
 
     layer: Optional[str] = None
     must: bool = False
@@ -61,12 +65,13 @@ class GatherRequest:
 class GatherScope:
     """One rung of the search: a name and the candidate domains at that rung.
 
-    The tree's layers each yield one scope (the domains at that layer) and the
-    accelerator domain yields another (its flat groups) — different sources,
-    the same shape, and the solver does not care which is which. Scopes are
-    ordered by communication cost, not by containment: a domain may span
-    racks and still come before the rack scope, because inside it the transfer
-    runs over the accelerator fabric rather than the network.
+    🔴 **Every candidate set comes out of the tree**, ordered tightest first
+    with the host at the front. There used to be a second source — the
+    accelerator domain, grouped separately and handed in as a scope beside the
+    tree's rungs — and it is gone: a domain is now a rung an operator declares,
+    so it is built, walked and widened past exactly like a rack. A scope the
+    tree did not produce is a scope with no parent, and widening past it would
+    have no defined next step.
     """
 
     name: str
@@ -157,12 +162,19 @@ async def solve_group_placement(
     ``scopes`` is tightest first: the first scope with a domain that holds the
     whole group wins, and inside it the tightest fitting domain. A sequence of
     layer names is accepted too, root-to-leaf as ``layer_names`` returns it,
-    and read as the tree's layers alone.
+    and read as the tree's layers.
 
-    ``MustGather(X)`` means "transfer quality at least that of X": the search
-    stops after scope ``X``. Since a domain scope precedes the rack scope, a
-    group may satisfy "at least the same rack" by landing in one accelerator
-    domain that spans two racks — which is faster, not looser.
+    The two strategies differ only in where the walk is allowed to stop:
+
+    - 🔴 ``MustGather(X)`` is a **hard floor**. The search runs from the
+      tightest scope up to and including ``X`` and then stops — it does *not*
+      step to X's parent, and it does not fall back to the cluster root. If
+      nothing at or below ``X`` holds the group, the deployment is refused.
+      That refusal is the entire behaviour the strategy adds; the solver was
+      already placing into the tightest domain that fits.
+    - ``PreferGather`` (``must=False``) keeps widening up the chain, to its
+      top, and then to the cluster root, which always fits. It cannot fail on
+      gather grounds.
     """
     total = sum(r.replicas for r in roles)
     if total <= 0:

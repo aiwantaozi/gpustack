@@ -80,24 +80,27 @@ def is_group_forming(model: Model, instances: Sequence[ModelInstance]) -> bool:
     return not any(i.worker_id is not None for i in gpu_members)
 
 
-def _gather_request(model: Model, cluster: Optional[Cluster]) -> GatherRequest:
-    """The group's gather requirement, model over cluster.
+def _gather_request(model: Model) -> GatherRequest:
+    """The group's gather requirement — the model's, and only the model's.
 
-    The model's own `gather` wins; absent, the cluster's default applies. That
-    is the inheritance §2.5.3 describes, and it is resolved here rather than in
-    the solver so the solver stays a function of its arguments.
+    There used to be a second source: the cluster carried a default that any
+    model without its own `gather` inherited (the §2.5.3 inheritance). It is
+    gone, and the argument is that the two directions of being wrong are not
+    the same size. Without a default, a group that wanted `rack` and said
+    nothing gets placed looser than ideal — it runs, slower. With one, a group
+    inherits `MustGather` at a layer the deploy form never mentioned and the
+    deployment is *refused*, citing a floor the deployer did not set and cannot
+    see. A cluster-level failure policy is an operator arming a rejection on
+    someone else's behalf.
+
+    So the requirement now comes from one place, and an empty `GatherRequest`
+    means exactly what it says: no constraint, place it wherever it fits.
     """
     spec = getattr(model, "gather", None)
     if spec and spec.strategy:
         return GatherRequest(
             layer=spec.layer,
             must=spec.strategy == GatherStrategyEnum.MUST_GATHER,
-        )
-    topology = cluster.topology if cluster else None
-    if topology and topology.default_gather_strategy:
-        return GatherRequest(
-            layer=topology.default_gather_layer,
-            must=(topology.default_gather_strategy == GatherStrategyEnum.MUST_GATHER),
         )
     return GatherRequest()
 
@@ -133,8 +136,13 @@ async def schedule_group(
         return None, ["The group has no member that occupies an accelerator."]
 
     capacity = GroupCapacity(config, model, workers, model_instances)
+    # One chain, walked from the host upward. Picking which chain to walk used
+    # to be a step here — the layer name was looked up to decide whether the
+    # search followed the network rungs or the accelerator ones — and it is
+    # gone with the second chain: there is one tree, so there is one search.
+    request = _gather_request(model)
     placement = await solve_group_placement(
-        view.root, demands, capacity, view.scopes(), _gather_request(model, cluster)
+        view.root, demands, capacity, view.scopes(), request
     )
     if not isinstance(placement, GroupPlacement):
         return None, [getattr(placement, "reason", "The group does not fit.")]

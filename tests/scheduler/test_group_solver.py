@@ -223,6 +223,35 @@ async def test_must_gather_stops_the_walk_at_the_named_layer():
 
 
 @pytest.mark.asyncio
+async def test_must_gather_does_not_fall_back_to_the_cluster_root_either():
+    """🔴 The other half of "MustGather is a hard floor", and the one a reader
+    is likelier to get wrong.
+
+    Stopping the *layer* walk at the named rung is not enough: the cluster root
+    is not one of the layers, it is a fallback below the loop, and it always
+    fits. Reaching it would turn every refusal into a silent placement
+    somewhere in the cluster — the exact outcome `MustGather` is bought to
+    prevent. Here the two workers share no rack, so the root is the only domain
+    that could hold the group, and the requirement has to refuse instead.
+    """
+    workers = [worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")]
+    root, layers = tree(workers)
+
+    loose = await solve_group_placement(root, pd(2, 2), flat_capacity(2), layers)
+    assert isinstance(loose, GroupPlacement)
+    assert loose.layer == ROOT_LAYER, "the fixture must force the root fallback"
+
+    strict = await solve_group_placement(
+        root,
+        pd(2, 2),
+        flat_capacity(2),
+        layers,
+        GatherRequest(layer="RackLayer", must=True),
+    )
+    assert isinstance(strict, GroupInfeasible)
+
+
+@pytest.mark.asyncio
 async def test_without_must_gather_the_same_group_is_placed_across_racks():
     root, layers = tree(
         [

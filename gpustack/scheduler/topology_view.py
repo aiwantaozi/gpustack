@@ -2,10 +2,16 @@
 
 The scheduler, the topology page and the deployment form's feasibility check
 all need the same answer to "what does this cluster's declaration do to these
-workers": which vocabulary fields are in use, the tree they produce, the
-accelerator domains beside it, and the ordered scopes the solver walks. This
-is that one computation, so the three can never disagree about the same
-cluster.
+workers": which fields are in use, the tree they produce, and the ordered
+scopes the solver walks. This is that one computation, so the three can never
+disagree about the same cluster.
+
+🔴 **There used to be two of everything here** — a ``ChainView`` per chain, a
+``scopes(chain)``, a ``chain_of(layer)`` that turned a saved constraint into
+the chain to walk — because the accelerator domain was modelled as a second,
+incomparable chain. Review collapsed it to one tree the operator declares (see
+``scheduler.topology``), so all of that is gone: one resolved chain, one tree,
+one scope list, and widening is a walk up it.
 """
 
 from __future__ import annotations
@@ -20,12 +26,11 @@ from gpustack.scheduler.topology import (
     TopologyNode,
     build_topology,
     effective_topology_labels,
-    group_by_domain,
     layer_names,
+    nodes_at_layer,
 )
 from gpustack.scheduler.topology_vocabulary import (
-    ACCELERATOR_DOMAIN,
-    ACCELERATOR_SUB_DOMAIN,
+    SWITCH_KEY,
     SWITCH_NAME_KEY,
     ResolvedLayer,
     ResolvedTopology,
@@ -49,75 +54,74 @@ class Location:
 class TopologyView:
     resolved: ResolvedTopology
     workers: List[object]
-    active: List[ResolvedLayer]
-    specs: List[TopologyLayerSpec]
-    root: TopologyNode
-    layers: List[str]
+    active: List[ResolvedLayer] = field(default_factory=list)
+    specs: List[TopologyLayerSpec] = field(default_factory=list)
+    root: Optional[TopologyNode] = None
+    layers: List[str] = field(default_factory=list)
     """Root-to-leaf, leaf included — the tree's layers."""
-    domains: List[TopologyNode]
-    sub_domains: List[TopologyNode]
+
     locations: Dict[int, Dict[str, Location]] = field(default_factory=dict)
-
-    @property
-    def has_domains(self) -> bool:
-        return any(not d.is_unclassified for d in self.domains)
-
-    @property
-    def has_sub_domains(self) -> bool:
-        return bool(self.sub_domains)
+    """worker id -> layer name -> value. Keyed by name because a name
+    identifies a rung, which is what the table (one column per name) and the
+    batch "set position" call already assume."""
 
     def scopes(self) -> List[GatherScope]:
-        """The solver's search order, tightest first.
+        """The search order, tightest first.
 
-        Host, then the accelerator sub-domain and domain, then the tree's
-        layers up from the switch. The domain sits between host and the tree
-        because inside it the transfer runs over the accelerator fabric — an
-        order of magnitude faster than any switch hop, whatever the domain's
-        physical extent. Scopes with nothing in them are left out so the
-        deployment form does not offer a tier no group could satisfy.
+        The host first — it is the tightest scope there is and it exists
+        whatever the operator declared — then the chain's layers upward. Scopes
+        with nothing in them are left out so the deployment form does not offer
+        a tier no group could satisfy.
         """
         tree = tree_scopes(self.root, self.layers)
         host, above = tree[0], tree[1:]
-        out = [host]
-        if self.has_sub_domains:
-            out.append(GatherScope(ACCELERATOR_SUB_DOMAIN, self.sub_domains))
-        if self.has_domains:
-            out.append(GatherScope(ACCELERATOR_DOMAIN, self.domains))
-        for scope in above:
-            if any(not d.is_unclassified for d in scope.domains):
-                out.append(scope)
-        return out
+        return [host] + [
+            scope
+            for scope in above
+            if any(not d.is_unclassified for d in scope.domains)
+        ]
 
-    def tier_names(self) -> List[str]:
-        """The scopes the deployment form may ask for, tightest first.
+    def tiers(self) -> List[str]:
+        """Every tier the deployment form may offer, tightest first.
 
-        The sub-domain is a search refinement, not a choice: "at least the
-        same rack" already carries its physical meaning.
+        The host, then the rungs above it. The order means something here — it
+        is the order the solver widens along — which is exactly what the old
+        two-chain list could not promise.
         """
-        return [s.name for s in self.scopes() if s.name != ACCELERATOR_SUB_DOMAIN]
+        return [s.name for s in self.scopes()]
+
+    def nodes(self, layer_id: str) -> List[TopologyNode]:
+        return nodes_at_layer(self.root, layer_id)
 
     def unclassified_at(self, layer_id: str) -> List[int]:
         """Workers with no value at this layer, across every bucket.
 
         The tree has one unclassified bucket *per parent* — the workers with a
-        zone but no rack sit under their zone, the ones with neither sit under
-        the zone-level bucket — so the answer is the union, not the first hit.
+        room but no rack sit under their room, the ones with neither sit under
+        the room-level bucket — so the answer is the union, not the first hit.
         """
         out: List[int] = []
-        for node in self._nodes(layer_id):
+        for node in self.nodes(layer_id):
             if node.is_unclassified:
                 out.extend(node.descendant_worker_ids())
         return out
 
     def domain_count(self, layer_id: str) -> int:
-        return len([n for n in self._nodes(layer_id) if not n.is_unclassified])
+        return len([n for n in self.nodes(layer_id) if not n.is_unclassified])
 
-    def _nodes(self, layer_id: str) -> List[TopologyNode]:
-        if layer_id == ACCELERATOR_DOMAIN:
-            return self.domains
-        from gpustack.scheduler.topology import nodes_at_layer
+    def unfilled_workers(self) -> set:
+        """Workers missing a value at any active layer, deduplicated.
 
-        return nodes_at_layer(self.root, layer_id)
+        One worker missing two fields is one worker to go and fill in, not two
+        problems.
+        """
+        out: set = set()
+        for layer in self.active:
+            out |= set(self.unclassified_at(layer.id))
+        return out
+
+    def location(self, worker_id: int, field_id: str) -> Optional[Location]:
+        return self.locations.get(worker_id, {}).get(field_id)
 
 
 def build_view(topology, workers: Iterable) -> TopologyView:
@@ -130,25 +134,14 @@ def build_view(topology, workers: Iterable) -> TopologyView:
     resolved = validate_declaration(topology)
     active = resolved.active(workers)
     specs = resolved.specs(active)
-    root = build_topology(specs, workers)
-    layers = layer_names(specs)
-    domains = group_by_domain(workers, resolved.domain.label_keys)
-    sub_domains = (
-        group_by_domain(
-            workers, resolved.domain.label_keys, resolved.domain.sub_domain_keys
-        )
-        if resolved.domain.sub_domain_keys
-        else []
-    )
+
     view = TopologyView(
         resolved=resolved,
         workers=workers,
         active=active,
         specs=specs,
-        root=root,
-        layers=layers,
-        domains=domains,
-        sub_domains=sub_domains,
+        root=build_topology(specs, workers),
+        layers=layer_names(specs),
     )
     view.locations = {
         w.id: _locations_of(w, resolved)
@@ -164,20 +157,25 @@ def _locations_of(worker, resolved: ResolvedTopology) -> Dict[str, Location]:
     facts = getattr(getattr(worker, "status", None), "topology_facts", None) or {}
     out: Dict[str, Location] = {}
 
-    fields: List[tuple] = [(layer.id, layer.label_keys) for layer in resolved.chain]
-    fields.append((ACCELERATOR_DOMAIN, resolved.domain.label_keys))
-    for field_id, keys in fields:
-        for key in keys:
+    for layer in resolved.layers:
+        for key in layer.label_keys:
             value = merged.get(key)
             if not value:
                 continue
-            discovered = next((facts[k] for k in keys if facts.get(k)), None)
+            discovered = next(
+                (facts[k] for k in layer.label_keys if facts.get(k)), None
+            )
+            # Keyed off the *label key*, not the layer's name: the switch is no
+            # longer a built-in rung, so the only thing that identifies "this
+            # value is a switch chassis id, and the worker also told us its
+            # name" is the key the value came from. A layer named anything at
+            # all reading the switch key still gets the readable name.
             display = (
                 facts.get(SWITCH_NAME_KEY)
-                if field_id == "switch" and key in facts
+                if key == SWITCH_KEY and key in facts
                 else None
             )
-            out[field_id] = Location(
+            out[layer.id] = Location(
                 value=value,
                 source=source_of(worker, key),
                 key=key,

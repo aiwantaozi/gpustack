@@ -3,9 +3,19 @@
 **The page opens on a filled-in table, not an empty form.** `GET /topology`
 returns every field of the vocabulary with whether it is in use, every worker
 with the values it has (hand-filled or discovered by its runtime) and where
-each came from, the tree those values produce, and the accelerator domains
-beside it — one request, so the table, the tree and the overview bar cannot
-disagree.
+each came from, and the tree those values produce — one request, so the table,
+the tree and the overview bar cannot disagree.
+
+🔴 **One tree.** This payload used to carry a second one — `accelerator_layers`
+/ `accelerator_tree` / `accelerator_unclassified_workers`, plus an
+`accelerator_domains` list on every node — because the accelerator domain was
+modelled as a chain that could not be ranked against the network one. Review
+collapsed the two into a single chain the operator declares, so all of it is
+deleted rather than emptied: a domain is now an ordinary layer and reports the
+same numbers every other layer does.
+
+**A worker's `location` is a flat map** keyed by layer name, which is what lets
+the table keep one column per layer name.
 
 **Filling in a value is writing a label.** `POST /topology/locations` sets one
 field on a batch of workers by writing the field's own key
@@ -42,7 +52,6 @@ from gpustack.scheduler.topology import (
 )
 from gpustack.scheduler.topology_view import TopologyView, build_view
 from gpustack.scheduler.topology_vocabulary import (
-    ACCELERATOR_DOMAIN,
     KNOWN_KEYS,
     VOCABULARY_IDS,
     display_name,
@@ -74,7 +83,12 @@ class KnownKeyPublic(BaseModel):
 
 class VocabularyPublic(BaseModel):
     fields: List[VocabularyFieldPublic]
+    """The built-in fields, root-to-leaf: room, row, rack."""
     known_keys: List[KnownKeyPublic]
+    """Label keys some vendor or tool is known to write, with the built-in rung
+    each is nearest to. The accelerator-domain and switch keys live here rather
+    than as fields of their own — they are facts the fleet publishes, and which
+    rung they amount to is the operator's call."""
 
 
 class TopologyLayerPublic(BaseModel):
@@ -94,22 +108,6 @@ class TopologyLayerPublic(BaseModel):
     """Models whose `gather.layer` names this layer. A custom layer with
     references cannot be deleted without stranding them, and the Advanced
     panel says which."""
-
-
-class AcceleratorDomainPublic(BaseModel):
-    active: bool
-    domains: int = 0
-    classified: int = 0
-    unclassified: int = 0
-    sub_classified: int = 0
-    """Workers with a domain *and* a sub-domain value: the "N / M" the
-    Advanced panel shows beside the sub-domain picker."""
-    label_keys: List[str] = []
-    sub_domain_keys: List[str] = []
-    sub_domain_field: Optional[str] = None
-    """The vocabulary field whose keys `sub_domain_keys` are, when they are
-    exactly one field's — the Advanced panel shows a field picker, not a key
-    list, and this is how it knows which option is selected."""
 
 
 class LocationPublic(BaseModel):
@@ -132,6 +130,7 @@ class TopologyWorkerPublic(BaseModel):
     gpus: int = 0
     free_gpus: int = 0
     location: Dict[str, LocationPublic] = {}
+    """This worker's values, keyed by layer id."""
     labels: Dict[str, str] = {}
     """The worker's own labels, so the Advanced panel can count who carries a
     key being typed without a second request."""
@@ -150,9 +149,6 @@ class TopologyDomainPublic(BaseModel):
     worker_ids: List[int] = []
     """Only populated on the unclassified bucket and the leaf: on the bucket it
     is what turns "3 workers have no rack" into one bulk action."""
-    accelerator_domains: List[str] = []
-    """The domains that appear under this node. Two or more in one rack is the
-    thing an operator checks the tree for."""
     children: List["TopologyDomainPublic"] = []
 
 
@@ -167,7 +163,6 @@ class TopologyViewPublic(BaseModel):
     vocabulary: VocabularyPublic
     layers: List[TopologyLayerPublic]
     """Root-to-leaf, the leaf (`NodeTopologyLayer`) last and always active."""
-    accelerator_domain: AcceleratorDomainPublic
     workers: List[TopologyWorkerPublic]
     tree: TopologyDomainPublic
     total_workers: int = 0
@@ -189,7 +184,7 @@ async def get_cluster_topology(session: SessionDep, ctx: TenantContextDep, id: i
 
 
 async def _gather_references(session, cluster_id: int) -> Dict[str, List[str]]:
-    """layer id -> names of models whose `gather.layer` names it."""
+    """layer name -> names of models whose `gather.layer` names it."""
     from gpustack.schemas.models import Model
 
     out: Dict[str, List[str]] = {}
@@ -229,6 +224,59 @@ async def preview_cluster_topology(
     return await _view_public(topology, workers, await _gather_references(session, id))
 
 
+def _layers_public(
+    view: TopologyView,
+    worker_count: int,
+    gather_refs: Dict[str, List[str]],
+) -> List[TopologyLayerPublic]:
+    """The chain's rungs, root-to-leaf, with the host leaf appended."""
+    active_ids = {layer.id for layer in view.active}
+    out: List[TopologyLayerPublic] = []
+    for layer in view.resolved.layers:
+        active = layer.id in active_ids
+        classified = sum(1 for locs in view.locations.values() if layer.id in locs)
+        out.append(
+            TopologyLayerPublic(
+                id=layer.id,
+                name=display_name(layer.id),
+                builtin=layer.builtin,
+                active=active,
+                label_keys=list(layer.label_keys),
+                primary_key=layer.primary_key,
+                domains=view.domain_count(layer.id) if active else 0,
+                classified=classified,
+                unclassified=worker_count - classified,
+                referenced_by_models=sorted(gather_refs.get(layer.id, [])),
+            )
+        )
+    # The host, last and always active.
+    out.append(
+        TopologyLayerPublic(
+            id=NODE_LAYER,
+            name=display_name(NODE_LAYER),
+            builtin=True,
+            active=True,
+            domains=worker_count,
+            classified=worker_count,
+            referenced_by_models=sorted(gather_refs.get(NODE_LAYER, [])),
+        )
+    )
+    return out
+
+
+def _locations_public(locs: Dict[str, object]) -> Dict[str, LocationPublic]:
+    return {
+        field_id: LocationPublic(
+            value=loc.value,
+            source=loc.source,
+            key=loc.key,
+            discovered_value=loc.discovered_value,
+            display=loc.display,
+        )
+        for field_id, loc in locs.items()
+    }
+
+
 async def _view_public(
     topology, workers, gather_refs: Optional[Dict[str, List[str]]] = None
 ) -> TopologyViewPublic:
@@ -239,67 +287,7 @@ async def _view_public(
         raise BadRequestException(message=str(e))
 
     capacity = await _worker_capacity(workers)
-    tree = _to_public(view.root, capacity, view)
     by_id = {w.id: w for w in workers}
-
-    layers: List[TopologyLayerPublic] = []
-    active_ids = {layer.id for layer in view.active}
-    for layer in view.resolved.chain:
-        active = layer.id in active_ids
-        classified = sum(1 for locs in view.locations.values() if layer.id in locs)
-        layers.append(
-            TopologyLayerPublic(
-                id=layer.id,
-                name=display_name(layer.id),
-                builtin=layer.builtin,
-                active=active,
-                label_keys=list(layer.label_keys),
-                primary_key=layer.primary_key,
-                domains=view.domain_count(layer.id) if active else 0,
-                classified=classified,
-                unclassified=len(workers) - classified,
-                referenced_by_models=sorted(gather_refs.get(layer.id, [])),
-            )
-        )
-    layers.append(
-        TopologyLayerPublic(
-            id=NODE_LAYER,
-            name=display_name(NODE_LAYER),
-            builtin=True,
-            active=True,
-            domains=len(workers),
-            classified=len(workers),
-            referenced_by_models=sorted(gather_refs.get(NODE_LAYER, [])),
-        )
-    )
-
-    domain_classified = sum(
-        1 for locs in view.locations.values() if ACCELERATOR_DOMAIN in locs
-    )
-    sub_keys = list(view.resolved.domain.sub_domain_keys)
-    sub_field = next(
-        (
-            layer.id
-            for layer in view.resolved.chain
-            if sub_keys and set(sub_keys) <= set(layer.label_keys)
-        ),
-        None,
-    )
-    sub_classified = sum(
-        len(node.descendant_worker_ids())
-        for node in view.sub_domains
-        if not node.is_unclassified
-    )
-    domain_public = AcceleratorDomainPublic(
-        active=view.has_domains,
-        domains=view.domain_count(ACCELERATOR_DOMAIN),
-        classified=domain_classified,
-        unclassified=len(workers) - domain_classified,
-        sub_classified=sub_classified,
-        label_keys=list(view.resolved.domain.label_keys),
-        sub_domain_keys=sub_keys,
-        sub_domain_field=sub_field,
-    )
 
     workers_public = [
         TopologyWorkerPublic(
@@ -308,27 +296,12 @@ async def _view_public(
             state=_state_of(w),
             gpus=capacity.get(w.id, _Capacity()).gpus,
             free_gpus=capacity.get(w.id, _Capacity()).free_gpus,
-            location={
-                field_id: LocationPublic(
-                    value=loc.value,
-                    source=loc.source,
-                    key=loc.key,
-                    discovered_value=loc.discovered_value,
-                    display=loc.display,
-                )
-                for field_id, loc in view.locations.get(w.id, {}).items()
-            },
+            location=_locations_public(view.locations.get(w.id, {})),
             labels=dict(getattr(w, "labels", None) or {}),
         )
         for w in workers
         if getattr(w, "id", None) is not None
     ]
-
-    # Unfilled at any active tree layer, deduplicated: one worker missing two
-    # fields is one worker to go and fill in, not two problems.
-    unfilled = set()
-    for layer in view.active:
-        unfilled |= set(view.unclassified_at(layer.id))
 
     return TopologyViewPublic(
         vocabulary=VocabularyPublic(
@@ -343,12 +316,13 @@ async def _view_public(
                 for k in KNOWN_KEYS
             ],
         ),
-        layers=layers,
-        accelerator_domain=domain_public,
+        layers=_layers_public(view, len(workers), gather_refs),
         workers=workers_public,
-        tree=tree,
+        tree=_to_public(view.root, capacity),
         total_workers=len(by_id),
-        unclassified_workers=len(unfilled),
+        # Unfilled at any active layer, deduplicated: one worker missing two
+        # fields is one worker to go and fill in, not two problems.
+        unclassified_workers=len(view.unfilled_workers()),
     )
 
 
@@ -406,9 +380,9 @@ async def _worker_capacity(workers) -> Dict[int, _Capacity]:
 
 
 def _to_public(
-    node: TopologyNode, capacity: Dict[int, _Capacity], view: TopologyView
+    node: TopologyNode, capacity: Dict[int, _Capacity]
 ) -> TopologyDomainPublic:
-    children = [_to_public(child, capacity, view) for child in node.children]
+    children = [_to_public(child, capacity) for child in node.children]
     worker_ids = node.descendant_worker_ids()
     is_leaf = node.layer == NODE_LAYER
 
@@ -421,14 +395,6 @@ def _to_public(
         gpus = sum(capacity.get(wid, _Capacity()).gpus for wid in worker_ids)
         free_gpus = sum(capacity.get(wid, _Capacity()).free_gpus for wid in worker_ids)
 
-    domains = sorted(
-        {
-            view.locations[wid][ACCELERATOR_DOMAIN].value
-            for wid in worker_ids
-            if wid in view.locations and ACCELERATOR_DOMAIN in view.locations[wid]
-        }
-    )
-
     return TopologyDomainPublic(
         layer=node.layer,
         name=node.name,
@@ -438,7 +404,6 @@ def _to_public(
         gpus=gpus,
         free_gpus=free_gpus,
         worker_ids=worker_ids if (node.is_unclassified or is_leaf) else [],
-        accelerator_domains=domains,
         children=children,
     )
 
@@ -451,7 +416,7 @@ def _to_public(
 class LocationAssignment(BaseModel):
     worker_ids: List[int]
     layer: str
-    """A vocabulary field id, `accelerator_domain`, or a custom layer's name."""
+    """A vocabulary field id, or a custom layer's name."""
     value: Optional[str] = None
     """None clears the field's own key. Other sources' keys are never touched,
     which is what lets a cleared hand-filled value uncover a discovered one."""
@@ -569,6 +534,7 @@ class GatherTierPublic(BaseModel):
     """One "at least in the same ___" choice, and whether it would deploy."""
 
     layer: str
+    """What the form sends back, on its own."""
     name: str = ""
     feasible: bool
     domain: Optional[str] = None
@@ -584,8 +550,14 @@ class GatherTierPublic(BaseModel):
 
 class GatherFeasibilityPublic(BaseModel):
     tiers: List[GatherTierPublic] = []
-    """Tightest first: host, then the accelerator domain when the fleet has
-    one, then the tree's active layers."""
+    """Host first — the tightest — then the cluster's active layers outward.
+    The order is the one the solver widens along, so it is a ranking and the
+    form may present it as one.
+
+    🔴 It used to carry a `chain` / `chain_name` on every tier, because the
+    accelerator domain was a second chain and the form had to show the two
+    under separate headings so nobody read the list as a ranking. With one
+    chain there is nothing to group by and nothing to disclaim."""
 
     prefer: Optional[GatherTierPublic] = None
     """The "as close as possible, deploy anyway" option, carried separately:
@@ -641,8 +613,7 @@ async def gather_feasibility(
         view = build_view(cluster.topology, workers)
     except TopologyError as e:
         raise BadRequestException(message=str(e))
-    scopes = view.scopes()
-    tiers_wanted = view.tier_names()
+    tiers_wanted = view.tiers()
 
     # 🔴 The edge, and it has to be here rather than one frame deeper:
     # `role_demands` revalidates the whole model, so a form value the
@@ -657,8 +628,12 @@ async def gather_feasibility(
         # constrains it. Saying so is more honest than solving for it.
         return GatherFeasibilityPublic(
             tiers=[
-                GatherTierPublic(layer=name, name=display_name(name), feasible=True)
-                for name in tiers_wanted
+                GatherTierPublic(
+                    layer=layer,
+                    name=display_name(layer),
+                    feasible=True,
+                )
+                for layer in tiers_wanted
             ],
             prefer=GatherTierPublic(
                 layer=NODE_LAYER, name=display_name(NODE_LAYER), feasible=True
@@ -671,13 +646,23 @@ async def gather_feasibility(
     instances = await ModelInstance.all(session)
     capacity = GroupCapacity(get_global_config(), model, workers, instances)
 
+    scopes = view.scopes()
     tiers: List[GatherTierPublic] = []
-    for name in tiers_wanted:
+    for layer in tiers_wanted:
+        # `must=True` is what makes the answer mean anything: a tier is the
+        # question "would you rather not deploy below this", so the solve has to
+        # stop at that rung rather than widen past it.
         result = await solve_group_placement(
-            view.root, demands, capacity, scopes, GatherRequest(layer=name, must=True)
+            view.root,
+            demands,
+            capacity,
+            scopes,
+            GatherRequest(layer=layer, must=True),
         )
-        tiers.append(_tier(name, result, GroupPlacement))
+        tiers.append(_tier(layer, result, GroupPlacement))
 
+    # "As close as possible, deploy anyway": the same walk with no floor, which
+    # widens to the cluster root and so cannot fail on gather grounds.
     prefer_result = await solve_group_placement(
         view.root, demands, capacity, scopes, GatherRequest()
     )

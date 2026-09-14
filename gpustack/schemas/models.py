@@ -649,9 +649,10 @@ PD_MODE_BACKENDS: Dict[str, List[str]] = {
 class GatherSpec(BaseModel):
     """How tightly this deployment's members must sit together.
 
-    The model-level override of `Cluster.topology.default_gather_*`: an
-    operator who knows the fabric sets the cluster default once, and a
-    deployment that cares more (or less) says so here. Absent means inherit.
+    The only source of the requirement. This used to be the model-level
+    *override* of a cluster-wide default, but a cluster-level failure policy
+    meant an operator could arm a rejection the deployer never saw stated;
+    the default is gone and absent now means absent — no constraint.
 
     Read as a *failure* policy, not a placement one. The group solver already
     places into the tightest domain that fits, so `MustGather` adds exactly
@@ -664,13 +665,22 @@ class GatherSpec(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     strategy: Optional[GatherStrategyEnum] = None
-    """None inherits the cluster's `default_gather_strategy`. `PreferGather`
-    keeps widening to the cluster root; `MustGather` stops at `layer` and
-    refuses the deployment instead."""
+    """None means no gather requirement. `PreferGather` keeps widening to the
+    cluster root; `MustGather` stops at `layer` and refuses the deployment
+    instead."""
 
     layer: Optional[str] = None
-    """The layer `strategy` applies to: a declared layer's name, or the
-    built-in node layer. Only meaningful with `MustGather`."""
+    """The layer `strategy` applies to: a layer id of the cluster's chain, or
+    the built-in node layer, which is the leaf. Only meaningful with
+    `MustGather`.
+
+    🔴 There is no `accelerator_domain` special value any more. It used to name
+    the built-in rung of a second, parallel chain; a domain is now an ordinary
+    layer the operator declares, so the name is valid here only for a cluster
+    that has a layer called that. `routes.models.validate_gather_layer` refuses
+    the rest — the solver stands an unknown layer down rather than failing, so
+    an unchecked name would be a `MustGather` nothing enforces.
+    """
 
     @model_validator(mode="after")
     def check_layer_accompanies_must(self) -> "GatherSpec":

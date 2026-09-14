@@ -1,13 +1,10 @@
 import pytest
 
-from gpustack.schemas.clusters import (
-    ClusterTopology,
-    ClusterUpdate,
-    GatherStrategyEnum,
-)
+from gpustack.schemas.clusters import ClusterTopology, ClusterUpdate
 
 RACK = "topology.gpustack.ai/rack"
-ZONE = "topology.kubernetes.io/zone"
+ROOM = "topology.gpustack.ai/room"
+DOMAIN = "topology.gpustack.ai/accelerator-domain"
 
 
 def cluster(topology: dict):
@@ -26,18 +23,15 @@ def test_layers_round_trip_through_their_camel_case_aliases():
     c = cluster(
         {
             "layers": [
-                {"name": "Zone", "labelKeys": [ZONE]},
-                {"name": "Rack", "labelKeys": [RACK], "parentLayer": "Zone"},
+                {"name": "Hall", "labelKeys": [ROOM]},
+                {"name": "Rack", "labelKeys": [RACK], "parentLayer": "Hall"},
             ],
-            "defaultGatherStrategy": "MustGather",
-            "defaultGatherLayer": "Rack",
         }
     )
 
-    assert [layer.name for layer in c.topology.layers] == ["Zone", "Rack"]
-    assert c.topology.layers[1].parent_layer == "Zone"
+    assert [layer.name for layer in c.topology.layers] == ["Hall", "Rack"]
+    assert c.topology.layers[1].parent_layer == "Hall"
     assert c.topology.layers[1].label_keys == [RACK]
-    assert c.topology.default_gather_strategy is GatherStrategyEnum.MUST_GATHER
 
 
 def test_declaration_order_does_not_have_to_be_root_first():
@@ -46,13 +40,13 @@ def test_declaration_order_does_not_have_to_be_root_first():
     c = cluster(
         {
             "layers": [
-                {"name": "Rack", "parentLayer": "Zone"},
-                {"name": "Zone"},
+                {"name": "Rack", "parentLayer": "Hall"},
+                {"name": "Hall"},
             ]
         }
     )
 
-    assert {layer.name for layer in c.topology.layers} == {"Rack", "Zone"}
+    assert {layer.name for layer in c.topology.layers} == {"Rack", "Hall"}
 
 
 def test_a_layer_may_declare_no_label_keys():
@@ -97,7 +91,7 @@ def test_a_layer_may_declare_no_label_keys():
             "share a parent",
         ),
         (
-            {"layers": [{"name": "accelerator_domain"}]},
+            {"layers": [{"name": "NodeTopologyLayer"}]},
             "reserved",
         ),
         (
@@ -122,76 +116,142 @@ def test_saving_does_not_require_any_worker_to_be_labelled_yet():
     assert c.topology.layers[0].label_keys == ["nobody.has/this"]
 
 
-# --- the inherited gather default ------------------------------------------ #
+# --- what the declaration is, and is not ----------------------------------- #
 
 
-def test_the_builtin_node_layer_is_selectable_without_declaring_anything():
-    """The tightest choice must not depend on configuration; it is the one an
-    operator with no RDMA needs, and the leaf layer always exists."""
+def test_the_cluster_carries_no_gather_default_any_more():
+    """🔴 `defaultGatherStrategy` / `defaultGatherLayer` are gone.
+
+    They were the cluster-level inheritance source: an operator who knew the
+    fabric set the strict choice once, and every model that said nothing
+    inherited it. What killed it is that the two ways of being wrong are not
+    the same size. Without a default, a group that wanted `rack` and did not
+    ask is placed looser than ideal — it runs, slower. With one, it inherits
+    `MustGather` and the deployment is *refused*, for a floor the deploy form
+    never showed and the deployer cannot see. A cluster-level failure policy
+    is one person arming a rejection on another's behalf.
+
+    The fabric knowledge still reaches the deployer: the form derives its
+    tiers from `layers`. Only the silent override is gone.
+
+    Old rows keep the keys, and they are read straight past — the model is
+    `extra="ignore"`, the same non-migration used for `acceleratorLayers`.
+    """
     c = cluster(
         {
+            "layers": [{"name": "Rack", "labelKeys": [RACK]}],
             "defaultGatherStrategy": "MustGather",
-            "defaultGatherLayer": "NodeTopologyLayer",
+            "defaultGatherLayer": "Rack",
         }
     )
 
-    assert c.topology.default_gather_layer == "NodeTopologyLayer"
+    assert not hasattr(c.topology, "default_gather_strategy")
+    assert not hasattr(c.topology, "default_gather_layer")
+    assert set(c.topology.model_dump(by_alias=True)) == {"layers"}
 
 
-def test_a_gather_layer_that_names_nothing_is_refused():
-    with pytest.raises(ValueError, match="is not a known layer"):
-        cluster({"layers": [{"name": "Rack"}], "defaultGatherLayer": "Zone"})
+def test_a_stale_default_naming_a_deleted_layer_no_longer_blocks_saving():
+    """The trap this removal sprang. `defaultGatherLayer` was validated against
+    the declared layers, so when a release dropped a vocabulary field — `zone`
+    and `region` both went — every cluster whose stored default named one
+    became unsaveable, on a field the operator was not editing and the UI never
+    showed. With no field there is no validation and no trap."""
+    c = cluster({"layers": [{"name": "Rack"}], "defaultGatherLayer": "zone"})
 
-
-def test_a_strategy_without_a_layer_is_refused():
-    """ "Must gather" has to say must gather *where*."""
-    with pytest.raises(ValueError, match="needs default_gather_layer"):
-        cluster({"layers": [{"name": "Rack"}], "defaultGatherStrategy": "MustGather"})
+    assert [layer.name for layer in c.topology.layers] == ["Rack"]
 
 
 def test_a_custom_layer_may_hang_under_a_vocabulary_field():
     """The vocabulary is the chain; a custom layer names the rung it sits
     under, which is how a fabric with a tier the vocabulary lacks is spelled."""
     c = cluster(
-        {
-            "layers": [{"name": "Pod", "parentLayer": "zone", "labelKeys": ["dc/pod"]}],
-            "defaultGatherLayer": "Pod",
-        }
+        {"layers": [{"name": "Pod", "parentLayer": "row", "labelKeys": ["dc/pod"]}]}
     )
 
-    assert c.topology.layers[0].parent_layer == "zone"
+    assert c.topology.layers[0].parent_layer == "row"
 
 
-def test_the_accelerator_domain_is_a_selectable_gather_layer():
-    """It is not a rung of the tree, but it is a scope the solver walks, so a
-    cluster may make "same domain" its default."""
+def test_the_accelerator_domain_is_a_layer_the_operator_declares():
+    """🔴 The redesign. It used to be the built-in rung of a second chain, and
+    every cluster could name it whether or not it had one. Now it is an
+    ordinary custom layer: it exists on the chain once declared, and nowhere
+    otherwise."""
     c = cluster(
         {
-            "defaultGatherStrategy": "MustGather",
-            "defaultGatherLayer": "accelerator_domain",
+            "layers": [
+                {
+                    "name": "accelerator_domain",
+                    "labelKeys": [DOMAIN, "nvidia.com/gpu.clique"],
+                    "parentLayer": "row",
+                }
+            ]
         }
     )
 
-    assert c.topology.default_gather_layer == "accelerator_domain"
+    assert c.topology.layers[0].parent_layer == "row"
+
+
+def test_a_tier_inside_the_domain_is_a_layer_too():
+    c = cluster(
+        {
+            "layers": [
+                {"name": "accelerator_domain", "labelKeys": [DOMAIN]},
+                {
+                    "name": "cabinet",
+                    "labelKeys": ["hw/cabinet"],
+                    "parentLayer": "accelerator_domain",
+                },
+            ]
+        }
+    )
+
+    assert c.topology.layers[1].parent_layer == "accelerator_domain"
 
 
 def test_vocabulary_keys_can_be_overridden_by_naming_the_field():
+    c = cluster({"layers": [{"name": "rack", "labelKeys": ["dc.example.com/rack"]}]})
+
+    assert c.topology.layers[0].label_keys == ["dc.example.com/rack"]
+
+
+def test_the_chain_takes_as_many_tiers_as_the_hardware_has():
+    """Atlas 950 has three bandwidth tiers inside one domain (blade 1008,
+    cabinet 896, across cabinets 448 GB/s). Each is a layer, not a schema
+    change — which is the property the second chain was built for and the one
+    chain keeps."""
     c = cluster(
         {
-            "layers": [{"name": "rack", "labelKeys": ["dc.example.com/rack"]}],
-            "acceleratorDomain": {"labelKeys": ["ds.coreweave.com/nvlink.domain"]},
+            "layers": [
+                {"name": "accelerator_domain", "labelKeys": [DOMAIN]},
+                {
+                    "name": "cabinet",
+                    "labelKeys": ["hw/cabinet"],
+                    "parentLayer": "accelerator_domain",
+                },
+                {"name": "blade", "labelKeys": ["hw/blade"], "parentLayer": "cabinet"},
+            ]
         }
     )
 
-    assert c.topology.layers[0].label_keys == ["dc.example.com/rack"]
-    assert c.topology.accelerator_domain.label_keys == [
-        "ds.coreweave.com/nvlink.domain"
+    assert [layer.name for layer in c.topology.layers] == [
+        "accelerator_domain",
+        "cabinet",
+        "blade",
     ]
 
 
-def test_a_layer_without_a_strategy_is_allowed():
-    """Naming the layer alone is inert, and inert is the right default: it
-    records the operator's intended granularity without forcing a policy."""
-    c = cluster({"layers": [{"name": "Rack"}], "defaultGatherLayer": "Rack"})
+def test_an_accelerator_layers_field_is_ignored_rather_than_migrated():
+    """🔴 §3: no data migration, no compatibility fallback. `ClusterTopology`
+    is `extra="ignore"`, so a cluster saved under the two-chain model loads
+    with its second chain silently dropped — the failure mode chosen over a
+    migration that would have had to guess where on the one chain each rung
+    belonged."""
+    c = cluster(
+        {
+            "layers": [{"name": "rack", "labelKeys": [RACK]}],
+            "acceleratorLayers": [{"name": "cabinet", "labelKeys": ["hw/cabinet"]}],
+        }
+    )
 
-    assert c.topology.default_gather_strategy is None
+    assert not hasattr(c.topology, "accelerator_layers")
+    assert [layer.name for layer in c.topology.layers] == ["rack"]

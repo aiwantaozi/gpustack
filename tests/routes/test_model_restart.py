@@ -129,9 +129,16 @@ async def test_rebuilding_is_left_to_replica_convergence():
 
 
 @pytest.mark.asyncio
-async def test_a_group_already_on_the_current_spec_is_a_no_op():
-    """The operation this endpoint names is "converge to the current spec",
-    not "cycle the processes", so an already-converged group is not bounced."""
+async def test_a_group_already_on_the_current_spec_is_still_rebuilt():
+    """🔴 This asserted the opposite until the endpoint stopped short-circuiting
+    on a converged group.
+
+    Two reasons it flipped. The word on the menu is "restart", and the state an
+    operator reaches for it in — a process wedged behind a socket while the
+    control plane still calls it RUNNING — is exactly the one a digest
+    comparison cannot see. And only a group's members carry a `spec_digest` at
+    all, so the short-circuit made the same button rebuild a role-less
+    deployment while doing nothing to a PD group on its current spec."""
     members = [
         _instance(1, role="prefill"),
         _instance(2, role="decode"),
@@ -139,8 +146,8 @@ async def test_a_group_already_on_the_current_spec_is_a_no_op():
     ]
     result, deleted = await _restart(_model(roles=_pd_roles()), members)
 
-    assert result.restarted is False
-    assert deleted == []
+    assert result.restarted is True
+    assert sorted(result.deleted_instances) == ["m-1", "m-2", "m-3"]
 
 
 @pytest.mark.asyncio
@@ -207,31 +214,35 @@ async def test_members_left_in_the_old_namespace_are_restarted():
 
 
 @pytest.mark.asyncio
-async def test_members_already_where_they_belong_are_left_alone():
-    """Placement drift must not make the endpoint stop being idempotent: a
-    converged group still reports `restarted: false` rather than bouncing
-    healthy containers on every call."""
+async def test_members_already_where_they_belong_are_not_called_moved():
+    """Drift is reported, not merely acted on. Everything is rebuilt now, so
+    `restarted` no longer distinguishes anything — what still has to be right
+    is the sentence, which tells the operator whether the members are coming
+    back somewhere else."""
     model = _model()
     instances = [_instance(1, spec_digest=TARGET)]
     instances[0].namespace = "gpustack-acme"
 
     result, deleted = await _restart(model, instances, namespace="gpustack-acme")
 
-    assert result.restarted is False
-    assert deleted == []
+    assert result.restarted is True
+    assert len(deleted) == 1
+    assert "tenant's namespace" not in result.message
 
 
 @pytest.mark.asyncio
 async def test_a_docker_deployment_never_looks_drifted():
     """Its instances carry no namespace and there is none to move them to, so
-    a restart there must stay driven by the digest alone."""
+    it must never be described as having been moved. Asserted on the message
+    rather than on `restarted`, which is now true for every teardown."""
     model = _model()
     instances = [_instance(1, spec_digest=TARGET)]
 
     result, deleted = await _restart(model, instances, namespace=None)
 
-    assert result.restarted is False
-    assert deleted == []
+    assert result.restarted is True
+    assert len(deleted) == 1
+    assert "tenant's namespace" not in result.message
 
 
 # --- a member that is not running anything --------------------------------- #
@@ -261,12 +272,15 @@ async def test_a_group_with_a_failed_member_is_restarted():
 
 
 @pytest.mark.asyncio
-async def test_a_healthy_converged_group_is_still_a_no_op():
-    """The failed-member reason must not cost the endpoint its idempotence."""
+async def test_a_healthy_group_is_rebuilt_without_the_failure_wording():
+    """A healthy group restarts too, but must not be handed the sentence
+    written for a group with a dead member — that one tells the reader to go
+    read a log before retrying, and there is no log to read."""
     model = _model()
     instances = [_instance(1, spec_digest=TARGET)]
 
     result, deleted = await _restart(model, instances)
 
-    assert result.restarted is False
-    assert deleted == []
+    assert result.restarted is True
+    assert len(deleted) == 1
+    assert "check its log" not in result.message

@@ -1871,11 +1871,18 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     request that produces exactly the cross-generation window above, and the
     strongest way to reject it is to have no way to express it.
 
-    Idempotent on the target digest: a group already wholly on the current spec
-    reports `restarted: false` rather than bouncing containers, because the
-    operation this endpoint names is "converge to the current spec", not
-    "cycle the processes". A restart still in flight is a 409 — the members are
-    mid-replacement and a second teardown would delete the replacements.
+    Not idempotent, deliberately. A group already wholly on the current spec is
+    still torn down and rebuilt: "restart" is the word this operation is
+    offered under, and the state an operator reaches for it in — a process
+    wedged behind a socket while the control plane still calls it RUNNING — is
+    precisely the one no digest comparison can detect. It also used to be the
+    only thing that made this endpoint behave differently on two rows that
+    look the same in the list, since `spec_digest` is stamped on a group's
+    members and nothing else. `restarted` is now always true when there was
+    anything to tear down, and `deleted_instances` says what that was.
+
+    A restart still in flight is a 409 — the members are mid-replacement and a
+    second teardown would delete the replacements.
 
     Placement counts as something to converge, even though it is not part of
     the digest. It is not part of the digest because it is not user intent —
@@ -1916,27 +1923,35 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
             session, model.owner_principal_id, model.cluster_id
         ),
     )
-    # A member in ERROR is not running the current configuration; it is not
-    # running anything. Reporting "already run the current configuration" to
-    # someone whose group is half down is not merely unhelpful, it is untrue —
-    # and it leaves the operation they reached for with nothing to do. The
-    # group is torn down and rebuilt, which is what a restart of a group has
-    # always meant here.
-    #
-    # No thrash risk in making this a reason to act: this endpoint is only
-    # ever reached by an explicit request. Automatic recovery of a crashed
-    # member is the worker's, and it has its own crash-loop brake.
     failed = [
         instance.name
         for instance in instances
         if instance.state == ModelInstanceStateEnum.ERROR
     ]
-    if digests == {target} and not drifted and not failed:
-        return ModelRestartResult(
-            spec_digest=target,
-            restarted=False,
-            message="Instances already run the current configuration.",
-        )
+
+    # 🔴 No short-circuit on a converged group. This used to return
+    # `restarted: false` when the members already carried the target digest,
+    # on the reading that the operation is "converge to the current spec" and
+    # a converged group has nothing to converge.
+    #
+    # It made the button mean two different things depending on the row. Only
+    # a group's members are stamped with a `spec_digest` — a role-less
+    # deployment's instances carry None, `{None} != {target}` is always true,
+    # and so a plain model always rebuilt while a PD group on its current spec
+    # answered with a sentence and did nothing. Same menu entry, same wording,
+    # opposite behaviour, and the half that did nothing was the half whose
+    # members are hardest to cycle by hand.
+    #
+    # Between making both idempotent and making both act, act wins: "restart"
+    # is the word on the menu, and the state an operator reaches for it in —
+    # a wedged process that is RUNNING as far as the control plane knows — is
+    # exactly the one a digest comparison cannot see. `deleted_instances` in
+    # the result still reports what was actually torn down, so a caller that
+    # cares can tell.
+    #
+    # No thrash risk: this endpoint is only ever reached by an explicit
+    # request. Automatic recovery of a crashed member is the worker's, and it
+    # has its own crash-loop brake.
 
     try:
         deleted = await ModelInstanceService(session).batch_delete(list(instances))

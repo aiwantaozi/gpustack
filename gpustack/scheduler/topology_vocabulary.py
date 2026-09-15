@@ -1,11 +1,11 @@
 """The fixed vocabulary of places a worker can be, and how a worker's place is read.
 
 An operator describes a machine room, not a schema: "node-9 is in rack R3".
-The layers a machine room has are a small, stable set — the room, the row of
-cabinets, the cabinet, the host — so they are declared once here, in order, and
-a cluster only ever fills in *values*. A field with a value on at least one
-worker is a layer of that cluster's tree; a field nobody filled in is not.
-There is no "declare a layer" step for the built-in three.
+The layers worth declaring for everyone are a small, stable set — the zone,
+the rack, the host — so they are declared once here, in order, and a cluster
+only ever fills in *values*. A field with a value on at least one worker is a
+layer of that cluster's tree; a field nobody filled in is not. There is no
+"declare a layer" step for the built-in rungs.
 
 🔴 **There used to be two vocabularies, because there were two chains** — the
 network one above and an accelerator one whose single built-in rung was the
@@ -52,19 +52,19 @@ class VocabularyField:
     """Registry number, never reused and never renumbered.
 
     Opaque on purpose. An id and a display name drawn from the same machine-room
-    vocabulary cannot be told apart in stored data — ``{id: "room", name:
-    "zone"}`` reads as a contradiction rather than as "the room rung, which this
-    operator calls a zone", and ``zone`` was itself a vocabulary id until it was
-    dropped in review. A number belongs to no vocabulary, so the two value
-    spaces cannot overlap.
+    vocabulary cannot be told apart in stored data — ``{id: "rack", name:
+    "zone"}`` reads as a contradiction rather than as "the rack rung, which
+    this operator calls a zone", and the vocabulary has since been edited twice
+    with ``zone`` both leaving it and coming back. A number belongs to no
+    vocabulary, so the two value spaces cannot overlap.
 
     ⚠️ **The number is allocation order, not chain order.** Today the two happen
-    to agree; a layer inserted above ``room`` later would take ``000005``, not
+    to agree; a layer inserted above ``zone`` later would take ``000005``, not
     ``000000``. Sorting by it is always wrong — the chain is ``parent_layer``.
 
     Hard-coded rather than derived from the tuple's position, and that is the
-    whole point: the vocabulary has already been edited once (five entries down
-    to three). Positional numbering would have silently repointed every stored
+    whole point: the vocabulary has already been edited twice (five entries down to
+    three, then to two). Positional numbering would have silently repointed every stored
     ``Model.gather.layer`` at a different layer.
     """
 
@@ -85,15 +85,34 @@ class VocabularyField:
 # recognises, and a fixed order is what lets two clusters mean the same thing
 # by "rack".
 #
-# 🔴 `region`, `zone` and `switch` were removed in review, and `room`/`row`
-# restored. `region`/`zone` are cloud words for a failure domain, not for a
-# distance a KV transfer notices; `switch` is a fact the worker discovers by
-# itself and writes as a label, so it needs no built-in rung — an operator who
-# wants to place by it adds a layer pointing at its key, which is the same
+# 🔴 Two rungs, `zone` over `rack`. This has moved twice: `region`/`zone`/
+# `switch` were dropped in review in favour of `room`/`row`/`rack`, on the
+# argument that the cloud words name a failure domain rather than a distance a
+# KV transfer notices. `zone` is back and `room`/`row` are gone, for the
+# opposite half of the same argument: three physical rungs is more structure
+# than an operator will fill in, and the one word among them with a standard
+# behind it — `topology.kubernetes.io/zone`, a Kubernetes well-known label —
+# is the one that was missing. A fleet on k8s now lands in the right rung with
+# no labelling at all.
+#
+# `switch` stays out for its original reason: it is a fact the worker
+# discovers and writes as a label, so it needs no built-in rung — an operator
+# who wants to place by it adds a layer pointing at its key, which is the same
 # operation as adding one for the accelerator domain.
+#
+# ⚠️ `builtin-000002` (`row`) is retired and deliberately NOT reused. Ids are
+# allocation order and a stored `Model.gather.layer` points at one; handing
+# `000002` to something else would silently repoint every declaration that
+# still names it. `builtin-000001` does change meaning (`room` -> `zone`),
+# which is the one exception this carries knowingly — both name the coarsest
+# rung an operator declares, so a declaration written for one reads sensibly
+# as the other.
 VOCABULARY: Tuple[VocabularyField, ...] = (
-    VocabularyField("builtin-000001", "room", (GPUSTACK_PREFIX + "room",)),
-    VocabularyField("builtin-000002", "row", (GPUSTACK_PREFIX + "row",)),
+    VocabularyField(
+        "builtin-000001",
+        "zone",
+        (GPUSTACK_PREFIX + "zone", "topology.kubernetes.io/zone"),
+    ),
     VocabularyField(
         "builtin-000003",
         "rack",
@@ -162,25 +181,25 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         GPUSTACK_PREFIX + "accelerator-domain",
         "GPUStack",
-        ("rack", "row"),
+        ("rack", "zone"),
         "NVLink/HCCS/UB domain, as the worker's runtime reports it.",
     ),
     KnownKey(
         "nvidia.com/gpu.clique",
         "NVIDIA",
-        ("rack", "row"),
+        ("rack", "zone"),
         "NVLink domain, written by the driver.",
     ),
     KnownKey(
         "accelerator.topograph.run/domain",
         "Topograph",
-        ("rack", "row"),
+        ("rack", "zone"),
         "NVLink domain as Topograph discovers it.",
     ),
     KnownKey(
         "network.topology.nvidia.com/accelerator",
         "NVIDIA",
-        ("rack", "row"),
+        ("rack", "zone"),
         "NVLink domain.",
     ),
     KnownKey(
@@ -198,31 +217,31 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "fabric.topograph.run/tier-1",
         "Topograph",
-        ("row", "room"),
+        ("zone",),
         "One tier above the leaf switch.",
     ),
     KnownKey(
         "fabric.topograph.run/tier-2",
         "Topograph",
-        ("room",),
+        ("zone",),
         "Two tiers above the leaf switch.",
     ),
     KnownKey(
         "network.topology.nvidia.com/block",
         "NVIDIA",
-        ("rack", "row"),
+        ("rack", "zone"),
         "IB fabric block.",
     ),
     KnownKey(
         "network.topology.nvidia.com/spine",
         "NVIDIA",
-        ("room",),
+        ("zone",),
         "IB fabric spine.",
     ),
     KnownKey(
         "network.topology.nvidia.com/datacenter",
         "NVIDIA",
-        ("room",),
+        ("zone",),
         "IB fabric datacenter.",
     ),
     KnownKey(
@@ -234,7 +253,7 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         "cloud.google.com/gce-topology-block",
         "GKE",
-        ("row", "room"),
+        ("zone",),
         "One fast network.",
     ),
     KnownKey(
@@ -256,15 +275,9 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
         "NVL72 domain.",
     ),
     KnownKey(
-        "topology.kubernetes.io/zone",
-        "Kubernetes",
-        ("room",),
-        "Well-known zone label.",
-    ),
-    KnownKey(
         "topology.kubernetes.io/region",
         "Kubernetes",
-        ("room",),
+        ("zone",),
         "Well-known region label.",
     ),
 )
@@ -380,7 +393,7 @@ def resolve(topology) -> ResolvedTopology:
     """Fill the vocabulary into a cluster's ``ClusterTopology`` (or None).
 
     Empty declarations are the common case and mean the vocabulary as-is:
-    room/row/rack. A non-empty list is the Advanced panel's work — an entry
+    zone/rack. A non-empty list is the Advanced panel's work — an entry
     carrying a vocabulary **id** replaces that field's keys or renames it, and
     any other entry is a custom layer whose place is fixed by its
     ``parent_layer``.
@@ -637,8 +650,7 @@ def primary_key_for(resolved: ResolvedTopology, field_id: str) -> Optional[str]:
 
 
 _ENGLISH = {
-    "room": "Room",
-    "row": "Row",
+    "zone": "Zone",
     "rack": "Rack",
     NODE_LAYER_SLUG: "Host",
 }

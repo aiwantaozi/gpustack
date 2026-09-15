@@ -19,7 +19,7 @@ from gpustack.scheduler.topology import NODE_LAYER, UNCLASSIFIED
 from tests.utils.topology_layers import layer_dict, layer_obj, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/room"
+ROOM = "topology.gpustack.ai/zone"
 CLIQUE = "nvidia.com/gpu.clique"
 DOMAIN = "topology.gpustack.ai/accelerator-domain"
 SWITCH = "topology.gpustack.ai/switch"
@@ -130,8 +130,7 @@ async def test_every_vocabulary_field_is_listed_inactive_until_someone_fills_it(
     result = await _get([_worker(1, "w1")])
 
     assert [layer.id for layer in result.layers] == [
-        lid("room"),
-        lid("row"),
+        lid("zone"),
         lid("rack"),
         NODE_LAYER,
     ]
@@ -402,11 +401,11 @@ async def test_no_body_falls_back_to_the_saved_mapping():
 
 @pytest.mark.asyncio
 async def test_a_custom_layer_appears_where_its_parent_puts_it():
-    saved = _topology(layers=[layer_dict("Pod", ["dc/pod"], parent="row")])
+    saved = _topology(layers=[layer_dict("Pod", ["dc/pod"], parent="zone")])
     result = await _get([_worker(1, "w1", {"dc/pod": "p1", RACK: "R1"})], saved=saved)
 
     ids = [layer.id for layer in result.layers]
-    assert ids.index(lid("Pod")) == ids.index(lid("row")) + 1
+    assert ids.index(lid("Pod")) == ids.index(lid("zone")) + 1
     assert _layer(result, lid("Pod")).builtin is False
     assert _find(result.tree, "p1") is not None
     assert result.workers[0].location[lid("Pod")].value == "p1"
@@ -459,7 +458,7 @@ async def test_layers_name_the_models_that_gather_into_them():
     result = await _get([_worker(1, "w1", {RACK: "R1"})], models=models)
 
     assert _layer(result, lid("rack")).referenced_by_models == ["pd-a", "pd-b"]
-    assert _layer(result, lid("room")).referenced_by_models == []
+    assert _layer(result, lid("zone")).referenced_by_models == []
 
 
 @pytest.mark.asyncio
@@ -510,8 +509,7 @@ async def test_the_vocabulary_ships_with_the_view_root_to_leaf():
     """§5: three built-in fields, no chain marker on any of them."""
     result = await _get([_worker(1, "w1")])
     assert [f.id for f in result.vocabulary.fields] == [
-        lid("room"),
-        lid("row"),
+        lid("zone"),
         lid("rack"),
     ]
     assert not hasattr(result.vocabulary.fields[0], "chain")
@@ -535,7 +533,7 @@ async def test_the_domain_and_switch_keys_are_offered_as_candidates():
     } <= offered
     # And every `fits` points at a rung that still exists.
     for known in result.vocabulary.known_keys:
-        assert set(known.fits) <= {"room", "row", "rack"}, known.key
+        assert set(known.fits) <= {"zone", "rack"}, known.key
 
 
 # --- locations: filling a value in ----------------------------------------- #

@@ -23,7 +23,7 @@ from gpustack.server.controllers import _gather_unmet
 from tests.utils.topology_layers import layer_dict, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/room"
+ROOM = "topology.gpustack.ai/zone"
 
 
 def _worker(id_, labels):
@@ -86,7 +86,7 @@ async def test_a_tighter_placement_than_asked_for_is_not_degraded():
     is the direction the comparison is easiest to write backwards, since
     "looser" means *earlier* in a root-to-leaf order."""
     prefer_room = GatherSpec(
-        strategy=GatherStrategyEnum.PREFER_GATHER, layer=lid("room")
+        strategy=GatherStrategyEnum.PREFER_GATHER, layer=lid("zone")
     )
     workers = [
         _worker(1, {ROOM: "H", RACK: "R1"}),
@@ -135,7 +135,7 @@ async def test_unlabelled_members_count_as_a_miss():
 
 @pytest.mark.asyncio
 async def test_a_custom_rung_is_compared_like_any_other():
-    topology = {"layers": [layer_dict("Pod", ["dc/pod"], parent="room")]}
+    topology = {"layers": [layer_dict("Pod", ["dc/pod"], parent="zone")]}
     prefer_pod = GatherSpec(strategy=GatherStrategyEnum.PREFER_GATHER, layer=lid("Pod"))
     same = [
         _worker(1, {ROOM: "H", "dc/pod": "P1"}),

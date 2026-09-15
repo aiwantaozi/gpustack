@@ -4,7 +4,7 @@ from gpustack.schemas.clusters import ClusterTopology, ClusterUpdate
 from tests.utils.topology_layers import layer_dict, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/room"
+ROOM = "topology.gpustack.ai/zone"
 DOMAIN = "topology.gpustack.ai/accelerator-domain"
 
 
@@ -165,9 +165,9 @@ def test_a_stale_default_naming_a_deleted_layer_no_longer_blocks_saving():
 def test_a_custom_layer_may_hang_under_a_vocabulary_field():
     """The vocabulary is the chain; a custom layer names the rung it sits
     under, which is how a fabric with a tier the vocabulary lacks is spelled."""
-    c = cluster({"layers": [layer_dict("Pod", ["dc/pod"], parent="row")]})
+    c = cluster({"layers": [layer_dict("Pod", ["dc/pod"], parent="zone")]})
 
-    assert c.topology.layers[0].parent_layer == lid("row")
+    assert c.topology.layers[0].parent_layer == lid("zone")
 
 
 def test_the_accelerator_domain_is_a_layer_the_operator_declares():
@@ -181,13 +181,13 @@ def test_the_accelerator_domain_is_a_layer_the_operator_declares():
                 layer_dict(
                     "accelerator_domain",
                     [DOMAIN, "nvidia.com/gpu.clique"],
-                    parent="row",
+                    parent="zone",
                 )
             ]
         }
     )
 
-    assert c.topology.layers[0].parent_layer == lid("row")
+    assert c.topology.layers[0].parent_layer == lid("zone")
 
 
 def test_a_tier_inside_the_domain_is_a_layer_too():

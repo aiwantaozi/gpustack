@@ -2574,3 +2574,38 @@ class TestForeignBenchmarksAreLeftAlone:
         orphan = SimpleNamespace(id=200, worker_id=None, name="unassigned")
 
         assert mgr._sync_single_benchmark_state(orphan) is None
+
+
+class TestTpotThresholdsAreForwardedAsItlFlags:
+    """gpustack says TPOT; benchmark-runner and guidellm say ITL.
+
+    Both names denote the decode-only per-token time. The vocabularies differ on
+    purpose: benchmark-runner is a wrapper around guidellm, so it speaks
+    guidellm's, while TPOT is what gpustack's API field, form and column have
+    always been called. SLO_THRESHOLDS carries the translation — the attr stays
+    `slo_*_tpot_ms`, the flag goes out as `--slo-*-itl-ms` — so it happens once
+    here instead of at each call site.
+
+    Pinned by a test because the two sides look inconsistent when read alone,
+    and "tidying" the flag back to `--slo-*-tpot-ms` would send an argument the
+    runner only still accepts as a deprecated alias.
+    """
+
+    def test_tpot_thresholds_go_out_under_the_itl_flag(self):
+        by_attr = {t.attr: t.flag for t in bm_schemas.SLO_THRESHOLDS}
+
+        assert by_attr["slo_avg_tpot_ms"] == "--slo-avg-itl-ms"
+        assert by_attr["slo_p95_tpot_ms"] == "--slo-p95-itl-ms"
+        assert by_attr["slo_p99_tpot_ms"] == "--slo-p99-itl-ms"
+
+    def test_the_other_thresholds_keep_their_own_names(self):
+        """Only the per-token pair is renamed across the boundary."""
+        by_attr = {t.attr: t.flag for t in bm_schemas.SLO_THRESHOLDS}
+
+        assert by_attr["slo_avg_ttft_ms"] == "--slo-avg-ttft-ms"
+        assert by_attr["slo_avg_latency_ms"] == "--slo-avg-latency-ms"
+
+    def test_no_threshold_still_emits_the_old_tpot_flag(self):
+        flags = {t.flag for t in bm_schemas.SLO_THRESHOLDS}
+
+        assert not any("tpot" in flag for flag in flags)

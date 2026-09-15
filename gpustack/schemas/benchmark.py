@@ -189,25 +189,32 @@ SLO_THRESHOLDS: List[SLOThreshold] = [
     # judged instead of failing it (a threshold that fails wherever the server
     # batched its stream would bracket the ramp on its first point) and without
     # waiving it (0 ms would clear every budget).
+    # This table is also where gpustack's vocabulary meets benchmark-runner's.
+    # gpustack says TPOT (the API field, the CLI, the form, the column), the
+    # runner and guidellm below it say ITL — both names for the decode-only
+    # per-token time. The flag column carries the translation, so it happens
+    # once, here, instead of being re-derived at each call site: everything to
+    # the left of it is gpustack's own naming, everything sent to the right is
+    # the runner's.
     SLOThreshold(
         "slo_avg_tpot_ms",
         "inter_token_latency_mean",
         1.0,
-        "--slo-avg-tpot-ms",
+        "--slo-avg-itl-ms",
         fallback="time_per_output_token_mean",
     ),
     SLOThreshold(
         "slo_p95_tpot_ms",
         "inter_token_latency_p95",
         1.0,
-        "--slo-p95-tpot-ms",
+        "--slo-p95-itl-ms",
         fallback="time_per_output_token_p95",
     ),
     SLOThreshold(
         "slo_p99_tpot_ms",
         "inter_token_latency_p99",
         1.0,
-        "--slo-p99-tpot-ms",
+        "--slo-p99-itl-ms",
         fallback="time_per_output_token_p99",
     ),
     SLOThreshold(

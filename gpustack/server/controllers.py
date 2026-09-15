@@ -5167,21 +5167,44 @@ async def notify_model_route_target(session: AsyncSession, model: Model, event: 
 
 
 async def sync_categories_and_meta(session: AsyncSession, model: Model, event: Event):
+    """Propagate a model's derived ``categories`` / ``meta`` onto the route it
+    created.
+
+    Neither field is known when the route is born: `POST /models` copies
+    whatever the caller sent (the UI sends neither, they are auto-detected)
+    and the scheduler fills them in a second later, off `evaluate_gguf_model`
+    / `evaluate_pretrained_config`. Only the Model is written there, so
+    without this the route keeps the empty list it was created with -- and
+    `/v1/models?categories=llm` filters on `ModelRoute.categories`, so the
+    deployment silently stops being listed as an LLM.
+
+    Queries `ModelRoute` directly rather than walking `model.model_routes`,
+    for the reason `reconcile_route_target_states` spells out at length:
+    `_reconcile` has already loaded this Model row twice by the time we get
+    here (plainly for `sync_model_status`, then with
+    `selectinload(model_route_targets)` inside `notify_model_route_target`),
+    so a third fetch asking for `selectinload(model_routes)` hits the
+    identity map, returns that same instance and never applies the loader
+    option. `model_routes` is `lazy="noload"`, and an unloaded collection
+    reads as `[]` rather than raising -- so the loop below found nothing to
+    do, every time, for every model, without a single log line. Confirmed
+    against a live database: a clean session yields the route, a session in
+    `_reconcile`'s state yields none.
+
+    `created_model_id` is also the more honest filter. The relationship goes
+    through `ModelRouteTarget`, so a multi-target route reached from model A
+    would have had A's categories written onto it even when B created it.
+    """
     if event.type == EventType.DELETED:
         return
-    model: Model = await Model.one_by_id(
-        session=session,
-        id=model.id,
-        options=[
-            selectinload(Model.model_routes),
-        ],
-    )
+    model: Model = await Model.one_by_id(session=session, id=model.id)
     if not model:
         return
-    routes = model.model_routes
+    routes = await ModelRoute.all_by_fields(
+        session,
+        fields={"created_model_id": model.id, "deleted_at": None},
+    )
     for route in routes:
-        if route.created_model_id is None:
-            continue
         if route.categories != model.categories or route.meta != model.meta:
             await ModelRouteService(session).update(
                 model_route=route,

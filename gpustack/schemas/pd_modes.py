@@ -511,13 +511,14 @@ class PDRouter(BaseModel):
         difference between a router and an engine is the binary, not the
         image — so this is the one line that says what actually runs.
     ``connection_args``
-        Addresses, ports and the transport handshake. **The platform owns
-        these**: they are rendered from placement facts the deployment does not
-        have, and a user value here is refused at admission rather than merged.
-        Measured why it must be refused: ``--prefill`` and ``--decode`` are
-        ``action="append"`` in both shipped routers, so a second one does not
-        replace the injected peer — it adds a phantom one the router then
-        forwards to.
+        Addresses, ports and the transport handshake. Rendered from placement
+        facts the deployment does not have, so GPUStack fills them in — but a
+        deployment may now override one by setting the same flag, which is
+        appended after the declared command and wins by last-wins, exactly as
+        for ``tunable_args``. What stays refused is a peer flag: ``--prefill``
+        and ``--decode`` are ``action="append"`` in both shipped routers, so a
+        second one does not replace the injected peer, it adds a phantom one
+        the router then forwards to.
     ``tunable_args``
         Strategy and resilience defaults. Overridable, because repeated flags
         are last-wins for every one of them (verified against both wheels:
@@ -594,25 +595,29 @@ class PDRouter(BaseModel):
     def platform_owned_flags(self) -> List[str]:
         """The flag names a deployment may not set — the blacklist, derived.
 
-        Read off the declaration rather than listed in Python, so adding a
-        recipe cannot forget to extend it. Only long-form tokens count: a value
-        that happens to start with ``--`` would be a value, not a flag, and
-        ``connection_args`` never carries one (its values are addresses and
-        ports).
-
-        🔴 **The peer flags belong here even though they are not in
-        ``connection_args``.** They live in ``peers`` because the renderer
-        appends one per member after the declared command, and leaving them out
-        of this list was the whole gap: ``--prefill`` and ``--decode`` are
-        ``action="append"`` in both shipped routers, so a user value does not
+        🔑 **Only the peer flags.** They live in ``peers`` rather than in
+        ``connection_args`` because the renderer appends one per member after
+        the declared command, and they are here because they are the one part
+        a user value cannot override: ``--prefill`` and ``--decode`` are
+        ``action="append"`` in both shipped routers, so a second one does not
         replace the injected peers — it adds one the router forwards to and
-        cannot reach, and the member simply never gets traffic.
+        cannot reach, and that member simply never gets traffic.
+
+        🔴 ``connection_args`` used to be in here too, on the grounds that the
+        platform owns addresses and ports. It is out now, for the same reason
+        ``tunable_args`` never was: repeated flags are last-wins for all of
+        them, a deployment's own parameters are appended after the declared
+        command, and so setting one simply overrides it. The blacklist was the
+        only thing making the router's connection flags un-editable while
+        every other role's injected parameter became an ordinary editable row
+        — and "GPUStack fills this in, and you may change it" is what the rest
+        of the form now says. Breaking the router by mis-editing ``--port`` is
+        the user's to own; being unable to touch it was the complaint.
+
+        Only long-form tokens would have counted anyway: a value that happens
+        to start with ``--`` would be a value, not a flag.
         """
-        flags = [
-            token
-            for token in self.connection_args
-            if token.startswith("--") and "{{" not in token
-        ]
+        flags: List[str] = []
         if self.peers is not None:
             for spec in (self.peers.prefill, self.peers.decode):
                 for key in ("flag", "host_flag", "port_flag"):

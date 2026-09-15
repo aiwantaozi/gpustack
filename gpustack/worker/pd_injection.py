@@ -167,7 +167,7 @@ def render_pd_injection(
         )
 
     effective = role_effective_model(model, role_name)
-    _reject_conflicting_kv_transfer_config(mode, role, effective, role_name)
+    user_owns_kv_config = _user_owns_kv_transfer_config(role, effective)
 
     context = _pd_variables(model, mode, instance, effective, variables)
     where = f"PD mode '{mode.name}' role '{role_name}'"
@@ -176,7 +176,20 @@ def render_pd_injection(
     _apply_kv_lease_env(mode, env, where)
 
     args = [render(token, context, context=f"{where} args") for token in role.args]
-    descriptor = _render_tree(role.connector, context, f"{where} connector")
+    descriptor = (
+        None
+        if user_owns_kv_config
+        else _render_tree(role.connector, context, f"{where} connector")
+    )
+    if user_owns_kv_config:
+        logger.info(
+            "Role '%s' sets %s itself; PD mode '%s' is not adding its own "
+            "connector descriptor. The role's own value is what the engine "
+            "gets.",
+            role_name,
+            KV_TRANSFER_CONFIG_FLAG,
+            mode.name,
+        )
     if descriptor:
         # Rendered whole, as this role's own connector. If an extended KV cache
         # also contributes one, `kv_transfer.compose_kv_transfer_config` folds
@@ -496,43 +509,38 @@ def _coerce(template: str, rendered: Optional[str]) -> Any:
         return rendered
 
 
-def _reject_conflicting_kv_transfer_config(
-    mode: PDMode,
-    role: PDModeRole,
-    effective,
-    role_name: str,
-) -> None:
-    """Refuse a launch where two sources would write `--kv-transfer-config`.
+def _user_owns_kv_transfer_config(role: PDModeRole, effective) -> bool:
+    """Whether the role's own parameters already carry `--kv-transfer-config`.
 
-    vLLM reads the flag once, and every source of it — this recipe's
-    connector, an extended KV cache, a hand-written parameter — expands into
-    one whole JSON document, not a fragment. Passing two lets argparse keep
-    the last, so the group would come up with either PD or the cache silently
-    absent while the UI reports both attached. The two user-facing paths are
-    therefore mutually exclusive until one assembler owns the flag: pick a
-    recipe and let GPUStack write the connector state, or pick `custom` and
-    write all of it yourself.
+    🔴 This used to raise. vLLM reads the flag once and every source of it
+    expands into a whole JSON document rather than a fragment, so two of them
+    means argparse keeps one and the other is silently absent — and refusing
+    was the way to make sure nobody discovered that at runtime.
 
-    Only recipes that carry a connector descriptor are affected. SGLang's
-    disaggregation is configured through its own flags, so a SGLang PD role
-    and a shared cache do not collide.
+    It now hands the flag over instead, because the form hands it over too:
+    the recipe's descriptor is seeded into the role's parameter list as an
+    ordinary editable row, so "the user set this flag" is no longer a sign
+    they went around us — it is the documented way to change it. Editing it
+    wrongly breaks the group, and that is the user's to own; being unable to
+    edit it at all was the complaint.
+
+    What must not happen is BOTH, which is the failure the refusal existed
+    for. So the injection drops its own descriptor when the user supplies one:
+    one assembler owns the flag either way, and the user is the one who asked
+    to be it.
+
+    Only recipes carrying a connector descriptor are affected. SGLang's
+    disaggregation is configured through its own flags and never collides.
     """
     if not role.connector:
-        return
+        return False
 
     parameters = flatten_to_argv(getattr(effective, "backend_parameters", None) or [])
-    if any(
+    return any(
         token == KV_TRANSFER_CONFIG_FLAG
         or token.startswith(KV_TRANSFER_CONFIG_FLAG + "=")
         for token in parameters
-    ):
-        raise PDInjectionError(
-            f"Role '{role_name}' sets {KV_TRANSFER_CONFIG_FLAG} in its backend "
-            f"parameters while PD mode '{mode.name}' injects its own connector "
-            f"into the same flag, which vLLM reads only once. Remove the "
-            f"parameter, or switch the deployment to PD mode 'custom', which "
-            f"injects no connection state and leaves the flag to you."
-        )
+    )
 
 
 def _enum_value(value: Any) -> Any:

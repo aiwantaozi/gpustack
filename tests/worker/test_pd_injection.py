@@ -7,9 +7,12 @@ Two properties are what these pin:
   role differs from it in exactly one field (`kv_role`), because that is the
   whole of what the two sides disagree on;
 * everything that cannot render correctly is visible. An unresolved
-  placeholder survives verbatim with a warning rather than being blanked, and
-  a launch where two sources would write `--kv-transfer-config` is refused
-  instead of being silently concatenated into a flag vLLM reads once.
+  placeholder survives verbatim with a warning, and a launch that cannot
+  resolve one at all is refused rather than started wrong.
+
+Never two `--kv-transfer-config` documents, whichever way the second one
+arrives: vLLM reads the flag once, so a role that sets it itself takes it over
+and the recipe stops contributing its own.
 """
 
 import json
@@ -260,13 +263,23 @@ def test_a_per_role_cache_leaves_every_role_renderable():
     ).args
 
 
-def test_user_written_kv_transfer_config_is_refused():
+def test_a_user_written_kv_transfer_config_takes_the_flag_over():
+    """🔴 This asserted a refusal until the form started seeding the recipe's
+    descriptor into the role's parameter list as an editable row.
+
+    Setting the flag is the documented way to change it now, so it can no
+    longer be read as going around us. What still must not happen is two
+    descriptors — vLLM reads the flag once — so the injection drops its own
+    and the user's is what reaches the engine."""
     model = _model(
         backend_parameters=[KV_TRANSFER_CONFIG_FLAG, '{"kv_connector":"Mine"}']
     )
 
-    with pytest.raises(PDInjectionError):
-        render_pd_injection(model, _instance(), _variables())
+    injection = render_pd_injection(model, _instance(), _variables())
+
+    assert KV_TRANSFER_CONFIG_FLAG not in injection.args
+    # The rest of the recipe still applies: only the one flag changed hands.
+    assert injection.env
 
 
 def test_sglang_pd_does_not_collide_with_a_shared_cache():

@@ -1,16 +1,17 @@
 """A router parameter that would collide with an injected one.
 
-The router's tunable flags are meant to be overridden — appending them is
-last-wins, verified against both shipped wheels. The connection flags are not,
-and refusing them is not tidiness:
+🔴 The refusal used to cover the connection flags too (``--host``, ``--port``,
+``--prometheus-*``, ``--kv-connector``). It no longer does: those are last-wins
+and a deployment's own parameters are appended after the declared command, so
+setting one simply overrides it — which is what every other role's injected
+parameter now allows. Binding the router somewhere the gateway is not looking
+is the user's to own.
 
-- ``--prefill`` / ``--decode`` are ``action="append"`` in both routers, so a
-  second one does not replace the injected peer. It adds one the router then
-  forwards to and cannot reach, and the only symptom is a member that quietly
-  never gets traffic.
-- ``--host`` / ``--port`` / ``--prometheus-*`` are last-wins, which is worse in
-  a different way: the router comes up bound somewhere the gateway and the
-  metrics scraper are not looking.
+What is still refused is the one case where overriding is not what happens:
+``--prefill`` / ``--decode`` are ``action="append"`` in both routers, so a
+second one does not replace the injected peer. It adds one the router then
+forwards to and cannot reach, and the only symptom is a member that quietly
+never gets traffic — a failure no message on the flag itself could explain.
 """
 
 import pytest
@@ -37,22 +38,9 @@ def test_a_router_with_no_parameters_of_its_own_is_untouched():
     _reject_router_params_the_platform_owns(_roles([]), _spec())
 
 
-@pytest.mark.parametrize(
-    "param",
-    [
-        # Appends rather than replaces: a phantom peer the router forwards to.
-        "--prefill",
-        "--decode",
-        # Last-wins: the router binds where nothing is looking for it.
-        "--host",
-        "--port",
-        "--prometheus-port",
-        # The transport handshake — the recipe's whole subject.
-        "--kv-connector",
-        "--vllm-pd-disaggregation",
-    ],
-)
-def test_a_flag_the_platform_renders_is_refused(param):
+@pytest.mark.parametrize("param", ["--prefill", "--decode"])
+def test_a_peer_flag_is_refused(param):
+    """The one kind of collision overriding cannot fix."""
     with pytest.raises(BadRequestException) as excinfo:
         _reject_router_params_the_platform_owns(_roles([param, "x"]), _spec())
     # The message has to name the flag and offer the alternative, or the user
@@ -61,10 +49,21 @@ def test_a_flag_the_platform_renders_is_refused(param):
     assert "--prefill-policy" in excinfo.value.message
 
 
-def test_both_spellings_of_a_parameter_are_caught():
+@pytest.mark.parametrize(
+    "param",
+    ["--host", "--port", "--prometheus-port", "--kv-connector"],
+)
+def test_a_connection_flag_is_now_the_users_to_set(param):
+    """🔴 Asserted a refusal until the form started offering these as ordinary
+    editable rows. Appended after the declared command, so the user's value is
+    the one the router starts with."""
+    _reject_router_params_the_platform_owns(_roles([param, "x"]), _spec())
+
+
+def test_both_spellings_of_a_peer_flag_are_caught():
     """`--flag=value` is as valid on a command line as `--flag value`, and a
     check that only splits on whitespace lets the first one through."""
-    for spelling in ("--host=1.2.3.4", "--port=9999"):
+    for spelling in ("--prefill=1.2.3.4:8000", "--decode=1.2.3.4:8001"):
         with pytest.raises(BadRequestException):
             _reject_router_params_the_platform_owns(_roles([spelling]), _spec())
 
@@ -89,18 +88,15 @@ def test_a_flag_the_platform_does_not_own_is_accepted():
 
 
 def test_the_refused_set_follows_the_mode():
-    """Read off the chosen recipe rather than a list in Python, so the two
-    SGLang modes refuse their own router's flags and not vLLM's."""
-    # `--kv-connector` is a vLLM-router flag; the SGLang recipes never pass it,
-    # so there is nothing of ours for a user value to collide with.
+    """Read off the chosen recipe rather than a list in Python, so each mode
+    refuses its own router's peer flags."""
+    # Connection flags are nobody's to refuse now, on any recipe.
     _reject_router_params_the_platform_owns(
         _roles(["--kv-connector", "nixl"]), _spec(PDModeEnum.SGLANG_MOONCAKE)
     )
-    # `--host` is injected by every recipe.
-    with pytest.raises(BadRequestException):
-        _reject_router_params_the_platform_owns(
-            _roles(["--host", "1.2.3.4"]), _spec(PDModeEnum.SGLANG_MOONCAKE)
-        )
+    _reject_router_params_the_platform_owns(
+        _roles(["--host", "1.2.3.4"]), _spec(PDModeEnum.SGLANG_MOONCAKE)
+    )
 
 
 def test_a_hand_written_mode_refuses_nothing():

@@ -135,7 +135,11 @@ async def schedule_group(
     if not demands:
         return None, ["The group has no member that occupies an accelerator."]
 
-    capacity = GroupCapacity(config, model, workers, model_instances)
+    # Cache servers draw from the same `service_port_range` the members do, so
+    # a host running one has fewer ports for the group — and a group is placed
+    # onto cache-bearing hosts on purpose, not by accident.
+    cache_instances = await _cache_instances_in(session, model.cluster_id)
+    capacity = GroupCapacity(config, model, workers, model_instances, cache_instances)
     # One chain, walked from the host upward. Picking which chain to walk used
     # to be a step here — the layer name was looked up to decide whether the
     # search followed the network rungs or the accelerator ones — and it is
@@ -182,6 +186,29 @@ async def schedule_group(
             already.append(_stand_in(candidate))
 
     return by_instance, []
+
+
+async def _cache_instances_in(session: AsyncSession, cluster_id) -> List[object]:
+    """Cache server instances of this cluster, for the port budget.
+
+    Failure is not fatal here and deliberately so: the budget is a refinement
+    of a capacity number that was already correct about cards. Refusing to
+    schedule a group because the cache table could not be read would trade a
+    slightly optimistic port count for an outage.
+    """
+    if not cluster_id:
+        return []
+    try:
+        from gpustack.schemas.cache_services import CacheServiceInstance
+
+        return list(
+            await CacheServiceInstance.all_by_field(session, "cluster_id", cluster_id)
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not read cache service instances for the port budget: %s", e
+        )
+        return []
 
 
 def _stand_in(candidate) -> object:

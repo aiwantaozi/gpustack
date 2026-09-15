@@ -165,6 +165,10 @@ async def _run(model, instances, instance_type_snapshot=None):
             AsyncMock(return_value="gpustack-default"),
         ),
         patch("gpustack.server.controllers.ModelInstanceService", recorder),
+        # Soft scale-down marks the surplus instead of deleting it, and the
+        # mark is a row write. Recorded rather than performed, for the same
+        # reason the deletes are: this harness has no database.
+        patch.object(ModelInstance, "update", AsyncMock()),
     ):
         await sync_replicas(MagicMock(), model)
     return recorder
@@ -362,8 +366,12 @@ async def test_scaling_one_role_up_touches_only_that_role():
 @pytest.mark.asyncio
 async def test_surplus_is_measured_against_the_roles_count():
     """The pre-PD expression was `len(candidates) - model.replicas`. Scoped to
-    one role of a group where `model.replicas == 1`, it deletes every member
-    the scorer returns."""
+    one role of a group where `model.replicas == 1`, it takes out every member
+    the scorer returns.
+
+    A group's surplus is *drained* rather than deleted — the arithmetic is
+    what this asserts, so it reads the mark instead of the delete.
+    """
     prefills = [
         _instance(i, role="prefill", group_id="1-abc", spec_digest="sha1:abc")
         for i in (1, 2, 3, 4)
@@ -376,10 +384,11 @@ async def test_surplus_is_measured_against_the_roles_count():
         "gpustack.server.controllers.find_scale_down_candidates",
         AsyncMock(return_value=[SimpleNamespace(model_instance=p) for p in prefills]),
     ):
-        recorder = await _run(_model(replicas=1, roles=_pd_roles(prefill=2)), members)
+        await _run(_model(replicas=1, roles=_pd_roles(prefill=2)), members)
 
-    assert len(recorder.deleted) == 2, "4 prefills down to 2, not down to 0"
-    assert {i.role for i in recorder.deleted} == {"prefill"}
+    drained = [i for i in members if i.draining_since is not None]
+    assert len(drained) == 2, "4 prefills down to 2, not down to 0"
+    assert {i.role for i in drained} == {"prefill"}
 
 
 @pytest.mark.asyncio

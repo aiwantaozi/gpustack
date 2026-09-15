@@ -1548,6 +1548,25 @@ class ModelInstanceBase(SQLModel, ModelSource):
     )
     """Connector ports by declared name. Values are bands, not points."""
 
+    draining_since: Optional[datetime] = Field(default=None)
+    """Set when scale-down picked this member, cleared if it is kept.
+
+    A prefill cannot be told "stop accepting work and exit once the blocks you
+    hold have been fetched" — the engine has no such shutdown, and waiting for
+    it is upstream WIP. So the wait happens here instead: the member is taken
+    out of the router's registry immediately (`pd_membership.desired_members`
+    skips it) and its container is left running for a window, which is what
+    lets the decodes that are mid-request finish pulling from it.
+
+    🔴 **The row is what makes this survive a server restart.** Held in memory,
+    a restart mid-window would leave a member that no router knows about and
+    nothing will ever delete — serving nothing, holding its cards. With the
+    timestamp on the row the reaper picks it up again, and a window that
+    elapsed while the server was down simply reaps on the next pass.
+
+    Clearing it is the rollback, and it needs no second mechanism: the next
+    membership reconcile sees the member as ordinary and re-registers it."""
+
     def get_deployment_metadata(
         self,
         worker_id: int,

@@ -227,3 +227,49 @@ class TestRouteModeAimsAtTheDeployment:
         )
         kwargs = json.loads(args[args.index("--backend-kwargs") + 1])
         assert kwargs["verify"] is False
+
+
+# ── warmup / cooldown: which axis gets trimmed ───────────────────────────────
+
+
+class TestTransientPhaseAxis:
+    """Warmup/cooldown must trim REQUESTS, not seconds.
+
+    guidellm's `TransientPhaseConfig` defaults to `mode="prefer_duration"`, and
+    its `compute_limits` drops the request bound whenever a duration can also be
+    computed. Our stages always set both `max_requests` and `max_seconds`, so a
+    bare number was always read as a slice of time.
+
+    That biases arm-to-arm comparison: trimming by time removes a different
+    population of requests from a saturated arm than from an idle one.
+    """
+
+    def test_fraction_is_sent_as_a_request_percentage(self):
+        from gpustack.worker.benchmark.runner import _transient_phase_arg
+
+        assert json.loads(_transient_phase_arg(0.1)) == {
+            "percent": 0.1,
+            "mode": "requests",
+        }
+
+    def test_one_and_above_stays_an_absolute_count(self):
+        """The column keeps guidellm's scalar convention; only the axis is pinned."""
+        from gpustack.worker.benchmark.runner import _transient_phase_arg
+
+        assert json.loads(_transient_phase_arg(10)) == {
+            "value": 10,
+            "mode": "requests",
+        }
+
+    def test_the_boundary_is_one_not_zero(self):
+        from gpustack.worker.benchmark.runner import _transient_phase_arg
+
+        assert "percent" in json.loads(_transient_phase_arg(0.999))
+        assert "value" in json.loads(_transient_phase_arg(1.0))
+
+    def test_mode_is_always_pinned(self):
+        """Without this the duration axis wins and the trim is time-based."""
+        from gpustack.worker.benchmark.runner import _transient_phase_arg
+
+        for v in (0.05, 0.5, 1, 300):
+            assert json.loads(_transient_phase_arg(v))["mode"] == "requests"

@@ -11,6 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from gpustack.policies.scorers.group_locality_scorer import GroupLocalityScorer
+from gpustack.policies.scorers.pairing_affinity_scorer import PairingAffinityScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.policies.scorers.model_file_locality_scorer import (
     ModelFileLocalityScorer,
@@ -19,6 +20,7 @@ from gpustack.policies.scorers.score_chain import CandidateScoreChain
 from gpustack.config.config import Config, get_global_config
 from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
+    ScheduleCandidatesScorer,
     WorkerFilterChain,
 )
 from gpustack.policies.candidate_selectors import (
@@ -633,6 +635,48 @@ def build_candidate_selector(
     return CustomBackendResourceFitSelector(config, model, model_instances)
 
 
+def _group_scorer(
+    group_id: Optional[str],
+    role: Optional[str],
+    cpu_only: bool,
+    model_instances: List[ModelInstance],
+) -> Optional[ScheduleCandidatesScorer]:
+    """The one extra scorer a group member gets, or None for everything else.
+
+    🔴 **The whole PD placement policy on the per-instance path lives behind
+    this single `group_id` check.** A model without `roles` has no `group_id`
+    on any of its instances, so it returns None and the scoring chain is
+    byte-for-byte what it was — which is the argument that none of this needs
+    a compatibility case for existing deployments.
+
+    Which scorer follows from which member this is, and the two are exclusive:
+
+    - **The accelerator-free member** — the router today. It is deliberately
+      outside the gang (`schedule_group` excludes it), and that left it
+      outside everything: placed across the whole cluster, possibly a rack
+      away from the members whose every token it forwards.
+    - **A weight-holding member**, which on this path can only be a scale-out.
+      Forming a group never reaches here — the solver places all of them at
+      once — so a prefill or decode arriving alone means the group is already
+      running and this is one more replica of one role. The solver cannot help
+      with that, because it may not move what is already placed.
+    """
+    if not group_id:
+        return None
+    if cpu_only:
+        return GroupLocalityScorer(
+            group_id,
+            model_instances,
+            max_score=envs.SCHEDULER_GROUP_LOCALITY_MAX_SCORE,
+        )
+    return PairingAffinityScorer(
+        group_id,
+        role,
+        model_instances,
+        max_score=envs.SCHEDULER_PAIRING_AFFINITY_MAX_SCORE,
+    )
+
+
 async def find_candidate(
     session: AsyncSession,
     config: Config,
@@ -655,7 +699,8 @@ async def find_candidate(
                  is asking for -- see below.
     :param group_id: The generation this instance belongs to, when it is a
                  member of a role group. Used to place an accelerator-free
-                 member near the siblings it forwards to.
+                 member near the siblings it forwards to, and to pull a
+                 scaled-out prefill or decode toward the opposite role.
     :return: A tuple containing:
                 - The schedule candidate.
                 - A list of messages for the scheduling process.
@@ -745,18 +790,9 @@ async def find_candidate(
                 max_score=locality_max_score,
             )
         )
-    # Only for the accelerator-free member, and only within a group: everyone
-    # else is placed by the group solver, which answers "how close" through
-    # `gather` and answers it for the whole group at once. The router is the
-    # one member that solve deliberately leaves out.
-    if cpu_only and group_id:
-        candidate_scorers.append(
-            GroupLocalityScorer(
-                group_id,
-                model_instances,
-                max_score=envs.SCHEDULER_GROUP_LOCALITY_MAX_SCORE,
-            )
-        )
+    group_scorer = _group_scorer(group_id, role, cpu_only, model_instances)
+    if group_scorer is not None:
+        candidate_scorers.append(group_scorer)
     candidates = await CandidateScoreChain(candidate_scorers).score(candidates)
 
     # Pick the highest score candidate.

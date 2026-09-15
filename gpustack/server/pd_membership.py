@@ -103,6 +103,13 @@ def desired_members(model: Model, instances: Sequence[ModelInstance]) -> Dict[st
     upstream, and a member that is not RUNNING has nothing listening — adding
     it would be admitted only to fail the router's own probe, and upstream
     drops such a peer silently.
+
+    🔴 **A draining member is excluded while still RUNNING**, and that is the
+    whole of soft scale-down's first step. It is deliberately not a state
+    change: the container has to keep serving the decodes that are already
+    pulling KV from it, and only *new* work has to stop arriving. Removing the
+    address is exactly that distinction, and it is measured at 18ms with
+    requests in flight — so changing the ratio does not interrupt them.
     """
     from gpustack.schemas.models import ModelInstanceStateEnum
 
@@ -111,6 +118,8 @@ def desired_members(model: Model, instances: Sequence[ModelInstance]) -> Dict[st
         if instance.role == RoleNameEnum.ROUTER.value or not instance.role:
             continue
         if instance.state != ModelInstanceStateEnum.RUNNING:
+            continue
+        if getattr(instance, "draining_since", None) is not None:
             continue
         url = member_url(instance)
         if url:

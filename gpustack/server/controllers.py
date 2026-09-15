@@ -4,6 +4,7 @@ import logging
 import random
 import string
 import asyncio
+from datetime import datetime, timezone
 from importlib.resources import files
 from functools import partial
 from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional, Set
@@ -1587,6 +1588,12 @@ async def _sync_replicas_per_role(
         # below, and it becomes creatable the moment its dependencies report
         # ready — which may already be true on a later pass.
 
+    # Before the per-role arithmetic, not after: a member whose window has
+    # passed is gone as far as the ratio is concerned, and leaving it in the
+    # count for one more pass would make the role look satisfied and stop the
+    # replacement that a re-scale-up is waiting for.
+    generation = await _reap_drained(session, generation)
+
     for role in model.roles:
         have = [i for i in generation if i.role == role.name]
         if len(have) < role.replicas:
@@ -1610,23 +1617,121 @@ async def _sync_replicas_per_role(
 async def _scale_down_role(
     session: AsyncSession, model: Model, role: RoleSpec, have: List[ModelInstance]
 ):
-    """Remove this role's surplus members.
+    """Take this role's surplus members out of rotation.
 
     The excess is measured against the ROLE's count, not the model's. The
     pre-PD line was `len(candidates) - model.replicas`, which assumed
     `candidates` held every instance of the model; scoped to one role of a
     4P4D that arithmetic deletes eight instances in one pass.
+
+    🔴 **Marks rather than deletes.** Deleting a prefill outright drops the KV
+    blocks the decodes are still fetching, and the engine has no shutdown that
+    waits for them. `_reap_drained` deletes it once the window has passed;
+    until then the member is out of the router's registry and still running.
     """
-    excess = len(have) - role.replicas
+    draining = [i for i in have if i.draining_since is not None]
+    excess = len(have) - len(draining) - role.replicas
     if excess <= 0:
+        # Already enough on their way out. Picking a second victim while the
+        # first is still draining is how a burst of reconciles scales a role
+        # to zero one window at a time — the surplus has been acted on, it
+        # just has not finished.
         return
-    candidates = await find_scale_down_candidates(have, model)
+
+    keep = [i for i in have if i.draining_since is None]
+    candidates = await find_scale_down_candidates(keep, model)
     if not candidates:
         # `find_scale_down_candidates` returns [] on its internal exception,
         # so an empty result is indistinguishable from a scoring failure.
         # Not deleting is the fail-safe reading of that ambiguity.
         return
-    await _release_and_delete(session, [c.model_instance for c in candidates[:excess]])
+
+    if not _soft_scale_down_enabled(model):
+        await _release_and_delete(
+            session, [c.model_instance for c in candidates[:excess]]
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    for candidate in candidates[:excess]:
+        instance = candidate.model_instance
+        instance.draining_since = now
+        await instance.update(session)
+        logger.info(
+            f"Draining {instance.name} (role '{role.name}') of model "
+            f"{model.name}; it leaves the router now and is deleted in "
+            f"{envs.SCHEDULER_DRAIN_WINDOW_SECONDS}s"
+        )
+
+
+def _soft_scale_down_enabled(model: Model) -> bool:
+    """Only a group drains, and only when a window is configured.
+
+    A role-less model has no router registry to be removed from, so the wait
+    would be a wait with nothing happening during it — the member would keep
+    taking new requests for the whole window and then vanish mid-request,
+    which is strictly worse than deleting it now.
+    """
+    return bool(model.roles) and envs.SCHEDULER_DRAIN_WINDOW_SECONDS > 0
+
+
+async def _reap_drained(
+    session: AsyncSession, instances: List[ModelInstance]
+) -> List[ModelInstance]:
+    """Delete the members whose drain window has passed; return the rest.
+
+    Returns the survivors rather than the reaped so the caller can assign
+    straight through. What it must not do is hand back a list still containing
+    a deleted member: the per-role arithmetic that follows would count it,
+    find the role satisfied, and skip creating the replacement a re-scale-up
+    is waiting for.
+
+    Runs off the reconcile loop rather than a timer: a timer would have to be
+    re-armed on restart for every draining member, and the row already says
+    when each window ends.
+    """
+    window = envs.SCHEDULER_DRAIN_WINDOW_SECONDS
+    if window <= 0:
+        return list(instances)
+    now = datetime.now(timezone.utc)
+    due = []
+    for instance in instances:
+        since = instance.draining_since
+        if since is None:
+            continue
+        if since.tzinfo is None:
+            # Read back from SQLite without a zone. It was written as UTC.
+            since = since.replace(tzinfo=timezone.utc)
+        if (now - since).total_seconds() >= window:
+            due.append(instance)
+    if not due:
+        return list(instances)
+    logger.info(
+        f"Drain window elapsed for {len(due)} member(s): "
+        f"{', '.join(i.name for i in due)}"
+    )
+    await _release_and_delete(session, due)
+    return [i for i in instances if i not in due]
+
+
+async def cancel_drain(session: AsyncSession, instance: ModelInstance):
+    """Put a draining member back into rotation.
+
+    The rollback half, and it is one field: the next membership reconcile sees
+    an ordinary RUNNING member and re-registers its address. Nothing has to be
+    restarted because nothing was stopped — which is the property that makes a
+    wrong scale-down recoverable rather than merely regrettable.
+
+    🔴 No automatic trigger yet, and deliberately not one invented here. The
+    obvious one — "roll back if the group's TTFT degrades during the window" —
+    needs a threshold, and a threshold picked without data would fire on
+    ordinary load variance and undo correct scale-downs. What exists is the
+    mechanism and the audit trail; the judgement stays with the operator until
+    there are measurements to set it from.
+    """
+    instance.draining_since = None
+    await instance.update(session)
+    logger.info(f"Cancelled the drain of {instance.name}; it rejoins the router")
 
 
 async def distribute_models_to_user(
@@ -2308,6 +2413,60 @@ def pairing_locality(
     )
 
 
+async def _no_atomic_admission(session: AsyncSession, model: Model) -> bool:
+    """Whether this group cannot be admitted to its queue as a unit.
+
+    Gang admission is what stops a 2P2D from having its prefills admitted and
+    its decodes left queueing — half a group, holding cards, serving nothing.
+    One Workload's podSets must come from one ClusterQueue, and a ClusterQueue
+    is per InstanceType, so P on A-cards and D on B-cards is two queues and
+    two admissions. The operator would need a cross-InstanceType queue object,
+    which is its roadmap and not ours.
+
+    🔴 **Kubernetes only, and Docker is not a milder version of the same
+    problem.** A Docker cluster has no queue at all, so there is nothing to be
+    half-admitted to and nothing that looks like queueing — a group that does
+    not fit fails scheduling with the shortfall named. Marking every Docker PD
+    deployment would put a permanent badge on a deployment that is behaving
+    exactly as designed, which is how a marker stops being read. What this one
+    has to be able to explain is a group that sits in the queue forever, and
+    that only happens where there is a queue.
+
+    Homogeneous on Kubernetes is the case that *does* get the guarantee, whole
+    cards and slices alike, so the marker is absent exactly when it is real.
+    """
+    from gpustack.schemas.models import role_takes_no_accelerator
+
+    if not model.roles:
+        return False
+
+    # One accelerator-bearing role cannot be half-admitted: there is no second
+    # role to be admitted without. The router never counts — it is outside the
+    # gang by construction (it would deadlock against the members it proxies).
+    gpu_roles = [
+        role for role in model.roles if not role_takes_no_accelerator(model, role.name)
+    ]
+    if len(gpu_roles) < 2:
+        return False
+
+    # `None` is a value here, not a gap: a role taking whole cards and a role
+    # taking slices of a pool are as much two queues as two different pools
+    # are. Collapsing them would claim a gang for the one mixed shape that
+    # most looks like it should have one.
+    pools = {getattr(role.gpu_type_selector, "type", None) for role in gpu_roles}
+    if len(pools) == 1:
+        # Homogeneous, and that answer does not depend on the provider — so it
+        # is decided before the cluster is read rather than after. Almost every
+        # deployment is this one, and it is the difference between the marker
+        # costing a query per reconcile per model and costing nothing.
+        return False
+
+    cluster = (
+        await Cluster.one_by_id(session, model.cluster_id) if model.cluster_id else None
+    )
+    return cluster is not None and cluster.provider == ClusterProvider.Kubernetes
+
+
 async def _gather_unmet(
     session: AsyncSession, model: Model, instances: Sequence[ModelInstance]
 ) -> bool:
@@ -2462,6 +2621,15 @@ async def _degradation_reasons(
     if await _gather_unmet(session, model, instances):
         # Says what the spec cannot: the ask is stored, the outcome was not.
         reasons.append(DegradationReasonEnum.GATHER_UNMET.value)
+
+    if await _no_atomic_admission(session, model):
+        # A property of the configuration, so it is true from the moment the
+        # group is created and stays true — unlike every other marker here,
+        # which describes something that happened. That is deliberate: what
+        # the user sees without it is a group queueing forever, and the fact
+        # they need is that nothing about this cluster will ever admit it as
+        # a unit.
+        reasons.append(DegradationReasonEnum.NO_ATOMIC_ADMISSION.value)
 
     if instances and placement_drifted(
         instances,

@@ -28,6 +28,7 @@ import logging
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 from gpustack.config.config import Config
+from gpustack.scheduler import port_budget
 from gpustack.policies.base import WorkerFilterChain
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -82,11 +83,16 @@ class GroupCapacity:
         model: Model,
         workers: Sequence[Worker],
         model_instances: Sequence[ModelInstance],
+        cache_instances: Sequence[object] = (),
     ):
         self._config = config
         self._model = model
         self._workers = {w.id: w for w in workers}
         self._model_instances = list(model_instances)
+        self._cache_instances = list(cache_instances)
+        # worker_id -> ports already spoken for there. Computed on first use
+        # and kept, because a solve asks about the same workers once per role.
+        self._ports_taken: Dict[int, int] = {}
         # role -> {worker_id: worker}, after that role's filters.
         self._eligible: Dict[Optional[str], Dict[int, Worker]] = {}
         self._projected: Dict[Optional[str], "_RoleProjection"] = {}
@@ -144,8 +150,54 @@ class GroupCapacity:
                 # Nothing was proven about this worker. Leaving it out is the
                 # difference between "no room" and "we could not look".
                 continue
-            out[worker_id] = offer.slots
+            out[worker_id] = self._within_port_budget(role, worker_id, offer)
         return out
+
+    def _within_port_budget(self, role: str, worker_id: int, offer) -> int:
+        """`offer.slots`, capped by what the host has ports for.
+
+        Applied here rather than as a filter of its own so a port shortage
+        reads to the solver exactly like a card shortage: fewer slots on this
+        worker, and the same walk to the next domain. The alternative — a
+        worker that passes capacity and fails at start-up — puts the failure
+        after the placement decision, where nothing reconsiders it.
+        """
+        if offer.slots <= 0:
+            return offer.slots
+
+        # The cards this member would get here. `{{accelerator_count}}` is the
+        # width of a Mooncake-style band, and it is the one input that is not
+        # knowable from the spec — it is what the selector just decided.
+        placements = getattr(offer, "placements", None) or []
+        cards = (
+            len(getattr(placements[0], "gpu_indexes", None) or []) if placements else 0
+        )
+
+        # The role's projection, which is what the worker's own resolver
+        # receives: `backend_parameters` there are the role's effective ones.
+        projected = self._projected[role].model
+        demand = port_budget.member_port_demand(projected, role, cards)
+
+        if worker_id not in self._ports_taken:
+            self._ports_taken[worker_id] = port_budget.ports_taken_on(
+                worker_id, self._model_instances, self._cache_instances
+            )
+        allowed = port_budget.port_capacity(
+            getattr(self._config, "service_port_range", None),
+            demand,
+            self._ports_taken[worker_id],
+        )
+        if allowed is None or allowed >= offer.slots:
+            return offer.slots
+
+        logger.debug(
+            "Port budget caps role %r on %s",
+            role,
+            port_budget.describe(
+                worker_id, allowed, demand, self._ports_taken[worker_id]
+            ),
+        )
+        return allowed
 
     def _translate(self, already_placed: Sequence[object]) -> List[object]:
         """The solver's commits, in the shape the allocation accounting reads.

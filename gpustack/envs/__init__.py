@@ -303,6 +303,23 @@ SCHEDULER_GROUP_LOCALITY_MAX_SCORE = float(
 SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE", 5)
 )
+# Per opposite-role sibling on a worker, when scaling one role of a PD group
+# out. Deliberately larger than every other scale-up scorer's maximum put
+# together (100 + 5): the rule is "most decodes wins, and capacity breaks the
+# tie", which only holds while one more sibling outweighs anything the
+# resource scorers can say. Set to 0 to scale a group out by resource fit
+# alone.
+SCHEDULER_PAIRING_AFFINITY_MAX_SCORE = float(
+    os.getenv("GPUSTACK_SCHEDULER_PAIRING_AFFINITY_MAX_SCORE", 200)
+)
+# How long a scaled-down group member keeps running after it leaves the
+# router's registry. It is not a grace period for the process — it is the time
+# the decodes already fetching KV from it need to finish, which the engine
+# cannot be asked to wait for itself. Set to 0 to delete immediately, which is
+# what a role-less model does regardless.
+SCHEDULER_DRAIN_WINDOW_SECONDS = int(
+    os.getenv("GPUSTACK_SCHEDULER_DRAIN_WINDOW_SECONDS", 60)
+)
 # Scale-down scoring weights (relative, normalized in score chain)
 SCHEDULER_SCALE_DOWN_STATUS_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_DOWN_STATUS_MAX_SCORE", 100)

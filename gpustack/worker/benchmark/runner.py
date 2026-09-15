@@ -105,6 +105,34 @@ def _local_model_snapshot(
     return endpoint_snapshot
 
 
+def _transient_phase_arg(value: float) -> str:
+    """Render a warmup/cooldown value as a guidellm TransientPhaseConfig object.
+
+    Sent as JSON rather than the bare number, for one reason: to pin ``mode``.
+
+    guidellm's ``TransientPhaseConfig`` defaults to ``mode="prefer_duration"``,
+    and ``compute_limits`` drops the request-based bound whenever a duration can
+    also be computed. Our stages always set BOTH ``max_requests`` and
+    ``max_seconds``, so the bare number was always interpreted as a slice of
+    TIME -- e.g. ``0.1`` trimmed the first 10% of each stage's seconds, not its
+    requests.
+
+    That is the wrong axis for comparing arms. Trimming by time removes a
+    DIFFERENT POPULATION of requests from a saturated arm than from an idle one
+    (the saturated arm's warmup backlog gets dragged into the measured window),
+    which biases the very comparison the benchmark exists to make. Trimming by
+    request count removes "the first N% of requests" from both, which is
+    comparable by construction.
+
+    The column keeps guidellm's own scalar convention -- below 1 is a fraction,
+    1 and above is an absolute count -- so both are forwarded, only with the
+    axis pinned.
+    """
+    if value < 1:
+        return json.dumps({"percent": value, "mode": "requests"})
+    return json.dumps({"value": int(value), "mode": "requests"})
+
+
 class BenchmarkRunner:
     _clientset: ClientSet
     _config: Config
@@ -627,10 +655,12 @@ class BenchmarkRunner:
                 command_args.extend(["--max-seconds", str(b.max_seconds)])
 
         # Warmup / cooldown / constraints, passed through to guidellm.
+        # Sent as a JSON object rather than the bare number the column holds, to
+        # pin `mode` — see `_transient_phase_arg`.
         if b.warmup is not None:
-            command_args.extend(["--warmup", str(b.warmup)])
+            command_args.extend(["--warmup", _transient_phase_arg(b.warmup)])
         if b.cooldown is not None:
-            command_args.extend(["--cooldown", str(b.cooldown)])
+            command_args.extend(["--cooldown", _transient_phase_arg(b.cooldown)])
         if b.max_errors is not None:
             command_args.extend(["--max-errors", str(b.max_errors)])
         # guidellm's MaxErrorRateConstraint takes a FRACTION in the open interval

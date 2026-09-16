@@ -16,7 +16,7 @@ from gpustack.schemas.clusters import ClusterTopology, GatherStrategyEnum
 from gpustack.schemas.models import GatherSpec, Model, RoleSpec
 from gpustack.scheduler import group_schedule
 from gpustack.scheduler.group_schedule import (
-    _gather_request,
+    gather_request,
     is_group_forming,
     schedule_group,
 )
@@ -132,7 +132,7 @@ def test_the_models_gather_is_the_requirement():
     model = _model(
         gather=GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer="Rack")
     )
-    request = _gather_request(model)
+    request = gather_request(model)
     assert request.must is True
     assert request.layer == "Rack"
 
@@ -158,7 +158,7 @@ def test_a_stale_cluster_level_default_has_no_effect():
     assert not hasattr(topology, "default_gather_strategy")
     assert "defaultGatherStrategy" not in topology.model_dump(by_alias=True)
 
-    request = _gather_request(_model())
+    request = gather_request(_model())
     assert request.must is False
     assert request.layer is None
 
@@ -166,7 +166,7 @@ def test_a_stale_cluster_level_default_has_no_effect():
 def test_no_gather_is_a_preference_not_a_requirement():
     """Absent must never mean "refuse": the solver's own default is to widen
     to the cluster root rather than fail."""
-    request = _gather_request(_model())
+    request = gather_request(_model())
     assert request.must is False
     assert request.layer is None
 
@@ -181,7 +181,7 @@ def test_an_accelerator_domain_layer_is_named_like_any_other():
             strategy=GatherStrategyEnum.MUST_GATHER, layer="accelerator_domain"
         )
     )
-    assert _gather_request(model).layer == "accelerator_domain"
+    assert gather_request(model).layer == "accelerator_domain"
 
 
 # --- the solve, and what it hands back -------------------------------------- #

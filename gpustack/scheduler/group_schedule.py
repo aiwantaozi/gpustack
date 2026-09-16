@@ -80,7 +80,7 @@ def is_group_forming(model: Model, instances: Sequence[ModelInstance]) -> bool:
     return not any(i.worker_id is not None for i in gpu_members)
 
 
-def _gather_request(model: Model) -> GatherRequest:
+def gather_request(model: Model) -> GatherRequest:
     """The group's gather requirement — the model's, and only the model's.
 
     There used to be a second source: the cluster carried a default that any
@@ -138,13 +138,13 @@ async def schedule_group(
     # Cache servers draw from the same `service_port_range` the members do, so
     # a host running one has fewer ports for the group — and a group is placed
     # onto cache-bearing hosts on purpose, not by accident.
-    cache_instances = await _cache_instances_in(session, model.cluster_id)
+    cache_instances = await cache_instances_in(session, model.cluster_id)
     capacity = GroupCapacity(config, model, workers, model_instances, cache_instances)
     # One chain, walked from the host upward. Picking which chain to walk used
     # to be a step here — the layer name was looked up to decide whether the
     # search followed the network rungs or the accelerator ones — and it is
     # gone with the second chain: there is one tree, so there is one search.
-    request = _gather_request(model)
+    request = gather_request(model)
     placement = await solve_group_placement(
         view.root, demands, capacity, view.scopes(), request
     )
@@ -183,12 +183,12 @@ async def schedule_group(
             ]
         for row, candidate in zip(rows, candidates):
             by_instance[row.id] = candidate
-            already.append(_stand_in(candidate))
+            already.append(stand_in(candidate))
 
     return by_instance, []
 
 
-async def _cache_instances_in(session: AsyncSession, cluster_id) -> List[object]:
+async def cache_instances_in(session: AsyncSession, cluster_id) -> List[object]:
     """Cache server instances of this cluster, for the port budget.
 
     Failure is not fatal here and deliberately so: the budget is a refinement
@@ -211,7 +211,7 @@ async def _cache_instances_in(session: AsyncSession, cluster_id) -> List[object]
         return []
 
 
-def _stand_in(candidate) -> object:
+def stand_in(candidate) -> object:
     """What the allocation accounting reads off a placed instance.
 
     The same four fields `offer_slot._PlacedStandIn` carries, and for the same

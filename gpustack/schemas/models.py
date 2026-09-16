@@ -1548,7 +1548,9 @@ class ModelInstanceBase(SQLModel, ModelSource):
     )
     """Connector ports by declared name. Values are bands, not points."""
 
-    draining_since: Optional[datetime] = Field(default=None)
+    draining_since: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
     """Set when scale-down picked this member, cleared if it is kept.
 
     A prefill cannot be told "stop accepting work and exit once the blocks you
@@ -1565,7 +1567,18 @@ class ModelInstanceBase(SQLModel, ModelSource):
     elapsed while the server was down simply reaps on the next pass.
 
     Clearing it is the rollback, and it needs no second mechanism: the next
-    membership reconcile sees the member as ordinary and re-registers it."""
+    membership reconcile sees the member as ordinary and re-registers it.
+
+    🔴 **`UTCDateTime`, not a bare `datetime`.** The column is TIMESTAMP WITHOUT
+    TIME ZONE and the writer builds `datetime.now(timezone.utc)`, which is
+    aware. SQLite stores that without complaint; asyncpg refuses it outright
+    (`DataError: invalid input for query argument`), and the refusal surfaces
+    as a reconcile that fails after `find_scale_down_candidates` has already
+    picked its victim — so on PostgreSQL every per-role scale-down retried
+    forever and no surplus member was ever taken out of rotation, while
+    `role_status` and `degradations` went on reporting the group as converged.
+    The type strips the zone on the way in and puts UTC back on the way out,
+    which is why every other timestamp on this table already uses it."""
 
     def get_deployment_metadata(
         self,

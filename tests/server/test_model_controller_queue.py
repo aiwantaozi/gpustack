@@ -13,13 +13,15 @@ publish by asking which fields moved, so keeping only the newest event's
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gpustack.config.config import Config
 from gpustack.schemas.config import GatewayModeEnum
+from gpustack.schemas.models import Model, SourceEnum
 from gpustack.server.bus import Event, EventType
 from gpustack.server.controllers import ModelController
 from gpustack.server.workqueue import WorkEvent, WorkEventType
@@ -185,3 +187,80 @@ async def test_a_successful_reconcile_clears_the_backoff():
         await controller._process(event)
 
     assert controller._queue.failures((1,)) == 0
+
+
+# --- the one pass this controller books for itself ------------------------- #
+
+
+async def _reconcile_once(controller, drain_due):
+    """Drive one `_reconcile` with everything after `sync_replicas` stubbed.
+
+    `_reconcile` swallows its own exceptions, so a half-built harness would
+    show up as a booking that silently never happened rather than as an error.
+    Everything it touches is patched for that reason.
+    """
+    model = Model(
+        id=1,
+        name="m",
+        replicas=1,
+        source=SourceEnum.HUGGING_FACE,
+        huggingface_repo_id="org/repo",
+        owner_principal_id=1,
+        cluster_id=1,
+    )
+
+    @asynccontextmanager
+    async def _session():
+        yield MagicMock()
+
+    with (
+        patch("gpustack.server.controllers.async_session", _session),
+        patch.object(controller._namespaces, "ensure", AsyncMock()),
+        patch(
+            "gpustack.server.controllers.resolve_workload_namespace",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "gpustack.server.controllers.sync_replicas",
+            AsyncMock(return_value=drain_due),
+        ),
+        patch(
+            "gpustack.server.controllers.Model.one_by_id",
+            AsyncMock(return_value=None),
+        ),
+        patch("gpustack.server.controllers.notify_model_route_target", AsyncMock()),
+        patch("gpustack.server.controllers.sync_categories_and_meta", AsyncMock()),
+        patch.object(controller, "_ensure_model_mcp_bridge", AsyncMock()),
+        patch.object(controller._queue, "add_after") as add_after,
+    ):
+        await controller._reconcile(
+            Event(type=EventType.UPDATED, data=model, changed_fields={})
+        )
+    return add_after
+
+
+@pytest.mark.asyncio
+async def test_an_open_drain_window_books_its_own_reap():
+    """🔴 Nothing else would arrive.
+
+    A member marked for drain changes no field `sync_model_status` publishes,
+    so the mark produces no Model event, and a deployment that has settled
+    produces none either. `_reap_drained` runs off this loop, so without the
+    booking the window expires against a reconcile that never comes and the
+    member holds its accelerators until someone happens to edit the model.
+    """
+    add_after = await _reconcile_once(_controller(), drain_due=42.0)
+
+    add_after.assert_called_once()
+    booked_event, delay = add_after.call_args[0]
+    assert delay == 42.0
+    assert booked_event.keys == (1,)
+
+
+@pytest.mark.asyncio
+async def test_nothing_draining_books_nothing():
+    """The booking is the exception, not the routine: an ordinary reconcile
+    must leave no timer behind, or every settled model would hold one."""
+    add_after = await _reconcile_once(_controller(), drain_due=None)
+
+    add_after.assert_not_called()

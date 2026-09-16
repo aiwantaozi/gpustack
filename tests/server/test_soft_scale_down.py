@@ -8,15 +8,21 @@ at 18ms with requests in flight, so the cost of changing a ratio is entirely
 that window, not an interruption.
 """
 
+import importlib
+import pkgutil
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import sqlalchemy as sa
+from sqlmodel import SQLModel
 
-from gpustack.schemas.models import ModelInstanceStateEnum, RoleNameEnum
+from gpustack.schemas.common import UTCDateTime
+from gpustack.schemas.models import ModelInstance, ModelInstanceStateEnum, RoleNameEnum
 from gpustack.server import pd_membership
 from gpustack.server.controllers import (
+    _next_drain_due,
     _reap_drained,
     _scale_down_role,
     cancel_drain,
@@ -223,6 +229,99 @@ class TestReaping:
         survivors, _ = await self._reap([old])
 
         assert survivors == []
+
+
+class TestTheMarkCanActuallyBeStored:
+    """🔴 Everything above mocks the write, and that is how this shipped broken.
+
+    `_scale_down_role` builds `datetime.now(timezone.utc)` — an aware value.
+    `draining_since` was declared as a bare `Optional[datetime]`, which maps to
+    TIMESTAMP WITHOUT TIME ZONE. SQLite takes that combination without
+    complaint, so every test here and every dev install passed; asyncpg refuses
+    it outright, so on PostgreSQL the write raised after the victim had already
+    been chosen, the reconcile died there, and the surplus member was never
+    taken out of rotation — while `role_status` and `degradations` went on
+    reporting the group as converged. Measured: 344s, two decodes, one wanted.
+    """
+
+    def test_the_column_normalizes_the_zone(self):
+        column = ModelInstance.__table__.c.draining_since
+        assert isinstance(column.type, UTCDateTime)
+
+        aware = datetime.now(timezone.utc)
+        stored = column.type.process_bind_param(aware, None)
+        assert stored.tzinfo is None
+        assert column.type.process_result_value(stored, None).tzinfo == timezone.utc
+
+    def test_no_timestamp_column_anywhere_is_left_bare(self):
+        """The invariant rather than the one column, because the bug is a
+        declaration that looks entirely ordinary. A bare `Optional[datetime]`
+        is the natural thing to write and is wrong on every table here."""
+        import gpustack.schemas as schemas
+
+        for module in pkgutil.iter_modules(schemas.__path__):
+            importlib.import_module(f"{schemas.__name__}.{module.name}")
+
+        bare = [
+            f"{table.name}.{column.name}"
+            for table in SQLModel.metadata.tables.values()
+            for column in table.columns
+            if isinstance(column.type, (sa.DateTime, sa.TIMESTAMP))
+            and not isinstance(column.type, UTCDateTime)
+        ]
+        assert bare == []
+
+
+class TestBookingTheReap:
+    """`_reap_drained` runs off the reconcile loop, and nothing ticks it.
+
+    A drained member changes no field the status pass publishes, and a settled
+    deployment publishes nothing either, so without a booked pass the window
+    expires against a reconcile that never arrives — the member keeps its
+    accelerators for as long as the deployment goes unedited.
+    """
+
+    def test_nothing_draining_books_nothing(self):
+        assert _next_drain_due([_instance("p1"), _instance("p2")]) is None
+
+    def test_the_delay_is_what_is_left_of_the_window(self):
+        with patch("gpustack.envs.SCHEDULER_DRAIN_WINDOW_SECONDS", WINDOW):
+            due = _next_drain_due(
+                [
+                    _instance(
+                        "p1",
+                        draining_since=datetime.now(timezone.utc)
+                        - timedelta(seconds=20),
+                    )
+                ]
+            )
+        assert 35 <= due <= 40
+
+    def test_the_earliest_deadline_wins(self):
+        now = datetime.now(timezone.utc)
+        with patch("gpustack.envs.SCHEDULER_DRAIN_WINDOW_SECONDS", WINDOW):
+            due = _next_drain_due(
+                [
+                    _instance("p1", draining_since=now - timedelta(seconds=10)),
+                    _instance("p2", draining_since=now - timedelta(seconds=50)),
+                ]
+            )
+        assert 5 <= due <= 15
+
+    def test_an_elapsed_window_books_an_immediate_pass(self):
+        """Not a negative delay: `add_after` treats <= 0 as "enqueue now",
+        which is right, but only by accident — say it here so a window that
+        elapsed while the server was down cannot turn into a skipped reap."""
+        with patch("gpustack.envs.SCHEDULER_DRAIN_WINDOW_SECONDS", WINDOW):
+            due = _next_drain_due(
+                [
+                    _instance(
+                        "p1",
+                        draining_since=datetime.now(timezone.utc) - timedelta(days=2),
+                    )
+                ]
+            )
+        assert due == 0
 
 
 @pytest.mark.asyncio

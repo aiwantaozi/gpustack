@@ -412,7 +412,23 @@ class ModelController:
                         session, model.owner_principal_id, model.cluster_id
                     ),
                 )
-                await sync_replicas(session, model)
+                drain_due = await sync_replicas(session, model)
+                if drain_due is not None:
+                    # The only self-scheduled pass this controller books, and it
+                    # exists because nothing else would arrive: a drained member
+                    # publishes no further Model event and a settled deployment
+                    # publishes none either, so `_reap_drained` would wait on a
+                    # reconcile that never comes. `add_after` is
+                    # last-schedule-wins per key, so re-booking on every pass
+                    # keeps one timer rather than accumulating them.
+                    self._queue.add_after(
+                        WorkEvent(
+                            keys=(model.id,),
+                            type=WorkEventType.MODIFIED,
+                            object=event,
+                        ),
+                        drain_due,
+                    )
                 # The status owner has to run on the spec side too, not only on
                 # instance events. `role_status.desired` is read straight off
                 # `roles[].replicas`, so a spec edit changes it with no instance
@@ -1059,9 +1075,14 @@ class CacheServiceController:
         )
 
 
-async def sync_replicas(session: AsyncSession, model: Model):
+async def sync_replicas(session: AsyncSession, model: Model) -> Optional[float]:
     """
     Synchronize the replicas.
+
+    Returns the seconds until this model next needs a pass with nothing else
+    prompting one, or None when it does not. Only the role-bearing rule has
+    such a deadline today — a drain window — so the role-less path returns
+    None and behaves exactly as it did.
 
     Two convergence rules live behind this one name, and the switch between
     them is `model.roles`:
@@ -1080,7 +1101,7 @@ async def sync_replicas(session: AsyncSession, model: Model):
     # (event data may be from a different session or stale)
     fresh_model = await Model.one_by_id(session, model.id)
     if not fresh_model or fresh_model.deleted_at is not None:
-        return
+        return None
     model = fresh_model
 
     # Resolved once per pass rather than per row: it is the same answer for
@@ -1115,9 +1136,10 @@ async def sync_replicas(session: AsyncSession, model: Model):
             f"{len(orphans)} group member(s) before rebuilding plain replicas"
         )
         await _release_and_delete(session, orphans)
-        return
+        return None
 
-    return await _sync_replicas_legacy(session, model, namespace)
+    await _sync_replicas_legacy(session, model, namespace)
+    return None
 
 
 async def _sync_replicas_legacy(
@@ -1499,12 +1521,16 @@ async def _release_and_delete(
 
 async def _sync_replicas_per_role(
     session: AsyncSession, model: Model, namespace: Optional[str] = None
-):
+) -> Optional[float]:
     """Converge a role-bearing model, one role at a time.
 
     Per role rather than per group because the group is not the unit of
     change: turning a 1P1D into a 2P1D under group semantics would mean
     deleting the group and recreating it — a full outage to add one prefill.
+
+    Returns the seconds until the earliest drain window closes, or None when
+    nothing is draining. The caller uses it to book the pass that reaps them:
+    see `_next_drain_due`.
     """
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
 
@@ -1512,7 +1538,7 @@ async def _sync_replicas_per_role(
         # `Model.replicas` is a deployment switch for a role-bearing model,
         # so zero means the whole group is parked, not "zero of each role".
         await _release_and_delete(session, instances)
-        return
+        return None
 
     digest = await model_spec_digest(session, model)
 
@@ -1613,6 +1639,37 @@ async def _sync_replicas_per_role(
         elif len(have) > role.replicas:
             await _scale_down_role(session, model, role, have)
 
+    return _next_drain_due(generation)
+
+
+def _next_drain_due(instances: List[ModelInstance]) -> Optional[float]:
+    """Seconds until the earliest drain window closes, or None if none is open.
+
+    🔴 **Without this the drain has no second half.** `_reap_drained` runs off
+    the reconcile loop, and this controller is purely event-driven — nothing
+    ticks. A member marked for drain changes no field that `sync_model_status`
+    publishes, so the mark itself produces no further Model event, and a
+    deployment that has settled produces none either. The window would then
+    expire against a pass that never comes: the member stays out of the
+    router's registry, serving nothing, holding its accelerators, for as long
+    as the deployment goes unedited.
+
+    Floored at zero rather than clamped away, so a window that already elapsed
+    (a server that was down through it) books an immediate pass instead of a
+    negative delay the queue would read as "now, unconditionally".
+    """
+    now = datetime.now(timezone.utc)
+    window = envs.SCHEDULER_DRAIN_WINDOW_SECONDS
+    deadlines = []
+    for instance in instances:
+        since = instance.draining_since
+        if since is None:
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        deadlines.append(max(0.0, window - (now - since).total_seconds()))
+    return min(deadlines) if deadlines else None
+
 
 async def _scale_down_role(
     session: AsyncSession, model: Model, role: RoleSpec, have: List[ModelInstance]
@@ -1700,7 +1757,10 @@ async def _reap_drained(
         if since is None:
             continue
         if since.tzinfo is None:
-            # Read back from SQLite without a zone. It was written as UTC.
+            # `UTCDateTime` puts the zone back on the way out, so this is not
+            # the path a stored row takes. Kept for a value that reached here
+            # without passing through the column — it was written as UTC either
+            # way, and the alternative is a TypeError on the subtraction below.
             since = since.replace(tzinfo=timezone.utc)
         if (now - since).total_seconds() >= window:
             due.append(instance)

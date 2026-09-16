@@ -34,6 +34,7 @@ from gpustack.schemas.models import (
     is_embedding_model,
     is_image_model,
     is_reranker_model,
+    role_effective_model,
     servable_instances,
 )
 from gpustack.schemas.clusters import Cluster
@@ -1092,7 +1093,21 @@ async def get_benchmark_snapshot(
     instance_snapshots = {}
 
     for member in await _snapshot_members(session, mi, model):
-        instance_snapshots[member.name] = create_model_instance_snapshot(member, model)
+        # Project the role's overrides before snapshotting, rather than handing
+        # every member the deployment's own values. `env` and
+        # `backend_parameters` are overridable per role precisely because
+        # prefill and decode need different ones -- measured on Ascend 910B2
+        # they differ down to `HCCL_CONNECT_TIMEOUT` (120 vs 1200). Reading the
+        # Model's copy for every member would freeze one intent as all of them,
+        # and the report would then attribute settings to a member that never
+        # ran with them.
+        #
+        # `role_effective_model` returns the model itself when there is no role
+        # to project, so a plain deployment snapshots byte-for-byte as before.
+        effective = role_effective_model(model, getattr(member, "role", None))
+        instance_snapshots[member.name] = create_model_instance_snapshot(
+            member, effective
+        )
 
         if member.worker_id is None:
             continue

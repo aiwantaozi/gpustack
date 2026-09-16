@@ -24,6 +24,7 @@ from gpustack.schemas.models import (
     PDModeEnum,
     RoleNameEnum,
     RoleSpec,
+    SourceEnum,
 )
 
 
@@ -33,6 +34,13 @@ def _group_model(**kwargs) -> Model:
         name=kwargs.pop("name", "g"),
         cluster_id=1,
         replicas=1,
+        # A column the DB requires, so every Model these tests stand in for has
+        # one. `Model` is a SQLModel table and skips validation on construction,
+        # which is what let it be omitted -- until the snapshot path started
+        # projecting roles through `RoleEffectiveModel.model_validate`, which
+        # does validate.
+        source=SourceEnum.HUGGING_FACE.value,
+        huggingface_repo_id="org/g",
         roles=[
             RoleSpec(name=RoleNameEnum.PREFILL.value, replicas=1),
             RoleSpec(name=RoleNameEnum.DECODE.value, replicas=1),
@@ -49,6 +57,8 @@ def _plain_model(**kwargs) -> Model:
         name=kwargs.pop("name", "m"),
         cluster_id=1,
         replicas=1,
+        source=SourceEnum.HUGGING_FACE.value,
+        huggingface_repo_id="org/m",
         **kwargs,
     )
 

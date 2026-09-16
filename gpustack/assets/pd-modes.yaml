@@ -574,6 +574,32 @@ modes:
     # the engine's own default, it is the only backend the DSA-layer-split
     # and unified-memory paths accept, and it takes the NIC through a
     # validated engine flag instead of UCX_NET_DEVICES discovery.
+    #
+    # ✅ Leaving `--disaggregation-ib-device` unset is safe even with no RDMA
+    # on the host. Measured 2026-09-17 (SGLang 0.5.15.post1, Qwen3-8B, two
+    # RTX 4090 48G hosts, one member each, `/sys/class/infiniband/` empty on
+    # both, TCP between them): auto discovery reports `Found 0 HCAs` and the
+    # transfer engine brings up its own `TcpTransport` rather than failing, PD
+    # warmup completes, and the cross-host 1P1D serves with
+    # `kv_transfers_per_request: 1.0` (transfer p50 1.5ms / p99 23ms).
+    #
+    # So `mooncake_tcp` is NOT the only way into TCP -- it is the explicit
+    # declaration, and it skips one discovery pass that was never going to find
+    # anything. An earlier reading of the engine notes had this backwards
+    # ("RDMA unavailable takes the discovery-failure path"), which would have
+    # made every RDMA-less cluster look unsupported on the recipe this flag
+    # marks as the DEFAULT. Nothing needs to be declared here for those hosts.
+    #
+    # ⚠️ Two alarming-but-harmless lines sit on that healthy path:
+    # `No RDMA devices found, check your device installation` (a WARNING phrased
+    # as an instruction) and `Local segment descriptor not found` (at ERROR).
+    # Both appear on a group that goes on to serve correctly, so any
+    # log-scanning diagnosis has to whitelist them.
+    #
+    # 🔬 Unverified: which HCA auto discovery picks when there ARE several --
+    # the case the flag actually exists for. No host here has both RDMA and
+    # this engine stack (the Ascend pair has RDMA but no Mooncake-TE/UCX; the
+    # x86 fleet has the stack but no RDMA).
     preferred: true
     kv_lease: sglang-mooncake
     roles:

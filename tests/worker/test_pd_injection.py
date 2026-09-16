@@ -401,6 +401,73 @@ def test_start_path_carries_env_args_and_attributes_them_to_gpustack():
     assert "--max-model-len" not in injected
 
 
+def test_a_users_parameter_is_rendered_like_an_env_value():
+    """🔑 The two halves of a deployment's configuration follow one rule.
+
+    `env` values have always been rendered; parameters were not, so the same
+    `{{worker_ip}}` resolved in one and reached the engine verbatim in the
+    other. The PD form is what made the split untenable — it seeds the recipe's
+    own rows into the role's parameter list so they can be edited, and those
+    rows are written in placeholders."""
+    # Non-PD on purpose: the rule under test is the shared parameter path, and
+    # a PD model would additionally need a derivable KV interface, which a
+    # developer laptop with two candidate NICs does not have.
+    model = _model(
+        mode=None,
+        backend_parameters=[
+            "--served-model-name",
+            "{{model_name}}",
+            "--max-model-len=8192",
+        ],
+    )
+    backend = _backend(model, _instance())
+
+    tokens = backend._flatten_backend_param()
+
+    assert "{{model_name}}" not in tokens
+    assert tokens[tokens.index("--served-model-name") + 1] == "llm"
+    # Everything without a placeholder is untouched.
+    assert "--max-model-len=8192" in tokens
+
+
+def test_an_unknown_placeholder_in_a_parameter_survives(caplog):
+    """Same posture as `render` takes everywhere else: verbatim plus a
+    warning. A user parameter may legitimately contain braces that are not
+    ours, and blanking one would turn text they chose into a plausible-looking
+    wrong value."""
+    model = _model(mode=None, backend_parameters=["--chat-template", "{{not_ours}}"])
+    backend = _backend(model, _instance())
+
+    with caplog.at_level(logging.WARNING):
+        tokens = backend._flatten_backend_param()
+
+    assert "{{not_ours}}" in tokens
+    assert "not_ours" in caplog.text
+
+
+def test_a_json_parameter_keeps_its_quotes_through_rendering():
+    """Rendering is per token, after `flatten_to_argv` has decided what a token
+    is. Doing it over the joined string would give a value containing a space a
+    second chance to be split — which for a JSON document means losing its
+    quotes."""
+    model = _model(
+        mode=None,
+        backend_parameters=[
+            "--kv-transfer-config",
+            '{"kv_connector":"Mine","host":"{{worker_ip}}"}',
+        ],
+    )
+    backend = _backend(model, _instance())
+
+    tokens = backend._flatten_backend_param()
+    document = tokens[tokens.index("--kv-transfer-config") + 1]
+
+    assert json.loads(document) == {
+        "kv_connector": "Mine",
+        "host": "192.168.50.10",
+    }
+
+
 def test_non_pd_deploy_takes_the_same_path_it_takes_today():
     model = _model(mode=None, backend_parameters=["--max-model-len", "8192"])
     backend = _backend(model, _instance())

@@ -64,7 +64,7 @@ from gpustack.server.bus import Event
 from gpustack.utils.command import flatten_to_argv, is_parameter_key
 from gpustack.utils.config import apply_registry_override_to_image
 from gpustack.utils.envs import filter_env_vars
-from gpustack.utils.template import deployment_variables, render_values
+from gpustack.utils.template import deployment_variables, render, render_values
 from gpustack.utils.hub import get_hf_text_config, get_max_model_len
 from gpustack.utils.hub import get_pretrained_config, safe_pretrained_config_from_dict
 from gpustack.utils.profiling import time_decorator
@@ -1764,6 +1764,35 @@ exec "$@"
         space form — equal form can't safely express them).
         """
         tokens = flatten_to_argv(self._model.backend_parameters or [])
+
+        # 🔴 Rendered, exactly as `env` values are (`_get_configured_env`). The
+        # two halves of one deployment's configuration had different rules
+        # until now: an env value could say `{{worker_ip}}` and get the
+        # address, while the same placeholder in a parameter reached the engine
+        # verbatim. Nothing justified the split — it was simply that `env` grew
+        # the feature first.
+        #
+        # What makes it matter is the PD form. It seeds the recipe's own rows
+        # into the role's parameter list so they can be edited like any other
+        # row, and those rows are written in placeholders: a prefill's
+        # connector carries `{{ports.kv_port}}`, a router's command carries
+        # `{{worker_ip}}`. Submitting one of them used to produce
+        # `{kv_connector:NixlConnector,...,{{kv_lease_duration}}}` on the
+        # command line and a launch that failed to parse its own JSON.
+        #
+        # Token by token rather than over the joined string: `flatten_to_argv`
+        # has already decided what a token is, and re-rendering the joined form
+        # would give a value containing a space a second chance to be split.
+        #
+        # An unknown name survives verbatim with a warning (see `render`),
+        # which is the right posture here: a user parameter may legitimately
+        # contain `{{...}}` that is not ours, and blanking it would turn text
+        # the user chose into a plausible-looking wrong value.
+        variables = self._template_variables()
+        tokens = [
+            render(token, variables, context="backend parameter") or token
+            for token in tokens
+        ]
 
         # The PD role's connector arguments ride in front of the user's. This
         # is the one seam in this file that every backend's command builder

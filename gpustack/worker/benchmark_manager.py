@@ -21,8 +21,10 @@ from gpustack.schemas.benchmark import (
     Benchmark,
     BenchmarkLoadModeEnum,
     BenchmarkStateEnum,
+    BenchmarkTargetModeEnum,
     benchmark_load_mode,
 )
+from gpustack.schemas.models import ModelInstanceStateEnum
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.benchmark import analysis, artifacts
 from gpustack.worker.benchmark.runner import BenchmarkRunner
@@ -50,6 +52,20 @@ BENCHMARK_LOG_SNAPSHOT_INTERVAL_SECONDS = 30
 # multi-point benchmark. The state poll fires ~1s; re-globbing and replacing the
 # whole result set every second would be wasteful, so throttle to this.
 BENCHMARK_PARTIAL_SYNC_INTERVAL_SECONDS = 10
+# How often a running benchmark re-checks that its target is still there. The
+# lookup reads ServeManager's watch-backed instance cache rather than the API
+# (both managers share one ClientSet), so the cost is a dict scan — but the
+# cache falls back to a full unpaginated GET while the watch is reconnecting,
+# and that one should not fire on every 3-second poll.
+BENCHMARK_TARGET_CHECK_INTERVAL_SECONDS = 15
+# How long the target may stay missing before the run is failed. This is not a
+# detection delay to be minimized: an instance can legitimately leave RUNNING
+# for a while (a restart, a worker heartbeat blip, a reconnecting watch whose
+# cache is still replaying), and killing a run that has been measuring for
+# twenty minutes because of a five-second gap is the worse error. Long enough
+# to sit out those, short enough to beat the load generator's own per-request
+# timeout, which is what the run would otherwise wait on.
+BENCHMARK_TARGET_GONE_GRACE_SECONDS = 300
 
 
 def _without_raw_metrics(results: list) -> list:
@@ -189,6 +205,12 @@ class BenchmarkManager:
         # in the last successful partial sync, and when it happened.
         self._partial_synced_count: Dict[int, int] = {}
         self._last_partial_sync_at: Dict[int, float] = {}
+        # Per-benchmark target liveness: when the target was last looked up, and
+        # when it was FIRST seen missing (cleared as soon as it comes back). A
+        # timestamp rather than a strike count so the grace period stays the same
+        # wall-clock window whatever the check interval is set to.
+        self._last_target_check_at: Dict[int, float] = {}
+        self._target_missing_since: Dict[int, float] = {}
 
         os.makedirs(self._benchmark_log_dir, exist_ok=True)
         os.makedirs(self._benchmark_dir, exist_ok=True)
@@ -267,10 +289,17 @@ class BenchmarkManager:
             # here: there is only the analysis left to write.
             self._finalize_partial_analysis(benchmark)
             self._dump_benchmark_logs_to_file(benchmark)
-            self._stop_benchmark(benchmark)
-            self._clear_active_benchmark(benchmark.id)
         except Exception as e:
             logger.error(f"Failed to stop benchmark {benchmark.name}: {e}")
+        finally:
+            # In a finally because the two calls above write the run's leftovers
+            # while these two are what lets this worker run anything else. A row
+            # stopped by the user is no longer RUNNING, so the state poll will
+            # never look at it again and this is the only chance to release
+            # `_active_benchmark_id` — an analysis or a log dump that raised used
+            # to take the whole queue down with it.
+            self._stop_benchmark(benchmark)
+            self._clear_active_benchmark(benchmark.id)
 
     async def _enqueue_benchmark(self, benchmark: Benchmark):
         async with self._queue_lock:
@@ -282,7 +311,18 @@ class BenchmarkManager:
                 self._benchmark_queue.append(benchmark)
 
                 patch_dict = {"state": BenchmarkStateEnum.QUEUED}
-                await self._update_benchmark_state(benchmark.id, **patch_dict)
+                if not await self._update_benchmark_state(benchmark.id, **patch_dict):
+                    # Deleted between the PENDING event and this patch. Mark it
+                    # canceled rather than popping it here: the queue is a deque
+                    # shared with the sync thread, and the existing
+                    # `_canceled_ids` guard drops the entry race-safely when the
+                    # queue worker reaches it.
+                    self._canceled_ids.add(benchmark.id)
+                    logger.info(
+                        f"Benchmark {benchmark.name}(id={benchmark.id}) was deleted "
+                        "before it could be queued; dropping it."
+                    )
+                    return
                 logger.info(
                     f"Enqueued benchmark {benchmark.name}(id={benchmark.id}) and set to QUEUED."
                 )
@@ -354,12 +394,26 @@ class BenchmarkManager:
             process.start()
 
             self._provisioning_processes[benchmark.id] = process
+            # Remembered for the whole run so the teardown paths that only have
+            # an id — `_reap_deleted_active_benchmark` — can still name the
+            # workload they have to delete. Dropped by `_stop_benchmark`.
+            self._benchmark_by_id[benchmark.id] = benchmark
             self._set_active_benchmark(benchmark.id)
             patch_dict = {
                 "state": BenchmarkStateEnum.RUNNING,
                 "pid": process.pid,
             }
-            await self._update_benchmark_state(benchmark.id, **patch_dict)
+            if not await self._update_benchmark_state(benchmark.id, **patch_dict):
+                # Deleted while we were starting it. Tear it down here and now:
+                # the state poll lists rows from the server, so this id is absent
+                # from every later tick and nothing else would ever release
+                # `_active_benchmark_id`.
+                logger.info(
+                    f"Benchmark {benchmark.name}(id={benchmark.id}) was deleted "
+                    "while starting; stopping it again."
+                )
+                self._stop_benchmark(benchmark)
+                return
             logger.info(f"Started benchmark {benchmark.name}(id={benchmark.id})")
 
         except Exception as e:
@@ -425,15 +479,42 @@ class BenchmarkManager:
                     )
                     raise e
 
-    async def _update_benchmark_state(self, id: int, **kwargs):
+    async def _update_benchmark_state(self, id: int, **kwargs) -> bool:
         client = self._clientset.http_client.get_async_httpx_client()
         resp = await client.patch(f"/benchmarks/{id}/state", json=kwargs)
-        resp.raise_for_status()
+        return self._state_patch_landed(id, resp)
 
-    def _update_benchmark_state_sync(self, id: int, **kwargs):
+    def _update_benchmark_state_sync(self, id: int, **kwargs) -> bool:
         client = self._clientset.http_client.get_httpx_client()
         resp = client.patch(f"/benchmarks/{id}/state", json=kwargs)
+        return self._state_patch_landed(id, resp)
+
+    @staticmethod
+    def _state_patch_landed(id: int, resp) -> bool:
+        """True when the patch landed, False when the row is gone.
+
+        A 404 here is not a failed write, it is the server stating that the
+        benchmark no longer exists — the user deleted it, or the workload cleaner
+        did. Raising on it aborted whichever caller was mid-teardown, and on the
+        state-poll paths the teardown is what releases `_active_benchmark_id`: a
+        run deleted while RUNNING therefore left this worker with an active id
+        forever, its queue popping nothing while the poll re-entered the same 404
+        every 3 seconds. The worker looked healthy throughout (ready, all GPUs,
+        instances running) — only the benchmark queue was dead.
+
+        Every caller already has a correct reaction to "this row is gone": the
+        same local teardown it runs for a terminal state. So report it and let
+        them get on with it. Every other status still raises — that one IS a
+        failed write, and the callers that retry should keep retrying it.
+        """
+        if resp.status_code == 404:
+            logger.info(
+                f"Benchmark {id} no longer exists on the server; "
+                "skipping the state update and cleaning up locally."
+            )
+            return False
         resp.raise_for_status()
+        return True
 
     def _stop_benchmark(self, benchmark: Benchmark):
         """
@@ -487,6 +568,8 @@ class BenchmarkManager:
         self._last_log_snapshot_at.pop(benchmark.id, None)
         self._partial_synced_count.pop(benchmark.id, None)
         self._last_partial_sync_at.pop(benchmark.id, None)
+        self._last_target_check_at.pop(benchmark.id, None)
+        self._target_missing_since.pop(benchmark.id, None)
         self._clear_active_benchmark(benchmark.id)
 
         self._record_teardown(benchmark.id)
@@ -517,11 +600,83 @@ class BenchmarkManager:
         benchmarks_page = self._clientset.benchmarks.list(
             params={"worker_id": self._worker_id, "state": BenchmarkStateEnum.RUNNING}
         )
-        if not benchmarks_page.items:
+        listed_ids = set()
+        for benchmark in benchmarks_page.items:
+            listed_ids.add(benchmark.id)
+            # One row per try/except. A single run's reconciliation used to be
+            # able to abort the whole round — and the rounds after it, since the
+            # condition that raised was in the row, not in the round: one
+            # benchmark whose state patch kept failing stopped every OTHER run on
+            # this worker from being reconciled at all, for as long as it lasted.
+            try:
+                self._sync_single_benchmark_state(benchmark)
+            except Exception as e:
+                logger.error(
+                    "Failed to sync the state of benchmark "
+                    f"{benchmark.name}(id={benchmark.id}): {e}"
+                )
+
+        self._reap_deleted_active_benchmark(listed_ids)
+
+    def _reap_deleted_active_benchmark(self, listed_ids: Set[int]):
+        """Release the queue when the active run's row has been deleted.
+
+        `_active_benchmark_id` is what serializes runs on this worker: while it
+        is set, `_benchmark_queue_worker` pops nothing. Every way a run ends
+        clears it through `_stop_benchmark`, and a delete does too — via the
+        DELETED watch event, if that event is seen. It is not always: a watch
+        that was disconnected, reconnecting, or replaying when the row was
+        deleted never delivers it, and then nothing revisits the run, because
+        this poll lists rows FROM the server and a deleted row is absent from
+        every later tick. The worker keeps an active id for a benchmark that no
+        longer exists and its queue is stalled for good, while the worker, its
+        GPUs and its instances all keep reporting healthy.
+
+        So ask about it directly — but only when the run is missing from the
+        RUNNING page above, which costs nothing in the normal case, and only act
+        on a definitive 404. A transport error must never look like a deletion,
+        or a server blip would tear down a perfectly healthy run.
+        """
+        benchmark_id = self._active_benchmark_id
+        if benchmark_id is None or benchmark_id in listed_ids:
             return
 
-        for benchmark in benchmarks_page.items:
-            self._sync_single_benchmark_state(benchmark)
+        client = self._clientset.http_client.get_httpx_client()
+        try:
+            resp = client.get(f"/benchmarks/{benchmark_id}")
+        except Exception as e:
+            logger.debug(
+                f"Could not check whether benchmark {benchmark_id} still exists: {e}"
+            )
+            return
+        if resp.status_code != 404:
+            # Either it is still there (any other state than RUNNING — queued,
+            # just-stopped, mid-transition) or the server could not answer. Both
+            # are somebody else's business.
+            return
+
+        logger.warning(
+            f"Active benchmark {benchmark_id} no longer exists on the server. "
+            "Tearing it down locally so the queue can move on."
+        )
+        benchmark = self._benchmark_by_id.get(benchmark_id)
+        if benchmark is not None:
+            self._stop_benchmark(benchmark)
+            return
+
+        # No row object to name the workload with, so the full teardown is not
+        # available. Release the queue anyway — a leaked container is recoverable
+        # and stated in the log; a stalled queue is neither.
+        if process := self._provisioning_processes.pop(benchmark_id, None):
+            try:
+                terminate_process_tree(process.pid)
+            except Exception as e:
+                logger.error(
+                    "Failed to terminate the provisioning process of benchmark "
+                    f"{benchmark_id}: {e}"
+                )
+        self._clear_active_benchmark(benchmark_id)
+        self._record_teardown(benchmark_id)
 
     def _sync_single_benchmark_state(self, benchmark: Benchmark):
         """Synchronize a single benchmark's state."""
@@ -555,6 +710,15 @@ class BenchmarkManager:
         # Check for timeout
         if self._is_benchmark_timed_out(benchmark):
             self._handle_benchmark_timeout(benchmark)
+            return
+
+        # Check that what the load is aimed at still exists. Before the workload
+        # lookup on purpose: the container is perfectly healthy in this failure —
+        # it is talking to an endpoint that went away — so every check below this
+        # one says "still running" and the run sits there until the load
+        # generator's own per-request timeout expires (an hour, by default).
+        if self._is_target_gone(benchmark):
+            self._handle_target_gone(benchmark)
             return
 
         # Skip if still provisioning
@@ -666,6 +830,122 @@ class BenchmarkManager:
         patch_dict = {
             "state": BenchmarkStateEnum.ERROR,
             "state_message": "Benchmark timed out.",
+        }
+        self._update_benchmark_state_sync(benchmark.id, **patch_dict)
+        self._finalize_partial_analysis(benchmark)
+        self._dump_benchmark_logs_to_file(benchmark)
+        self._stop_benchmark(benchmark)
+
+    def _is_target_gone(self, benchmark: Benchmark) -> bool:
+        """Whether this run's target has been missing long enough to give up on.
+
+        Only `instance` mode is judged here. That mode pins one member at create
+        time -- `_resolve_target_endpoint` requires it to be RUNNING and records
+        its name -- so the target leaving RUNNING, or being replaced by a
+        differently-named one (what a rescheduled disaggregated group does to its
+        router), means the thing being measured is not there any more. `route`
+        mode is deliberately exempt: its whole point is that the instances behind
+        it come and go, so the same observation is not a failure there.
+
+        Throttled, and grace-period'd rather than acted on at first sight -- see
+        the two interval constants for why each is set where it is.
+        """
+        # Read defensively. The caller catches per row, so a missing field
+        # cannot take the round down with it — but it would still spend the
+        # run's whole lifetime logging one traceback every three seconds, and a
+        # run whose row cannot answer "which instance?" is exactly the one this
+        # check has nothing to say about. Absent means "not judged", which is
+        # the safe way to be wrong here.
+        if getattr(benchmark, "target_mode", None) != BenchmarkTargetModeEnum.INSTANCE:
+            return False
+
+        name = (getattr(benchmark, "model_instance_name", None) or "").strip()
+        if not name:
+            # Nothing to check against. Pre-`model_instance_name` rows and any
+            # future mode that does not pin a member land here; the run is left
+            # to the checks below rather than failed on a missing field.
+            return False
+
+        now = time.time()
+        last_checked = self._last_target_check_at.get(benchmark.id, 0.0)
+        if now - last_checked < BENCHMARK_TARGET_CHECK_INTERVAL_SECONDS:
+            return False
+        self._last_target_check_at[benchmark.id] = now
+
+        alive = self._is_target_instance_alive(name)
+        if alive is None:
+            # Could not tell. Not the same as "gone": see
+            # `_is_target_instance_alive`.
+            return False
+
+        if alive:
+            self._target_missing_since.pop(benchmark.id, None)
+            return False
+
+        missing_since = self._target_missing_since.setdefault(benchmark.id, now)
+        missing_for = now - missing_since
+        if missing_for < BENCHMARK_TARGET_GONE_GRACE_SECONDS:
+            logger.debug(
+                f"Benchmark {benchmark.name}(id={benchmark.id}) target instance "
+                f"'{name}' has been missing for {missing_for:.0f}s; waiting out "
+                f"the {BENCHMARK_TARGET_GONE_GRACE_SECONDS}s grace period."
+            )
+            return False
+
+        logger.warning(
+            f"Benchmark {benchmark.name}(id={benchmark.id}) target instance "
+            f"'{name}' has been missing for {missing_for:.0f}s. Failing the run."
+        )
+        return True
+
+    def _is_target_instance_alive(self, name: str) -> Optional[bool]:
+        """True / False / None for "cannot tell", for the instance called `name`.
+
+        Reads through `ClientSet.model_instances`, which ServeManager's watch
+        keeps populated for the WHOLE cluster (`awatch` there passes no filter)
+        and which this manager shares -- the worker builds one ClientSet for
+        both. So the normal path is a dict scan, not a request, which is what
+        makes a 15-second check affordable. When the watch is down the client
+        falls back to an unpaginated GET by itself.
+
+        The empty-result guard is the important part: a reconnecting watch
+        clears its cache before replaying, so there is a window where the cache
+        is considered authoritative and holds nothing. Reading that as "the
+        target is gone" would fail every running benchmark in the cluster at
+        once, on nothing but a dropped stream. A cluster that genuinely has zero
+        instances also has no benchmark running against one, so treating the
+        empty set as unknown costs nothing real.
+        """
+        try:
+            instances = self._clientset.model_instances.list()
+        except Exception as e:
+            logger.debug(f"Could not check benchmark target instance '{name}': {e}")
+            return None
+
+        items = getattr(instances, "items", None) or []
+        if not items:
+            return None
+
+        target = next((i for i in items if i.name == name), None)
+        if target is None:
+            return False
+        return target.state == ModelInstanceStateEnum.RUNNING
+
+    def _handle_target_gone(self, benchmark: Benchmark):
+        """Fail a run whose target is gone, keeping what it already measured.
+
+        Same shape and same ordering as `_handle_benchmark_timeout`, for the
+        reason given there: this runs from the RUNNING-only state poll, so the
+        row has to leave RUNNING before the analysis is written, or the next tick
+        walks into a second teardown.
+        """
+        name = benchmark.model_instance_name or "?"
+        patch_dict = {
+            "state": BenchmarkStateEnum.ERROR,
+            "state_message": self._truncate_state_message(
+                f"Target model instance '{name}' is no longer running. "
+                "The benchmark was stopped because there was nothing left to measure."
+            ),
         }
         self._update_benchmark_state_sync(benchmark.id, **patch_dict)
         self._finalize_partial_analysis(benchmark)

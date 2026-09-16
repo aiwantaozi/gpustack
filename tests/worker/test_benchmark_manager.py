@@ -1,3 +1,4 @@
+import time
 from collections import deque
 from types import SimpleNamespace
 
@@ -18,6 +19,8 @@ def _bare_manager(benchmark_dir="/tmp/does-not-matter"):
     mgr._benchmark_dir = str(benchmark_dir)
     mgr._partial_synced_count = {}
     mgr._last_partial_sync_at = {}
+    mgr._last_target_check_at = {}
+    mgr._target_missing_since = {}
     return mgr
 
 
@@ -679,6 +682,8 @@ class TestQueueCancelGuard:
         mgr._last_log_snapshot_at = {}
         mgr._partial_synced_count = {}
         mgr._last_partial_sync_at = {}
+        mgr._last_target_check_at = {}
+        mgr._target_missing_since = {}
         mgr._active_benchmark_id = None
         mgr._is_provisioning = lambda _b: False
         mgr._clear_active_benchmark = lambda _i: None
@@ -2208,6 +2213,8 @@ class TestTeardownIsIdempotent:
         mgr._last_log_snapshot_at = {}
         mgr._partial_synced_count = {}
         mgr._last_partial_sync_at = {}
+        mgr._last_target_check_at = {}
+        mgr._target_missing_since = {}
         mgr._active_benchmark_id = None
         mgr._active_benchmark_started_at = None
         mgr._is_provisioning = lambda _b: False
@@ -2271,7 +2278,9 @@ class TestTeardownIsIdempotent:
         mgr._queue_lock = asyncio.Lock()
 
         async def _noop_state(_id, **_kw):
-            return None
+            # True = "the patch landed"; False means the server says the row is
+            # gone, which would (correctly) make the enqueue drop it.
+            return True
 
         mgr._update_benchmark_state = _noop_state
 
@@ -2609,3 +2618,406 @@ class TestTpotThresholdsAreForwardedAsItlFlags:
         flags = {t.flag for t in bm_schemas.SLO_THRESHOLDS}
 
         assert not any("tpot" in flag for flag in flags)
+
+
+class TestTargetGoneDetection:
+    """A run whose target disappears must fail, not wait out the load
+    generator's per-request timeout.
+
+    Observed on b255: the model behind `...-r4-router-yj3i1` was deleted about
+    seven minutes into the run. Nothing in the reconcile path noticed -- the
+    container was healthy, it was the endpoint that was gone -- so the row sat
+    RUNNING at 100% progress for the rest of the hour that the runner's
+    `timeout: 3600` backend setting takes to give up. `max_errors` and
+    `max_error_rate` were both unset, so the flood of failed requests was not a
+    stopping condition either.
+    """
+
+    @staticmethod
+    def _manager(instances, *, mode=bm_schemas.BenchmarkTargetModeEnum.INSTANCE):
+        mgr = _bare_manager()
+        calls = []
+
+        def _list():
+            calls.append(1)
+            if isinstance(instances, Exception):
+                raise instances
+            return SimpleNamespace(items=list(instances))
+
+        mgr._clientset_getter = lambda: SimpleNamespace(
+            model_instances=SimpleNamespace(list=_list)
+        )
+        mgr._list_calls = calls
+        return mgr
+
+    @staticmethod
+    def _benchmark(mode=bm_schemas.BenchmarkTargetModeEnum.INSTANCE):
+        return SimpleNamespace(
+            id=255,
+            name="pdc-asc-glm47-pd-1p2-3d2-custom",
+            target_mode=mode,
+            model_instance_name="router-yj3i1",
+        )
+
+    @staticmethod
+    def _instance(name, state=bm.ModelInstanceStateEnum.RUNNING):
+        return SimpleNamespace(name=name, state=state)
+
+    def test_a_running_target_is_not_gone(self):
+        mgr = self._manager([self._instance("router-yj3i1")])
+
+        assert mgr._is_target_gone(self._benchmark()) is False
+
+    def test_a_missing_target_is_tolerated_inside_the_grace_period(self):
+        """An instance can leave RUNNING briefly. Twenty minutes of measurement
+        must not be thrown away over a restart that resolves in seconds."""
+        mgr = self._manager([self._instance("someone-else")])
+        benchmark = self._benchmark()
+
+        # First sighting only starts the clock.
+        assert mgr._is_target_gone(benchmark) is False
+        assert benchmark.id in mgr._target_missing_since
+
+        # Still missing, but not for long enough yet.
+        mgr._target_missing_since[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_GONE_GRACE_SECONDS + 30
+        )
+        mgr._last_target_check_at[benchmark.id] = 0.0
+        assert mgr._is_target_gone(benchmark) is False
+
+    def test_a_target_missing_past_the_grace_period_fails_the_run(self):
+        mgr = self._manager([self._instance("someone-else")])
+        benchmark = self._benchmark()
+        mgr._target_missing_since[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_GONE_GRACE_SECONDS - 1
+        )
+
+        assert mgr._is_target_gone(benchmark) is True
+
+    def test_a_target_that_left_running_counts_as_missing(self):
+        """Present in the list but not RUNNING is not something to measure."""
+        mgr = self._manager(
+            [self._instance("router-yj3i1", state=bm.ModelInstanceStateEnum.ERROR)]
+        )
+        benchmark = self._benchmark()
+        mgr._target_missing_since[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_GONE_GRACE_SECONDS - 1
+        )
+
+        assert mgr._is_target_gone(benchmark) is True
+
+    def test_a_target_coming_back_resets_the_clock(self):
+        mgr = self._manager([self._instance("router-yj3i1")])
+        benchmark = self._benchmark()
+        mgr._target_missing_since[benchmark.id] = time.time() - 120
+
+        assert mgr._is_target_gone(benchmark) is False
+        assert benchmark.id not in mgr._target_missing_since
+
+    def test_an_empty_instance_list_is_unknown_not_gone(self):
+        """A reconnecting watch clears its cache before replaying it. Reading
+        that window as "gone" would fail every running benchmark in the cluster
+        at once, on nothing but a dropped stream."""
+        mgr = self._manager([])
+        benchmark = self._benchmark()
+        mgr._target_missing_since[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_GONE_GRACE_SECONDS - 1
+        )
+
+        assert mgr._is_target_gone(benchmark) is False
+
+    def test_a_failed_lookup_is_unknown_not_gone(self):
+        mgr = self._manager(RuntimeError("connection refused"))
+        benchmark = self._benchmark()
+        mgr._target_missing_since[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_GONE_GRACE_SECONDS - 1
+        )
+
+        assert mgr._is_target_gone(benchmark) is False
+
+    def test_route_mode_is_exempt_and_never_looks_up(self):
+        """`route` mode exists precisely because the instances behind a route
+        come and go; the same observation is not a failure there."""
+        mgr = self._manager([])
+        benchmark = self._benchmark(mode=bm_schemas.BenchmarkTargetModeEnum.ROUTE)
+
+        assert mgr._is_target_gone(benchmark) is False
+        assert mgr._list_calls == [], "route mode must not query instances at all"
+
+    def test_a_row_without_a_pinned_instance_is_exempt(self):
+        mgr = self._manager([])
+        benchmark = self._benchmark()
+        benchmark.model_instance_name = None
+
+        assert mgr._is_target_gone(benchmark) is False
+        assert mgr._list_calls == []
+
+    def test_the_lookup_is_throttled_between_checks(self):
+        """The check runs off the 3-second state poll but must not look up that
+        often: the instance cache falls back to a full GET while its watch is
+        reconnecting."""
+        mgr = self._manager([self._instance("router-yj3i1")])
+        benchmark = self._benchmark()
+
+        mgr._is_target_gone(benchmark)
+        mgr._is_target_gone(benchmark)
+        mgr._is_target_gone(benchmark)
+
+        assert mgr._list_calls == [1], "throttle window allows exactly one lookup"
+
+        mgr._last_target_check_at[benchmark.id] = (
+            time.time() - bm.BENCHMARK_TARGET_CHECK_INTERVAL_SECONDS - 1
+        )
+        mgr._is_target_gone(benchmark)
+
+        assert len(mgr._list_calls) == 2, "a lookup resumes once the window passes"
+
+
+class TestTargetGoneIsCheckedBeforeTheWorkload:
+    """Ordering matters: in this failure the container is healthy, so every
+    workload-based check below says "still running" and the run is left alone."""
+
+    def test_the_poll_fails_the_run_before_it_looks_at_the_workload(self, monkeypatch):
+        mgr = _bare_manager()
+        mgr._worker_id_getter = lambda: 3
+        mgr._is_torn_down = lambda _bid: False
+        mgr._is_benchmark_timed_out = lambda _b: False
+        mgr._is_target_gone = lambda _b: True
+
+        handled = []
+        mgr._handle_target_gone = lambda b: handled.append(b.id)
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError("workload was inspected despite a missing target")
+
+        mgr._is_provisioning = _boom
+        monkeypatch.setattr(bm, "get_workload", _boom)
+
+        benchmark = SimpleNamespace(id=255, worker_id=3, name="b255")
+        mgr._sync_single_benchmark_state(benchmark)
+
+        assert handled == [255]
+
+
+class TestADeletedRowDoesNotBlockTheQueue:
+    """D40: deleting a RUNNING benchmark stalled the worker's whole queue.
+
+    `_active_benchmark_id` is what serializes runs on a worker — while it is
+    set, `_benchmark_queue_worker` pops nothing — and every path that releases
+    it used to run only AFTER a successful state patch. Patching a row the user
+    had just deleted returns 404, `raise_for_status` turned that into an
+    exception, and the teardown underneath it never ran: the active id stayed
+    set forever, the 3-second poll re-entered the same 404 (observed: one error
+    line every 3s for ten minutes), and every benchmark dispatched to that
+    worker afterwards sat unstarted. Nothing else looked wrong — the worker was
+    `ready` with all eight GPUs and its instances were `running`.
+    """
+
+    class _Resp:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.raised = False
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                self.raised = True
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    def test_a_404_is_reported_not_raised(self):
+        """404 is the server stating the row is gone — information, not a
+        failed write."""
+        resp = self._Resp(404)
+
+        assert BenchmarkManager._state_patch_landed(255, resp) is False
+        assert not resp.raised
+
+    def test_any_other_status_still_raises(self):
+        """A real write failure must keep failing loudly, so the callers that
+        retry keep retrying."""
+        resp = self._Resp(500)
+
+        with pytest.raises(RuntimeError):
+            BenchmarkManager._state_patch_landed(255, resp)
+
+    def test_a_204_lands(self):
+        assert BenchmarkManager._state_patch_landed(255, self._Resp(204)) is True
+
+    def _mgr(self):
+        mgr = _bare_manager()
+        mgr._worker_id_getter = lambda: 7
+        mgr._canceled_ids = set()
+        mgr._torn_down_ids = bm.OrderedDict()
+        mgr._provisioning_processes = {}
+        mgr._benchmark_by_id = {}
+        mgr._container_log_offset = {}
+        mgr._last_log_snapshot_at = {}
+        mgr._active_benchmark_id = None
+        mgr._active_benchmark_started_at = None
+        mgr._is_provisioning = lambda _b: False
+        return mgr
+
+    def test_the_failure_path_still_tears_down_a_deleted_row(self, monkeypatch):
+        """The state patch 404s because the row is gone; the teardown that
+        follows it is exactly what still has to happen."""
+        deleted = []
+        monkeypatch.setattr(
+            bm, "delete_workload", lambda *a, **k: deleted.append("workload")
+        )
+        mgr = self._mgr()
+        mgr._active_benchmark_id = 255
+        mgr._finalize_partial_analysis = lambda _b: None
+        mgr._dump_benchmark_logs_to_file = lambda _b: None
+        mgr._update_benchmark_state_sync = lambda _id, **_kw: False
+
+        benchmark = SimpleNamespace(id=255, name="b255", namespace=None)
+        mgr._handle_benchmark_failure(benchmark)
+
+        assert deleted == ["workload"]
+        assert mgr._active_benchmark_id is None
+
+    def test_one_bad_row_does_not_abort_the_round(self):
+        """The condition that raises lives in the row, not in the round, so an
+        aborted round used to repeat forever — taking every other run on the
+        worker down with it."""
+        mgr = self._mgr()
+        mgr._clientset_getter = lambda: SimpleNamespace(
+            benchmarks=SimpleNamespace(
+                list=lambda params=None: SimpleNamespace(
+                    items=[
+                        SimpleNamespace(id=1, name="first"),
+                        SimpleNamespace(id=2, name="second"),
+                    ]
+                )
+            )
+        )
+        seen = []
+
+        def _sync(benchmark):
+            seen.append(benchmark.id)
+            if benchmark.id == 1:
+                raise RuntimeError("HTTP 404")
+
+        mgr._sync_single_benchmark_state = _sync
+        mgr.sync_benchmark_state()
+
+        assert seen == [1, 2]
+
+    def _mgr_with_get(self, status_code=None, error=None):
+        mgr = self._mgr()
+        asked = []
+
+        def _get(path):
+            asked.append(path)
+            if error is not None:
+                raise error
+            return SimpleNamespace(status_code=status_code)
+
+        mgr._clientset_getter = lambda: SimpleNamespace(
+            http_client=SimpleNamespace(
+                get_httpx_client=lambda: SimpleNamespace(get=_get)
+            )
+        )
+        mgr._asked = asked
+        return mgr
+
+    def test_an_active_run_deleted_behind_the_watch_is_reaped(self, monkeypatch):
+        """The DELETED event is not guaranteed to arrive: a watch that was
+        disconnected or replaying when the row went away never delivers it, and
+        the poll lists rows FROM the server, so the id is absent from every
+        later tick. Nothing else would ever release the queue."""
+        deleted = []
+        monkeypatch.setattr(
+            bm, "delete_workload", lambda *a, **k: deleted.append("workload")
+        )
+        mgr = self._mgr_with_get(status_code=404)
+        mgr._active_benchmark_id = 255
+        mgr._benchmark_by_id[255] = SimpleNamespace(id=255, name="b255", namespace=None)
+
+        mgr._reap_deleted_active_benchmark(listed_ids=set())
+
+        assert mgr._asked == ["/benchmarks/255"]
+        assert deleted == ["workload"]
+        assert mgr._active_benchmark_id is None
+        assert mgr._is_torn_down(255)
+
+    def test_a_row_that_still_exists_is_left_alone(self):
+        """Absent from the RUNNING page only means "not RUNNING" — queued,
+        just-stopped, mid-transition. None of those are this method's business."""
+        mgr = self._mgr_with_get(status_code=200)
+        mgr._active_benchmark_id = 255
+
+        mgr._reap_deleted_active_benchmark(listed_ids=set())
+
+        assert mgr._active_benchmark_id == 255
+
+    def test_an_unreachable_server_is_not_a_deletion(self):
+        """A failed lookup must never read as a deletion, or a blip would tear
+        down a healthy run."""
+        mgr = self._mgr_with_get(error=RuntimeError("connection refused"))
+        mgr._active_benchmark_id = 255
+
+        mgr._reap_deleted_active_benchmark(listed_ids=set())
+
+        assert mgr._active_benchmark_id == 255
+
+    def test_a_listed_run_costs_no_request(self):
+        """The normal case: the active run is in the RUNNING page the poll just
+        fetched, so the existence check never fires."""
+        mgr = self._mgr_with_get(status_code=404)
+        mgr._active_benchmark_id = 255
+
+        mgr._reap_deleted_active_benchmark(listed_ids={255})
+
+        assert mgr._asked == []
+        assert mgr._active_benchmark_id == 255
+
+    def test_the_queue_is_released_even_with_nothing_to_tear_down(self):
+        """A leaked container is recoverable and stated in the log; a stalled
+        queue is neither."""
+        mgr = self._mgr_with_get(status_code=404)
+        mgr._active_benchmark_id = 255
+
+        mgr._reap_deleted_active_benchmark(listed_ids=set())
+
+        assert mgr._active_benchmark_id is None
+
+    def test_a_user_stop_releases_the_queue_even_if_the_analysis_raises(self):
+        """The row is no longer RUNNING, so the poll will never revisit it —
+        this handler is the only chance to release the active id."""
+        import asyncio
+
+        mgr = self._mgr()
+        mgr._active_benchmark_id = 255
+        mgr._stop_benchmark = lambda b: mgr._clear_active_benchmark(b.id)
+
+        def _boom(_b):
+            raise RuntimeError("unreadable point file")
+
+        mgr._finalize_partial_analysis = _boom
+        mgr._dump_benchmark_logs_to_file = lambda _b: None
+
+        benchmark = SimpleNamespace(id=255, name="b255", namespace=None)
+        asyncio.run(mgr._handle_stop_benchmark_event(benchmark))
+
+        assert mgr._active_benchmark_id is None
+
+    def test_a_row_deleted_before_it_could_be_queued_is_dropped(self):
+        """Deleted between the PENDING event and the QUEUED patch. Marked
+        canceled rather than popped: the deque is shared with the sync thread,
+        and the existing guard drops the entry race-safely when the queue worker
+        reaches it."""
+        import asyncio
+
+        mgr = self._mgr()
+        mgr._benchmark_queue = deque()
+        mgr._queue_lock = asyncio.Lock()
+
+        async def _gone(_id, **_kw):
+            return False
+
+        mgr._update_benchmark_state = _gone
+
+        benchmark = SimpleNamespace(id=258, name="b258", namespace=None)
+        asyncio.run(mgr._enqueue_benchmark(benchmark))
+
+        assert 258 in mgr._canceled_ids

@@ -1,4 +1,5 @@
 from gpustack.schemas.models import BackendEnum, PDModeEnum
+from gpustack.schemas.pd_mode_resolution import PDModeUnresolvedCode
 from gpustack.server.pd_mode_resolver import resolve_pd_mode
 
 VLLM = BackendEnum.VLLM.value
@@ -139,3 +140,62 @@ def test_engine_mismatch_carries_its_reason():
     assert sglang.eligible is False
     assert "SGLang" in sglang.ineligible_reason
     assert "custom" in sglang.ineligible_reason
+
+
+# ---- every unresolved exit is translatable --------------------------------
+
+
+def test_every_unresolved_exit_carries_a_code_the_ui_can_translate():
+    """`unresolved_reason` is English prose assembled here, so a UI that
+    rendered it verbatim put an English sentence inside a localized form. The
+    code plus `unresolved_params` is the same statement in a shape the client
+    looks up in its own catalog; the prose stays as the fallback for a client
+    that predates the code.
+
+    Asserted as a set over every exit rather than one case at a time: the
+    failure this guards against is a *new* exit added with prose only, which a
+    per-case test would not notice.
+    """
+    Code = PDModeUnresolvedCode
+    cases = [
+        # (resolution, expected code, params that must be present)
+        (resolve_pd_mode(VLLM, set()), Code.VENDORS_UNKNOWN, {}),
+        (
+            resolve_pd_mode(VLLM, {"nvidia"}, vendor="ascend"),
+            Code.VENDOR_NOT_IN_CLUSTER,
+            {"vendor": "ascend", "vendors": "nvidia"},
+        ),
+        (
+            resolve_pd_mode(SGLANG, {"ascend"}),
+            Code.NO_BUILT_IN_RECIPE,
+            {"backend": SGLANG, "vendors": "ascend"},
+        ),
+        (
+            resolve_pd_mode(VLLM, {"ascend", "nvidia"}),
+            Code.MULTIPLE_VENDORS,
+            {"vendors": "ascend, nvidia"},
+        ),
+    ]
+    for resolution, code, params in cases:
+        assert resolution.mode is None
+        assert resolution.unresolved_code == code
+        # The prose is kept, not replaced: an older client still renders it.
+        assert resolution.unresolved_reason
+        for key, value in params.items():
+            assert (resolution.unresolved_params or {})[key] == value
+
+
+def test_a_resolved_answer_carries_no_code():
+    resolution = resolve_pd_mode(VLLM, {"nvidia"})
+    assert resolution.unresolved_code is None
+    assert resolution.unresolved_params is None
+
+
+def test_an_engine_the_request_omits_is_left_for_the_client_to_word():
+    """`backend` is optional on the request. The server sends `''` rather than
+    its own "this engine": that half-sentence is the client's to word, and a
+    server-supplied English one would be the very mixing this code exists to
+    end."""
+    resolution = resolve_pd_mode(None, {"amd"})
+    assert resolution.unresolved_code == PDModeUnresolvedCode.NO_BUILT_IN_RECIPE
+    assert resolution.unresolved_params["backend"] == ""

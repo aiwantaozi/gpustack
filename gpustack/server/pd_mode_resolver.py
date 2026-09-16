@@ -31,6 +31,7 @@ from gpustack.server.pd_mode_catalog import get_pd_modes
 from gpustack.schemas.pd_mode_resolution import (
     PDModeEligibility,
     PDModeResolution,
+    PDModeUnresolvedCode,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,11 @@ def resolve_pd_mode(
                 f"This cluster reports no {chosen} accelerator "
                 f"(it has: {', '.join(sorted(cluster_vendors))})."
             ),
+            unresolved_code=PDModeUnresolvedCode.VENDOR_NOT_IN_CLUSTER,
+            unresolved_params={
+                "vendor": chosen,
+                "vendors": ", ".join(sorted(cluster_vendors)),
+            },
         )
 
     search_vendors = {chosen} if chosen else cluster_vendors
@@ -136,6 +142,7 @@ def resolve_pd_mode(
                 "The cluster's accelerators are not known yet, so the recipe "
                 "cannot be derived."
             ),
+            unresolved_code=PDModeUnresolvedCode.VENDORS_UNKNOWN,
         )
 
     per_vendor: Dict[str, List[PDMode]] = {
@@ -157,6 +164,15 @@ def resolve_pd_mode(
                 f"{', '.join(sorted(search_vendors))}. Use pd mode 'custom' "
                 f"to supply the connection parameters yourself."
             ),
+            unresolved_code=PDModeUnresolvedCode.NO_BUILT_IN_RECIPE,
+            unresolved_params={
+                # The engine is a field the user filled in, so naming it beats
+                # "this engine" -- but it is genuinely optional on the request,
+                # and an empty string here would render as a hole in the
+                # sentence. The client substitutes its own wording for "".
+                "backend": backend or "",
+                "vendors": ", ".join(sorted(search_vendors)),
+            },
         )
 
     if len(candidate_vendors) > 1:
@@ -174,6 +190,8 @@ def resolve_pd_mode(
                 f"host the group ({', '.join(candidate_vendors)}), and a PD "
                 "group cannot span vendors. Pick one."
             ),
+            unresolved_code=PDModeUnresolvedCode.MULTIPLE_VENDORS,
+            unresolved_params={"vendors": ", ".join(candidate_vendors)},
         )
 
     resolved_vendor = candidate_vendors[0]
@@ -189,6 +207,7 @@ def resolve_pd_mode(
         unresolved_reason=(
             None if picked else "Several recipes fit and none is marked preferred."
         ),
+        unresolved_code=(None if picked else PDModeUnresolvedCode.NO_PREFERRED_RECIPE),
     )
 
 
@@ -202,6 +221,8 @@ def _resolution(
     resolved_vendor: Optional[str],
     candidate_vendors: List[str],
     unresolved_reason: Optional[str],
+    unresolved_code: Optional[PDModeUnresolvedCode] = None,
+    unresolved_params: Optional[Dict[str, str]] = None,
 ) -> PDModeResolution:
     """Attach the per-option verdicts to a decision already made.
 
@@ -243,6 +264,8 @@ def _resolution(
         mode=mode,
         vendor=resolved_vendor,
         unresolved_reason=unresolved_reason,
+        unresolved_code=unresolved_code,
+        unresolved_params=unresolved_params,
         candidate_vendors=candidate_vendors,
         cluster_vendors=sorted(cluster_vendors),
         options=options,

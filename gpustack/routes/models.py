@@ -1,5 +1,6 @@
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import or_
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from gpustack import envs
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     ConflictException,
@@ -1894,7 +1896,10 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     anything to tear down, and `deleted_instances` says what that was.
 
     A restart still in flight is a 409 — the members are mid-replacement and a
-    second teardown would delete the replacements.
+    second teardown would delete the replacements. That is recorded on the
+    model (`restarting_since`) rather than inferred from the rows: see
+    `_restart_in_flight`, and the field's own note for why the digest
+    comparison this replaces could never fire.
 
     Placement counts as something to converge, even though it is not part of
     the digest. It is not part of the digest because it is not user intent —
@@ -1920,13 +1925,12 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         )
 
     digests = {instance.spec_digest for instance in instances}
-    if len(digests) > 1:
-        # Mixed digests mean a previous restart is still rebuilding. Tearing
-        # down again here would delete the replacements it just created.
+    if _restart_in_flight(model):
+        # Tearing down again here would delete the replacements the previous
+        # restart just created, and cost the group a second full startup.
         raise ConflictException(
             message="A restart is already in progress for this model: its "
-            "instances span more than one generation. Retry once they have "
-            "converged."
+            "members are still being rebuilt. Retry once it is running again."
         )
 
     drifted = placement_drifted(
@@ -1965,9 +1969,21 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     # request. Automatic recovery of a crashed member is the worker's, and it
     # has its own crash-loop brake.
 
+    # Marked before the teardown, not after: if the process dies between the
+    # two, a guard left on is recoverable (it lapses) while a guard never set
+    # leaves the replacements exposed to the next click.
+    await ModelService(session).update(
+        model, {"restarting_since": datetime.now(timezone.utc)}
+    )
+
     try:
         deleted = await ModelInstanceService(session).batch_delete(list(instances))
     except Exception as e:
+        # Nothing was torn down, so there are no replacements to protect and no
+        # reason to make the operator wait out the lapse. Released explicitly
+        # rather than left to expire: the failure they now have to retry is the
+        # worst moment to answer the retry with a 409.
+        await ModelService(session).update(model, {"restarting_since": None})
         raise InternalServerErrorException(message=f"Failed to restart model: {e}")
 
     # Rebuilding is left to replica convergence rather than done here: it is
@@ -1980,6 +1996,33 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         deleted_instances=deleted,
         message=_restart_message(drifted and digests == {target}, failed),
     )
+
+
+def _restart_in_flight(model: Model) -> bool:
+    """Whether a previous restart is still rebuilding this deployment.
+
+    Read off `Model.restarting_since`, which the status pass clears on RUNNING.
+    Two things it is deliberately not:
+
+    - **Not a digest comparison.** The teardown is synchronous and the reconcile
+      rebuilds from the same target digest, so the generations never coexist and
+      `len(digests) > 1` — the test this replaces — was never true. What it was
+      written to prevent happened anyway, measured: a second click 4.5s after
+      the first deleted the three replacements the first had just created.
+    - **Not "the group is not RUNNING".** That would refuse the restart of a
+      group wedged in `starting`, which is the state operators reach for this
+      endpoint in and the reason its no-op short-circuit was removed.
+
+    The lapse makes the refusal bounded. A restart that never converges must not
+    become a deployment that can never be restarted.
+    """
+    since = model.restarting_since
+    if since is None:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - since).total_seconds()
+    return age < envs.RESTART_IN_FLIGHT_LAPSE_SECONDS
 
 
 def _restart_message(moved: bool, failed: List[str]) -> str:

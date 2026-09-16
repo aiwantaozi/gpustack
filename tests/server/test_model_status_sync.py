@@ -14,6 +14,7 @@ Two properties are load-bearing and pinned here:
   3P1D group with the router down is four RUNNING instances and no service.
 """
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -877,3 +878,36 @@ def test_a_group_with_no_disaggregation_block_uses_the_default():
     as the forgiving policy rather than raise."""
     state, _ = _readiness_state(None, ready=3)
     assert state == ModelStateEnum.RUNNING
+
+
+# --- the restart guard's release ------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_reaching_running_releases_the_restart_guard():
+    """The endpoint marks `restarting_since` before it tears the generation
+    down; this is the only thing that clears it, and RUNNING is the only event
+    that actually means the replacements are no longer at risk."""
+    model = _model(roles=[RoleSpec(name="prefill", replicas=1)])
+    model.restarting_since = datetime.now(timezone.utc)
+
+    changed, _ = await _sync(model, [_instance(1, role="prefill")])
+
+    assert changed is True
+    assert model.state == ModelStateEnum.RUNNING
+    assert model.restarting_since is None
+
+
+@pytest.mark.asyncio
+async def test_a_group_still_rebuilding_keeps_the_guard():
+    """Releasing on anything short of RUNNING would reopen the window the
+    guard exists for: the replacements are exactly the members that are not
+    running yet."""
+    model = _model(roles=[RoleSpec(name="prefill", replicas=1)])
+    since = datetime.now(timezone.utc)
+    model.restarting_since = since
+
+    await _sync(model, [_instance(1, ModelInstanceStateEnum.STARTING, role="prefill")])
+
+    assert model.state != ModelStateEnum.RUNNING
+    assert model.restarting_since == since

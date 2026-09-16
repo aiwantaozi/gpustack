@@ -3122,6 +3122,16 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # pre-upgrade model stale on the first pass after an upgrade.
     stale = await _stale_members(session, model, instances)
 
+    # The restart guard's other half. Set by the endpoint before it tears the
+    # generation down, released here the moment the rebuilt one is serving —
+    # which is the only event that actually means "the replacements are no
+    # longer at risk". It rides the same change gate rather than getting its
+    # own write, so releasing the guard costs nothing on a pass that was
+    # already publishing the transition into RUNNING.
+    restarting_since = model.restarting_since
+    if restarting_since is not None and state == ModelStateEnum.RUNNING:
+        restarting_since = None
+
     if (
         model.ready_replicas != ready_replicas
         or model.state != state
@@ -3129,6 +3139,7 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         or model.role_status != role_status
         or model.stale != stale
         or model.degradations != degradations
+        or model.restarting_since != restarting_since
     ):
         model.ready_replicas = ready_replicas
         model.state = state
@@ -3136,6 +3147,7 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
         model.role_status = role_status
         model.stale = stale
         model.degradations = degradations
+        model.restarting_since = restarting_since
         await ModelService(session).update(model)
         updated = True
     else:

@@ -330,6 +330,15 @@ SCHEDULER_SCALE_DOWN_OFFLOAD_MAX_SCORE = float(
 SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE", 1)
 )
+# How long `POST /models/{id}/restart` keeps answering 409 to a second request
+# before assuming the first one is not coming back. Not a tidy-up: a group that
+# never reaches RUNNING is exactly the one an operator needs to restart again,
+# and a guard with no expiry would refuse them forever. Sized to outlast a cold
+# start that pulls an image and reads weights off disk, since refusing early is
+# the failure that costs a real outage.
+RESTART_IN_FLIGHT_LAPSE_SECONDS = int(
+    os.getenv("GPUSTACK_RESTART_IN_FLIGHT_LAPSE_SECONDS", 900)
+)
 
 MIGRATION_DATA_DIR = os.getenv("GPUSTACK_MIGRATION_DATA_DIR", None)
 

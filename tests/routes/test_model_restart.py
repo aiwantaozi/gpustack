@@ -14,13 +14,15 @@ the whole generation goes down together, there is no way to ask for part of
 it, and a restart already in flight is refused rather than restarted again.
 """
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gpustack.api.exceptions import ConflictException
-from gpustack.routes.models import restart_model
+from gpustack import envs
+from gpustack.api.exceptions import ConflictException, InternalServerErrorException
+from gpustack.routes.models import _restart_in_flight, restart_model
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
@@ -74,7 +76,15 @@ async def _restart(model, instances, namespace=None):
         deleted.extend(rows)
         return [r.name for r in rows]
 
+    async def _update(row, source=None, **kwargs):
+        # The endpoint marks the guard through the service. Applied to the row
+        # rather than recorded, so a test can restart the same model twice and
+        # see the second call meet the mark the first one left.
+        for key, value in (source or {}).items():
+            setattr(row, key, value)
+
     service = MagicMock(return_value=SimpleNamespace(batch_delete=_batch_delete))
+    model_service = MagicMock(return_value=SimpleNamespace(update=_update))
     with (
         patch("gpustack.routes.models.Model.one_by_id", AsyncMock(return_value=model)),
         patch("gpustack.routes.models.assert_resource_visible", MagicMock()),
@@ -94,6 +104,7 @@ async def _restart(model, instances, namespace=None):
             AsyncMock(return_value=namespace),
         ),
         patch("gpustack.routes.models.ModelInstanceService", service),
+        patch("gpustack.routes.models.ModelService", model_service),
     ):
         result = await restart_model(MagicMock(), MagicMock(), 1)
     return result, deleted
@@ -150,16 +161,83 @@ async def test_a_group_already_on_the_current_spec_is_still_rebuilt():
     assert sorted(result.deleted_instances) == ["m-1", "m-2", "m-3"]
 
 
+# --- the guard against a second teardown ----------------------------------- #
+
+
 @pytest.mark.asyncio
-async def test_a_restart_in_flight_is_refused():
-    """Mixed digests mean a previous restart is still rebuilding. Tearing down
-    again would delete the replacements it just created."""
+async def test_a_restart_records_that_one_is_in_flight():
+    """The fact has to be written down, because it cannot be read back off the
+    rows: the teardown is synchronous and the reconcile rebuilds from the same
+    target digest, so there is no moment when the table shows two
+    generations."""
+    model = _model(roles=_pd_roles())
+    assert model.restarting_since is None
+
+    await _restart(model, [_instance(1, role="prefill")])
+
+    assert model.restarting_since is not None
+
+
+@pytest.mark.asyncio
+async def test_a_second_click_while_the_replacements_are_starting_is_refused():
+    """🔴 The regression this guard exists for, measured on a live group: a
+    second restart 4.5s after the first returned 200 and deleted the three
+    replacements the first one had just created, costing the group another full
+    startup with nothing in the UI to say why it was back at pending.
+
+    The replacements are ordinary members carrying the target digest, which is
+    why the digest comparison this replaces could never see them."""
+    model = _model(roles=_pd_roles())
+    await _restart(model, [_instance(1, role="prefill"), _instance(2, role="decode")])
+
+    replacements = [_instance(3, role="prefill"), _instance(4, role="decode")]
+    replacements[0].state = ModelInstanceStateEnum.STARTING
+    with pytest.raises(ConflictException):
+        await _restart(model, replacements)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_guard_lapses_rather_than_wedging_the_button():
+    """A group that never converges is exactly the one an operator needs to
+    restart again. A guard with no expiry would answer 409 to them forever."""
+    model = _model(roles=_pd_roles())
+    model.restarting_since = datetime.now(timezone.utc) - timedelta(
+        seconds=envs.RESTART_IN_FLIGHT_LAPSE_SECONDS + 1
+    )
+
+    result, deleted = await _restart(model, [_instance(1, role="prefill")])
+
+    assert result.restarted is True
+    assert len(deleted) == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_digests_alone_do_not_refuse_anything():
+    """The old guard's whole condition, now inert. Kept as a test because the
+    shape is tempting to reintroduce: it reads like "mid-replacement" and is
+    not, and a group that somehow does hold two generations is the one most in
+    need of the restart that would collapse them into one."""
     members = [
         _instance(1, role="prefill", spec_digest=TARGET),
         _instance(2, role="decode", spec_digest="sha1:old"),
     ]
-    with pytest.raises(ConflictException):
-        await _restart(_model(roles=_pd_roles()), members)
+    result, deleted = await _restart(_model(roles=_pd_roles()), members)
+
+    assert result.restarted is True
+    assert len(deleted) == 2
+
+
+def test_the_guard_reads_naive_and_aware_timestamps_alike():
+    """`UTCDateTime` hands back an aware value; a row that reached memory
+    without passing through the column is naive. Subtracting the wrong one
+    raises, and a TypeError here is a 500 on the restart button."""
+    model = _model()
+    for since in (
+        datetime.now(timezone.utc),
+        datetime.now(timezone.utc).replace(tzinfo=None),
+    ):
+        model.restarting_since = since
+        assert _restart_in_flight(model) is True
 
 
 @pytest.mark.asyncio
@@ -284,3 +362,43 @@ async def test_a_healthy_group_is_rebuilt_without_the_failure_wording():
     assert result.restarted is True
     assert len(deleted) == 1
     assert "check its log" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_teardown_that_failed_leaves_no_guard_behind():
+    """Nothing was torn down, so there are no replacements to protect. The
+    failure the operator now has to retry is the worst possible moment to
+    answer their retry with a 409."""
+    model = _model(roles=_pd_roles())
+
+    async def _explode(_rows):
+        raise RuntimeError("boom")
+
+    service = MagicMock(return_value=SimpleNamespace(batch_delete=_explode))
+
+    async def _update(row, source=None, **kwargs):
+        for key, value in (source or {}).items():
+            setattr(row, key, value)
+
+    model_service = MagicMock(return_value=SimpleNamespace(update=_update))
+    with (
+        patch("gpustack.routes.models.Model.one_by_id", AsyncMock(return_value=model)),
+        patch("gpustack.routes.models.assert_resource_visible", MagicMock()),
+        patch(
+            "gpustack.routes.models.model_spec_digest", AsyncMock(return_value=TARGET)
+        ),
+        patch(
+            "gpustack.routes.models.ModelInstance.all_by_fields",
+            AsyncMock(return_value=[_instance(1, role="prefill")]),
+        ),
+        patch(
+            "gpustack.routes.models.resolve_workload_namespace",
+            AsyncMock(return_value=None),
+        ),
+        patch("gpustack.routes.models.ModelInstanceService", service),
+        patch("gpustack.routes.models.ModelService", model_service),
+    ):
+        with pytest.raises(InternalServerErrorException):
+            await restart_model(MagicMock(), MagicMock(), 1)
+
+    assert model.restarting_since is None

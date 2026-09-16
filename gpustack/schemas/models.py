@@ -1054,6 +1054,26 @@ class Model(ModelBase, BaseModelMixin, table=True):
     a stale group is usually still serving."""
     degradations: Optional[List[str]] = Field(sa_type=JSON, default=None)
     """`DegradationReasonEnum` values. A list, because they coexist."""
+    restarting_since: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    """When `POST /{id}/restart` last tore this deployment down, cleared once
+    it is serving again. The window a second restart must be refused in.
+
+    🔴 **It exists because the fact is not derivable.** The guard used to ask
+    whether the live members spanned more than one `spec_digest`, which reads
+    like "mid-replacement" and never is: the teardown is synchronous and the
+    replacements are built by the reconcile from the same target digest, so
+    the two generations are never in the table at the same time and the test
+    was dead code. Meanwhile the thing it was meant to catch — a second click
+    landing while the replacements are still starting — deleted exactly those
+    replacements and cost the group another full startup, with nothing in the
+    UI to say why it had gone back to pending.
+
+    Cleared by `sync_model_status` on reaching RUNNING, and lapsing on its own
+    after `RESTART_IN_FLIGHT_LAPSE_SECONDS`. The lapse is not a tidy-up: a
+    group that never converges is precisely the one an operator needs to
+    restart again, and a guard with no expiry would answer 409 forever."""
 
     instances: list["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
@@ -1117,6 +1137,9 @@ class ModelPublic(
     role_status: Optional[Dict[str, RoleStatus]] = None
     stale: Optional[bool] = None
     degradations: Optional[List[str]] = None
+    # Exposed so the Restart control can be disabled while one is in flight,
+    # rather than letting the click through to a 409 the user has to read.
+    restarting_since: Optional[datetime] = None
     # Populated only by the detail endpoint; None on list responses.
     has_stale_lora_instances: Optional[bool] = None
 

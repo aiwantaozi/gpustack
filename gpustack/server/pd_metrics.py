@@ -323,6 +323,33 @@ class PDMetricsPublic(BaseModel):
     never give: a degradation is a step in the line, with no threshold to
     pick."""
 
+    pairing_locality: Optional[float] = None
+    """The share of requests whose KV transfer can stay inside one host, from
+    where the members actually landed.
+
+    🔑 **The only figure here that is not measured** — it is placement
+    arithmetic, computed from the members' workers by
+    `controllers.pairing_locality`, and it is therefore set even when
+    `available` is false. That is deliberate: a group with no reachable
+    Prometheus can still be told that none of its pairs are local, which on a
+    link without RDMA is the difference between PD helping and PD being
+    strictly worse than not disaggregating.
+
+    🔴 **This is the real number; the deploy form can only show a lower
+    bound.** The form knows `x` (the replica count the user typed) and not
+    `m` (how many machines the solver spread the group over), and the true
+    value is driven by `m`: an evenly mixed group over `m` machines pairs
+    locally `1/m` of the time, so packing the same 4P4D from four machines
+    onto two takes it from 25% to 50%. `1/x` is the special case where every
+    machine holds exactly one prefill and one decode — the most spread-out
+    arrangement that still pairs at all — which is why the form's figure is a
+    floor and this one is the answer.
+
+    Same source as the `pairing_remote` degradation, which is this value at
+    exactly zero. One function, because two implementations of one number
+    drift, and the marker and the figure disagreeing is worse than either
+    being absent."""
+
 
 def _selectors(model_id: int, counted_role: str) -> dict:
     """What each declared scope expands to.

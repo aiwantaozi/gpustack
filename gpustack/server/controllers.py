@@ -2377,10 +2377,18 @@ def pairing_locality(
 
         P(local) = Σ_w  (prefill_w / prefill_total) × (decode_w / decode_total)
 
-    which reproduces the known ceiling on its own: an evenly spread xPxD gives
-    1/x, and that is the best any placement can do while the router chooses at
-    random. A single host gives 1.0; prefill entirely on one host and decode
-    entirely on another gives 0.
+    🔑 **The driver is how many MACHINES the group landed on, not how many
+    replicas it has.** Mixed evenly over `m` workers this comes out at `1/m`,
+    so the same 4P4D packed from four hosts onto two goes from 0.25 to 0.5,
+    and onto one host to 1.0. `1/x` is simply the case `m == x` — one prefill
+    and one decode per host, the most spread-out arrangement that still pairs
+    at all — which is why the deploy form, knowing only `x`, can offer it as a
+    floor and nothing better.
+
+    ⚠️ That floor holds only while the roles stay MIXED across those hosts.
+    Spread further, so a host carries one role and not the other, and this
+    falls below `1/x` all the way to 0 — which the group solver's round-robin
+    dealing exists to prevent, and which manual card selection still reaches.
 
     None when the question does not apply — not a group, or a role with no
     running member, where 0 would read as a verdict rather than as silence.

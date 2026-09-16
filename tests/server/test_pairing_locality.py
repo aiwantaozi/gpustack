@@ -59,6 +59,48 @@ def test_an_even_spread_reproduces_the_one_over_x_ceiling():
         assert _pairing_remote(_model(), instances) is False
 
 
+def test_packing_the_same_group_tighter_beats_one_over_x():
+    """🔴 `1/x` is a FLOOR, not a ceiling — the machine count is the driver.
+
+    The same 4P4D, three placements. Nothing about the deployment changes
+    between them: same replica counts, same roles, same cards. Only the number
+    of hosts the members sit on moves, and the locality moves with it as
+    `1/m`.
+
+    This is what the deploy form cannot say. It knows `x` and not `m`, so the
+    most it can honestly offer is the `m == x` row below; the group summary
+    reads the row that actually happened.
+    """
+    # m == x: one prefill and one decode per host.
+    spread = [_instance("prefill", w) for w in range(1, 5)]
+    spread += [_instance("decode", w) for w in range(1, 5)]
+    assert pairing_locality(_model(), spread) == pytest.approx(1 / 4)
+
+    # m == 2: two of each per host.
+    packed = [_instance("prefill", w) for w in (1, 1, 2, 2)]
+    packed += [_instance("decode", w) for w in (1, 1, 2, 2)]
+    assert pairing_locality(_model(), packed) == pytest.approx(1 / 2)
+
+    # m == 1.
+    single = [_instance("prefill", 1) for _ in range(4)]
+    single += [_instance("decode", 1) for _ in range(4)]
+    assert pairing_locality(_model(), single) == pytest.approx(1.0)
+
+
+def test_spreading_past_one_pair_per_host_falls_below_the_floor():
+    """The floor only holds while the roles stay mixed.
+
+    Four hosts, but each carries one role and not the other. `m` went up and
+    the mixing went away, so this lands below `1/x` — at zero, the one reading
+    `_pairing_remote` marks. The solver deals round-robin precisely so that a
+    group it places never looks like this; manual card selection still can.
+    """
+    unmixed = [_instance("prefill", w) for w in (1, 2)]
+    unmixed += [_instance("decode", w) for w in (3, 4)]
+    assert pairing_locality(_model(), unmixed) == 0.0
+    assert _pairing_remote(_model(), unmixed) is True
+
+
 def test_a_partial_overlap_is_between_the_two():
     # prefill on 1,2 · decode both on 1 -> half the prefill picks are local.
     instances = [

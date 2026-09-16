@@ -78,7 +78,7 @@ from gpustack.server.services import (
     WorkerService,
     revoke_model_access_cache,
 )
-from gpustack.server.controllers import model_spec_digest
+from gpustack.server.controllers import model_spec_digest, pairing_locality
 from gpustack.server.scaling_scheduler import compute_desired_replicas
 from gpustack.server.cache_provider_catalog import get_cache_provider
 from gpustack.server.lora_adapters_discovery import list_adapters_for_base
@@ -281,11 +281,23 @@ async def get_model_pd_metrics(
     mode_name = getattr(model.disaggregation.mode, "value", None) or str(
         model.disaggregation.mode
     )
-    return await collect_pd_metrics(
+    result = await collect_pd_metrics(
         model_id=model.id,
         mode=get_pd_mode(mode_name),
         window_seconds=window_seconds,
     )
+
+    # Placement arithmetic, not a measurement — so it is filled in here rather
+    # than inside the collector, and it survives `available=false`. A group
+    # whose Prometheus is unreachable can still be told that none of its pairs
+    # are local, which is knowable the moment the members are bound.
+    #
+    # The same function the `pairing_remote` degradation is derived from: that
+    # marker is this value at exactly zero, and a second implementation of one
+    # number is how a marker and a figure come to disagree.
+    instances = await ModelInstance.all_by_field(session, "model_id", model.id)
+    result.pairing_locality = pairing_locality(model, instances)
+    return result
 
 
 @router.get("/{id}/dashboard")

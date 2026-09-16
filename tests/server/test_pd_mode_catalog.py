@@ -952,12 +952,14 @@ def test_declared_and_usable_move_together_once_the_flag_is_launched():
 
 def test_the_vllm_recipes_launch_what_their_membership_api_requires():
     """The measured half of F12: without the flag there is no membership API
-    at all (`POST /workers` -> 400), so a recipe that declares one and omits it
-    promises a scale-out that will fail on first use."""
+    at all on that fork (`POST /workers` -> 400), so a recipe that declares one
+    and omits it promises a scale-out that will fail on first use."""
     seen = 0
     for mode in load_pd_modes():
         router = mode.router
         if not router.membership_api.available:
+            continue
+        if BackendEnum.VLLM not in mode.backends:
             continue
         seen += 1
         assert router.membership_api.requires_args == ["--enable-igw"]
@@ -966,15 +968,40 @@ def test_the_vllm_recipes_launch_what_their_membership_api_requires():
     assert seen == 2, "both vLLM-family recipes declare a membership API"
 
 
-def test_the_sglang_recipes_leave_membership_undeclared_rather_than_guessed():
-    """`sglang_router` is the fork vllm-router descends from and serves
-    `/add_worker`, but whether that route works under `--pd-disaggregation`
-    was never read here. Copying the vLLM shape on the strength of shared
-    ancestry is the mistake the metric names in this file already avoided:
-    `smg_` versus `vllm_router_` proved the two diverge where it matters."""
+def test_the_sglang_recipes_declare_membership_without_a_flag_to_launch():
+    """🔄 Was "left undeclared rather than guessed", and the reason it was left
+    undeclared has been read: whether `/add_worker` works under
+    `--pd-disaggregation` "was never read on this side".
+
+    Measured 2026-09-16 on `sglang_router` 0.2.2 and 0.3.2 with stub engines:
+    `POST /workers` is accepted (202, queued), the member is in `GET /workers`
+    on the next read, and traffic reaches it — with no flag, because on this
+    gateway the command-line peers and the API go through the same
+    registration job and the PD router reads the shared registry per request.
+
+    So the assertion that matters is the *absence* of a required flag: copying
+    the vLLM shape wholesale is what this file has always guarded against, and
+    `requires_args: [--enable-igw]` here would be exactly that copy — it would
+    make `membership_api_usable` False and send every ratio change through a
+    restart the router does not need.
+    """
     for name in (PDModeEnum.SGLANG_MOONCAKE.value, PDModeEnum.SGLANG_NIXL.value):
         mode = next(m for m in load_pd_modes() if m.name == name)
-        assert mode.router.membership_api.available is False, name
+        api = mode.router.membership_api
+        assert api.available is True, name
+        assert api.requires_args == [], name
+        assert mode.router.membership_api_usable is True, name
+        # `{id}`, not `{url}`: from v0.5.7 a member's id is a UUID the registry
+        # mints, and the address form answers 400. The id comes off the probe
+        # because nothing on this side can construct it.
+        assert api.remove == "DELETE /workers/{id}", name
+        # And the floor that shape belongs to is declared, so a reader does not
+        # have to infer which dialect the recipe speaks.
+        assert mode.backend_versions == ">=0.5.7", name
+        assert api.probe == "GET /workers", name
+        # The prefill's bootstrap port must reach the body, or the member
+        # registers and then hangs every request routed to it.
+        assert (api.body or {}).get("bootstrap_port") == "{{peer.ports.bootstrap}}"
 
 
 def test_membership_api_round_trips_through_serialization():
@@ -1033,3 +1060,29 @@ def test_the_composed_command_is_the_three_parts_in_order():
         for arg in router.tunable_args:
             expected.extend(arg.tokens)
         assert router.command == expected, mode.name
+
+
+def test_a_membership_body_may_only_name_a_band_the_mode_allocates():
+    """🔴 The one template whose failure is silent, so it is caught at load.
+
+    Everywhere else an unresolved placeholder reaches the process verbatim and
+    the engine dies with it in the message. A membership value that cannot
+    resolve is dropped from the body instead — deliberately, so one `body` can
+    serve a prefill that has a bootstrap band and a decode that has none. A
+    typo'd band would therefore register a prefill without its
+    `bootstrap_port`, and every request routed to that member would hang with
+    nothing anywhere saying why.
+    """
+    shipped = next(
+        m for m in load_pd_modes() if m.name == PDModeEnum.SGLANG_MOONCAKE.value
+    )
+    dumped = shipped.model_dump(mode="json")
+    dumped["router"]["membership_api"]["body"][
+        "bootstrap_port"
+    ] = "{{peer.ports.bootstrp}}"
+
+    with pytest.raises(ValueError, match="nothing in this mode allocates"):
+        PDMode.model_validate(dumped)
+
+    # And the shipped spelling still validates, so this is not vacuous.
+    assert PDMode.model_validate(shipped.model_dump(mode="json")).name == shipped.name

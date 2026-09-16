@@ -415,6 +415,14 @@ class PDMembershipAPI(BaseModel):
     `requires_args` records, and it is still unverified on hardware (see
     open-questions F12) — so a consumer should treat a failed call as "fall
     back to restart", never as "the group is broken".
+
+    ⭐ **An empty `requires_args` is a finding of its own, not an omission.**
+    The gateway that fork descends from needs no such flag: its command-line
+    peers and its API go through the same registration job, and its PD router
+    reads the shared registry per request, so membership works from the start
+    (measured 2026-09-16 on `sglang_router` 0.2.2 and 0.3.2). Two routers of
+    shared ancestry disagreeing about this is exactly why the declaration is
+    per-recipe rather than one rule in code.
     """
 
     add: Optional[str] = None
@@ -423,7 +431,16 @@ class PDMembershipAPI(BaseModel):
     versus an action endpoint (`POST /instances/add`)."""
 
     remove: Optional[str] = None
-    """`"METHOD /path"`, with `{url}` substituted for the peer being removed."""
+    """`"METHOD /path"`, with `{url}` or `{id}` substituted for the peer being
+    removed. Both are percent-encoded by the consumer.
+
+    🔴 **`{id}` is the one that survives an upstream rename of the member.**
+    SGLang keys a member by its URL through v0.5.6 and by a registry-generated
+    UUID from v0.5.7 — the URL form answers `400 Invalid worker_id (expected
+    UUID)` there. `{id}` takes whatever the `probe` reported for that member,
+    which is the URL on the old build and the UUID on the new one, so one
+    declaration covers an image the user may pick either side of. Use `{url}`
+    only where the router is known to address members that way for good."""
 
     probe: Optional[str] = None
     """Read-back for reconciliation. The one field that is not optional in
@@ -435,7 +452,20 @@ class PDMembershipAPI(BaseModel):
 
     body: Optional[Dict[str, str]] = None
     """Body template for `add`. Values may carry the same `{{...}}`
-    placeholders the rest of the catalog uses."""
+    placeholders the rest of the catalog uses — `{{peer.url}}`, `{{peer.ip}}`,
+    `{{peer.port}}`, `{{peer.ports.<band>}}`, `{{model_name}}`.
+
+    Two rules the consumer applies, both of which a router refuses the member
+    over if they are got wrong:
+
+    * **A bare placeholder keeps its type.** `"{{peer.ports.bootstrap}}"`
+      becomes the integer 9002, because upstream declares that field a `u16`
+      and answers `invalid type: string "9002", expected u16` otherwise. A
+      template with any literal text around it renders to a string, as it must.
+    * **A placeholder that does not resolve drops its key.** A decode has no
+      bootstrap band, and sending `"bootstrap_port": null` would be a claim
+      about a port rather than silence about one. So one `body` can describe
+      both roles without a per-role section."""
 
     role_field: Optional[str] = None
     """Which body key carries the role. Named rather than assumed because it
@@ -895,6 +925,37 @@ class PDMode(BaseModel):
                     raise ValueError(
                         f"{scope}: port band '{spec.name}' declares inject_to "
                         f"'{spec.inject_to.value}' but nothing there references it"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def check_membership_body_bands(self) -> "PDMode":
+        """A membership body may only name a port band some role allocates.
+
+        🔴 Checked here rather than left to runtime because this is the one
+        template whose failure is *silent*. Everywhere else an unresolved
+        placeholder reaches the process verbatim and the engine dies with it in
+        the message; a membership value that cannot resolve is dropped from the
+        body instead, deliberately — that is what lets one ``body`` serve a
+        prefill that has a bootstrap band and a decode that has none. So a
+        typo'd band name would not fail, it would register a prefill without
+        its ``bootstrap_port``, and every request routed to that member would
+        hang with nothing anywhere saying why.
+        """
+        if self.router is None or not self.router.membership_api.body:
+            return self
+        allocated = {
+            port.name for holder in self._holders_only() for port in holder.ports
+        }
+        for key, template in self.router.membership_api.body.items():
+            for occurrence in iter_placeholders(str(template)):
+                parts = occurrence[2:-2].split(".")
+                if parts[:2] != ["peer", "ports"]:
+                    continue
+                if len(parts) != 3 or parts[2] not in allocated:
+                    raise ValueError(
+                        f"router membership_api.body['{key}']: {occurrence} "
+                        "references a port band nothing in this mode allocates"
                     )
         return self
 

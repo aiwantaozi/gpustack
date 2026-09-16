@@ -561,6 +561,13 @@ modes:
       prefill's parallelism from prefill's bootstrap service, so the two
       sides rendezvous themselves and the router only has to dispatch.
     backends: [SGLang]
+    # 🔴 The floor is the router's, not the engine's: v0.5.7 is where a member
+    # stops being addressed by its URL and gets a registry-generated UUID
+    # instead. Supporting both would mean the removal path had to guess which
+    # dialect the image speaks, and guessing wrong is a stale member that keeps
+    # taking traffic. Below this floor membership still *works* — measured on
+    # wheel 0.2.2 — so this is a decision to carry one shape, not a limitation.
+    backend_versions: ">=0.5.7"
     gpu_filters:
       vendor: nvidia
     # Both SGLang recipes fit NVIDIA; this is the one to pick. Mooncake is
@@ -690,16 +697,56 @@ modes:
         models_endpoint: true
         # SGLang's Mooncake path exports no KV-expiry counter.
         kv_expired_metric: false
-      # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
-      # fork this catalog's vLLM router descends from and it does serve
-      # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
-      # routes work under `--pd-disaggregation`, and which of the two shapes
-      # the body takes, was never read on this side. Declaring the vLLM shape
-      # here on the strength of the shared ancestry is the same mistake the
-      # metric names above avoided: it would look supported and fail at the
-      # first scale-out. Absent means "re-render and restart", which is
-      # correct and merely costs an outage.
-      # membership_api: {}
+      # 🆕 Capability 7. 🔄 Was deliberately left undeclared ("it does serve
+      # `/add_worker` — but whether those routes work under
+      # `--pd-disaggregation` was never read on this side"). MEASURED
+      # 2026-09-16 against `sglang_router` wheel 0.3.2 (the `sgl-model-gateway`
+      # of SGLang v0.5.8+), `--pd-disaggregation`, stub engines, no
+      # `--enable-igw`:
+      #
+      #   command-line peers  GET /workers reports both, with the right
+      #                       `worker_type` and the prefill's bootstrap_port
+      #   add                 POST /workers -> 202 (queued, NOT 200); the
+      #                       member is in the registry on the next read
+      #   traffic             after deleting the command-line prefill, a
+      #                       request routed through the dynamically added
+      #                       one, carrying `bootstrap_port: 9002` — the value
+      #                       it was registered with
+      #   removal             202, and the member leaves
+      #
+      # ⭐ No `requires_args`, and that is the difference from the vLLM fork:
+      # here the CLI peers and the API go through the *same* registration job
+      # (`InitializeWorkersFromConfig` submits one `AddWorker` per peer), and
+      # the PD router reads the shared registry on every request. There is no
+      # flag to turn membership on, and no window where the group is empty.
+      #
+      # 🔴 `remove` names `{id}`, not `{url}`, and the id is read back off
+      # `probe` rather than assumed. From v0.5.7 — the floor this recipe
+      # declares — a member's id is a UUID the registry mints on admission, so
+      # nothing on this side can construct it: `DELETE /workers/{url}` answers
+      # `400 Invalid worker_id (expected UUID)`. Taking it from the read-back
+      # is also what makes the removal path survive the next such rename
+      # without a version check of its own.
+      #
+      # 🔴 `bootstrap_port` renders to a NUMBER (the value template is a bare
+      # placeholder, which keeps the band's type). A string is refused with
+      # `invalid type: string "9002", expected u16` and the member never
+      # registers. Decode declares no bootstrap band, so the key resolves to
+      # nothing and is left out of its body entirely — which is what upstream
+      # expects, since a decode has no bootstrap service to name.
+      membership_api:
+        add: POST /workers
+        remove: DELETE /workers/{id}
+        # The read-back, and here it is load-bearing twice over: the add is
+        # asynchronous (202 = queued), and upstream health-checks the peer
+        # before admitting it and drops it silently on timeout.
+        probe: GET /workers
+        body:
+          bootstrap_port: "{{peer.ports.bootstrap}}"
+        role_field: worker_type
+        role_values:
+          prefill: prefill
+          decode: decode
       health_path: /health
 
   - name: sglang-nixl
@@ -716,6 +763,10 @@ modes:
       whereas this path relies on UCX_NET_DEVICES discovery. See kv_lease
       sglang-nixl for the one transfer-teardown difference.
     backends: [SGLang]
+    # Same floor as sglang-mooncake, and for a reason that has nothing to do
+    # with the transfer backend: it is the router that renamed a member's id
+    # at v0.5.7, and both recipes run the same router.
+    backend_versions: ">=0.5.7"
     gpu_filters:
       vendor: nvidia
     kv_lease: sglang-nixl
@@ -842,16 +893,21 @@ modes:
         metrics: true
         models_endpoint: true
         kv_expired_metric: false
-      # 🆕 Capability 7, deliberately left undeclared. `sglang_router` is the
-      # fork this catalog's vLLM router descends from and it does serve
-      # `/add_worker` / `/remove_worker` / `/list_workers` — but whether those
-      # routes work under `--pd-disaggregation`, and which of the two shapes
-      # the body takes, was never read on this side. Declaring the vLLM shape
-      # here on the strength of the shared ancestry is the same mistake the
-      # metric names above avoided: it would look supported and fail at the
-      # first scale-out. Absent means "re-render and restart", which is
-      # correct and merely costs an outage.
-      # membership_api: {}
+      # 🆕 Capability 7. Same gateway as sglang-mooncake, same measurement
+      # (2026-09-16) — the router binary is identical between the two recipes,
+      # only the engine's transfer backend differs, and membership is a
+      # property of the router. See the sglang-mooncake recipe for why `remove`
+      # names `{id}` and why `bootstrap_port` must render to a number.
+      membership_api:
+        add: POST /workers
+        remove: DELETE /workers/{id}
+        probe: GET /workers
+        body:
+          bootstrap_port: "{{peer.ports.bootstrap}}"
+        role_field: worker_type
+        role_values:
+          prefill: prefill
+          decode: decode
       health_path: /health
 
   - name: vllm-ascend-mooncake

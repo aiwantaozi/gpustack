@@ -462,3 +462,190 @@ def test_forgetting_a_group_clears_its_restart_budget():
     assert pd_membership.restarts_exhausted(99)
     pd_membership.forget(99)
     assert pd_membership.restarts_exhausted(99) is False
+
+
+# --- the SGLang gateway: one declaration across a breaking upstream rename ---
+#
+# Measured 2026-09-16 against `sglang_router` wheels 0.2.2 (SGLang v0.5.5) and
+# 0.3.2 (v0.5.8+), `--pd-disaggregation`, stub engines, no `--enable-igw`.
+# What the run established, and what each test below pins:
+#
+#   POST /workers -> 202 (queued, not 200), member present on the next read
+#   a prefill registered with `bootstrap_port` as a STRING -> 422, never joins
+#   0.2.2: GET /workers reports id == url;  DELETE /workers/{encoded url} -> 202
+#   0.3.2: id is a UUID;  the url form -> 400 "expected UUID";  UUID -> 202
+#   with the command-line prefill deleted, traffic reached the added one and
+#   carried the bootstrap_port it was registered with
+
+
+def _band(base):
+    return SimpleNamespace(base=base)
+
+
+def _prefill_with_bootstrap(port=40010, bootstrap=9001):
+    instance = _instance("prefill", port)
+    instance.named_ports = {"bootstrap": _band(bootstrap)}
+    return instance
+
+
+def test_a_bootstrap_port_reaches_the_body_as_a_number():
+    """🔴 A string here is refused with `invalid type: string "9001", expected
+    u16` and the member never registers — the group then has a prefill the
+    router does not know about, which reads like a scheduling problem."""
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    api = get_pd_mode("sglang-mooncake").router.membership_api
+    ports = pd_membership.desired_member_ports([_prefill_with_bootstrap()])
+    body = pd_membership._body(
+        api, "http://10.0.0.1:40010", "prefill", "pd", ports["http://10.0.0.1:40010"]
+    )
+
+    assert body["bootstrap_port"] == 9001
+    assert isinstance(body["bootstrap_port"], int), body
+    assert body["url"] == "http://10.0.0.1:40010"
+    assert body["worker_type"] == "prefill"
+
+
+def test_a_role_without_the_band_simply_omits_the_key():
+    """Decode has no bootstrap service, so the key is absent rather than null:
+    a null would be a claim about a port, and one `body` has to describe both
+    roles without growing a per-role section."""
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    api = get_pd_mode("sglang-mooncake").router.membership_api
+    body = pd_membership._body(api, "http://10.0.0.1:40011", "decode", "pd", {})
+
+    assert "bootstrap_port" not in body, body
+    assert body == {"url": "http://10.0.0.1:40011", "worker_type": "decode"}
+
+
+def test_a_template_with_literal_text_still_renders_to_a_string():
+    """Only a bare placeholder carries a type through. `vllm-nixl` renders its
+    address this way, and an address is a string on every router."""
+    rendered = pd_membership._render(
+        "http://{{peer.ip}}:{{peer.port}}",
+        pd_membership._scope("http://10.0.0.1:40010", "pd", {}),
+    )
+    assert rendered == "http://10.0.0.1:40010"
+
+
+@pytest.mark.asyncio
+async def test_a_member_is_removed_by_the_id_the_registry_reports():
+    """🔴 The upstream rename this survives: SGLang keys a member by its URL
+    through v0.5.6 and by a generated UUID from v0.5.7, where the URL form
+    answers `400 Invalid worker_id (expected UUID)`. Taking the id off the
+    probe is right on both, and needs no version check against an image the
+    user picks.
+    """
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    seen = []
+    uuid = "cd144cb9-2026-4854-9478-7b67c10de9ca"
+
+    class _Response:
+        status = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            seen.append((method, url))
+            return _Response(
+                {
+                    "workers": [
+                        {
+                            "id": uuid,
+                            "url": "http://10.0.0.1:40099",
+                            "worker_type": "prefill",
+                        }
+                    ]
+                }
+            )
+
+        async def close(self):
+            return None
+
+    # The registry holds a member the group no longer has, so it must go.
+    outcome = await pd_membership.reconcile(
+        _model(),
+        get_pd_mode("sglang-mooncake"),
+        [_instance(RoleNameEnum.ROUTER.value, 40012), _prefill_with_bootstrap()],
+        "10.0.0.1:40012",
+        client=_Client(),
+    )
+
+    deletes = [url for method, url in seen if method == "DELETE"]
+    assert deletes == [f"http://10.0.0.1:40012/workers/{uuid}"], seen
+    # And not the address, which is what the old declaration would have sent.
+    assert not any("40099" in url for url in deletes), deletes
+    assert outcome is not None
+
+
+@pytest.mark.asyncio
+async def test_a_router_without_the_route_is_not_a_failed_registration():
+    """🔴 The regression that protects older images. A router that predates
+    this API (SGLang through v0.5.2 served only the older `/add_worker`) has
+    its peers from the command line and serves fine. Reading its 404 as an
+    unreadable registry would park a healthy group in PARTIAL and then spend
+    the restart budget on a route that cannot appear."""
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    class _Response:
+        status = 404
+
+        async def json(self):
+            return {}
+
+        async def text(self):
+            return "Not Found"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Client:
+        def request(self, method, url, **kwargs):
+            return _Response()
+
+        async def close(self):
+            return None
+
+    outcome = await pd_membership.reconcile(
+        _model(),
+        get_pd_mode("sglang-mooncake"),
+        [_instance(RoleNameEnum.ROUTER.value, 40012), _prefill_with_bootstrap()],
+        "10.0.0.1:40012",
+        client=_Client(),
+    )
+
+    assert outcome.ok is True
+    assert outcome.unreadable is False, "a missing route is not a wedged router"
+    assert outcome.reason is None
+
+
+def test_the_sglang_recipes_need_no_flag_to_make_membership_usable():
+    """The difference from the vLLM fork, stated where a reader will hit it:
+    there is no `--enable-igw` equivalent here, so `usable` follows from
+    `available` alone."""
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    for name in ("sglang-mooncake", "sglang-nixl"):
+        mode = get_pd_mode(name)
+        assert mode.router.membership_api.requires_args == [], name
+        assert mode.router.membership_api.available is True, name
+        assert mode.router.membership_api_usable is True, name

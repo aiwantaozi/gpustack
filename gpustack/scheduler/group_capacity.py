@@ -47,9 +47,22 @@ from gpustack.schemas.models import (
     role_takes_no_accelerator,
 )
 from gpustack.schemas.workers import Worker
-from gpustack.scheduler.offer_slot import _PlacedStandIn, count_offer_slots
+from gpustack.scheduler.offer_slot import _stand_in_for, count_offer_slots
 
 logger = logging.getLogger(__name__)
+
+
+def _reports_no_memory(worker: Worker) -> bool:
+    """Whether this worker's system telemetry is absent rather than small.
+
+    Zero total RAM is not a quantity, it is a gap: no host runs on none, and a
+    worker that says so has failed to measure itself. Told apart from a real
+    shortage because the two call for opposite reactions -- free some memory,
+    versus go and look at why that agent is not reporting.
+    """
+    status = getattr(worker, "status", None)
+    memory = getattr(status, "memory", None) if status else None
+    return not getattr(memory, "total", None)
 
 
 class _RoleProjection(NamedTuple):
@@ -96,9 +109,9 @@ class GroupCapacity:
         # role -> {worker_id: worker}, after that role's filters.
         self._eligible: Dict[Optional[str], Dict[int, Worker]] = {}
         self._projected: Dict[Optional[str], "_RoleProjection"] = {}
-        # (role, worker_id) -> one member's claim there, learned while counting.
-        # See `_translate`.
-        self._claims: Dict[tuple, tuple] = {}
+        # (role, worker_id) -> the candidates the count produced there, in the
+        # order it produced them. See `_translate`.
+        self._offers: Dict[tuple, List[object]] = {}
 
     async def __call__(
         self,
@@ -130,6 +143,23 @@ class GroupCapacity:
                 # domain is genuinely too small rather than unmeasurable.
                 out[worker_id] = 0
                 continue
+            if _reports_no_memory(worker):
+                # 🔴 Left out, not zeroed. A host that reports `memory.total`
+                # of 0 has not told us it is full, it has told us nothing --
+                # and every role wants some RAM, so a definite zero here reads
+                # to the solver as a host with no room and the refusal comes
+                # out as "not enough room" on a fleet with idle cards. Observed
+                # on a worker whose GPU telemetry was fine and whose system
+                # telemetry was empty: the group was refused while single
+                # instances kept landing there, because that path accepts the
+                # overcommitted candidate this one is right to refuse.
+                logger.debug(
+                    "Worker %s reports no system memory; its capacity for role "
+                    "%r is unknown rather than zero",
+                    worker_id,
+                    role,
+                )
+                continue
             offer = await count_offer_slots(
                 make_selector=lambda instances_now, p=projected: (
                     self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
@@ -140,12 +170,11 @@ class GroupCapacity:
             )
             if offer.placements:
                 # Learned here so `_translate` can turn the solver's commits
-                # into something the allocation accounting can read.
-                first = offer.placements[0]
-                self._claims[(role, worker_id)] = (
-                    getattr(first, "gpu_type", None),
-                    getattr(first, "computed_resource_claim", None),
-                )
+                # into something the allocation accounting can read. The whole
+                # list, in order: the second member of a role on this worker
+                # gets the second set of cards, and remembering only the first
+                # is what made every later member invisible to the next role.
+                self._offers[(role, worker_id)] = list(offer.placements)
             if offer.unavailable and offer.slots == 0:
                 # Nothing was proven about this worker. Leaving it out is the
                 # difference between "no room" and "we could not look".
@@ -218,8 +247,26 @@ class GroupCapacity:
 
         Entries that already look like instances (or stand-ins) pass through:
         the commit pass builds those itself.
+
+        🔴 **Which cards, not just how much.** This used to hand back
+        `gpu_indexes=None`, and a claim with no card attached is one the
+        allocation accounting cannot subtract from any GPU: the next role saw
+        every card on the worker as free. On a two-card host a 2P1D then
+        counted two prefill slots and, separately, one decode slot, and the
+        solver dealt three members onto two cards. Nothing caught it until
+        `commit` tried to turn that assignment into real cards and came up
+        short -- reported as "the cluster changed during scheduling", which was
+        never true. The group was refused outright while the same fleet ran the
+        same spec perfectly if it was grown one member at a time, because
+        scale-out never goes through here.
+
+        The n-th commit for a (role, worker) therefore takes the n-th candidate
+        the count produced there. They are distinct by construction:
+        `count_offer_slots` stands each one in before looking for the next, so
+        the cards it hands out in a single pass are already disjoint.
         """
         out: List[object] = []
+        taken: Dict[tuple, int] = {}
         for entry in already_placed:
             if getattr(entry, "computed_resource_claim", None) is not None or hasattr(
                 entry, "distributed_servers"
@@ -228,30 +275,28 @@ class GroupCapacity:
                 continue
             worker_id = getattr(entry, "worker_id", None)
             role = getattr(entry, "role", "") or ""
-            known = self._claims.get((role, worker_id))
-            if known is None:
-                # Unreachable in practice: the solver only commits to workers a
-                # previous count already examined, and a count that returned
-                # slots also returned placements. Skipping rather than
-                # inventing a claim, and saying so, because a made-up claim
-                # would make the domain look either roomier or tighter than the
-                # placement it is meant to reflect.
+            key = (role, worker_id)
+            index = taken.get(key, 0)
+            taken[key] = index + 1
+            offers = self._offers.get(key) or []
+            if index >= len(offers):
+                # Unreachable while the solver hands out no more than the count
+                # reported: that count is the length of this list. Skipping
+                # rather than inventing a claim, and saying so, because a
+                # made-up one would make the domain look either roomier or
+                # tighter than the placement it is meant to reflect.
                 logger.warning(
-                    "No learned claim for role %r on worker %s; the commit is "
-                    "not counted against remaining capacity.",
+                    "No learned placement #%d for role %r on worker %s; the "
+                    "commit is not counted against remaining capacity.",
+                    index + 1,
                     role,
                     worker_id,
                 )
                 continue
-            gpu_type, claim = known
-            out.append(
-                _PlacedStandIn(
-                    worker_id=worker_id,
-                    gpu_indexes=None,
-                    gpu_type=gpu_type,
-                    computed_resource_claim=claim,
-                )
-            )
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                continue
+            out.append(_stand_in_for(offers[index], worker))
         return out
 
     def _selector(self, model, instances, cpu_only, ram_claim=None):

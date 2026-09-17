@@ -518,3 +518,33 @@ async def test_domains_are_sized_with_one_capacity_pass_not_one_each():
     # three more.
     assert calls[0] == ("prefill", (1, 2, 3), 0), "the sizing pass comes first"
     assert len(calls) == 3, f"expected 1 sizing + 2 placements, got {calls}"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_names_the_workers_it_could_not_look_at():
+    """🔴 The sentence an operator gets when one worker stopped reporting.
+
+    Only the root sees every worker, so it is the only domain that can say
+    "we could not measure one of them"; a single host, asked about itself,
+    can only ever say "not enough room". The two tie on measured room -- the
+    root's total IS the reachable host's -- and with a strict `>` the host won
+    and the unmeasured worker vanished from the message. A fleet with an agent
+    that had stopped reporting then read as simply full, which sends the
+    reader to free up memory instead of to that agent.
+    """
+
+    async def capacity(_role, worker_ids, placed):
+        # Worker 2 is absent rather than zero: this module's way of saying
+        # "unknown", and what a host with no system telemetry produces.
+        used = {}
+        for entry in placed:
+            used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
+        return {w: max(0, 1 - used.get(w, 0)) for w in worker_ids if w != 2}
+
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")])
+
+    got = await solve_group_placement(root, pd(2, 2), capacity, layers, GatherRequest())
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.unmeasured == 1
+    assert "could not be measured" in got.reason

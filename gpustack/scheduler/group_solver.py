@@ -235,7 +235,15 @@ async def solve_group_placement(
         placement = await _fit_in_domain(root, root.layer, ordered_roles, capacity)
         if isinstance(placement, GroupPlacement):
             return placement
-        if best is None or placement.available > best.available:
+        # `>=`, for the same reason the loop above uses it: a tie goes to the
+        # wider scope, and nothing is wider than the root. It also decides
+        # which sentence the operator gets, because the root is the only
+        # domain that sees every worker — so it is the only one that can say
+        # "capacity could not be measured on 1 of 2 workers" rather than the
+        # flat "not enough room" a single host reports about itself. With `>`
+        # those two tie and the host wins, and a fleet with a worker whose
+        # telemetry had stopped read as simply full.
+        if best is None or placement.available >= best.available:
             best = placement
 
     if best is None:

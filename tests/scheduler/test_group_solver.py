@@ -548,3 +548,53 @@ async def test_a_refusal_names_the_workers_it_could_not_look_at():
     assert isinstance(got, GroupInfeasible)
     assert got.unmeasured == 1
     assert "could not be measured" in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_without_a_floor_still_carries_the_numbers():
+    """🔴 The default path, and the one that used to say the least.
+
+    `needed` / `available` are filled in on every refusal, but only the
+    MustGather branches spent them on a sentence — so a deployment with no
+    gather requirement, which is most of them, got the bare "not enough room"
+    while the shortfall sat unread in the fields beside it. The
+    single-instance refusal names the claim and what the roomiest worker had;
+    this is the same event described with an order of magnitude less.
+    """
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-a")])
+
+    got = await solve_group_placement(
+        root, pd(4, 4), flat_capacity(1), layers, GatherRequest()
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.needed == 8
+    assert got.available == 2
+    assert "8" in got.reason and "2" in got.reason
+    # No floor was asked for, so the search ran to the cluster root and the
+    # sentence must not name a domain whose only name is an internal layer id.
+    assert "ClusterTopologyLayer" not in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_floorless_refusal_separates_short_from_unmeasured():
+    """ "Full" is the one answer that stops an operator looking for a mistake,
+    and without a floor the mistake is usually a worker that stopped reporting
+    rather than a cluster out of cards."""
+
+    async def capacity(_role, worker_ids, placed):
+        used = {}
+        for entry in placed:
+            used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
+        return {w: max(0, 1 - used.get(w, 0)) for w in worker_ids if w != 2}
+
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")])
+
+    got = await solve_group_placement(root, pd(2, 2), capacity, layers, GatherRequest())
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.needed == 4
+    assert got.unmeasured == 1
+    assert "could not be measured" in got.reason
+    # Both halves, because either alone points somewhere wrong.
+    assert "4" in got.reason

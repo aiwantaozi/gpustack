@@ -251,6 +251,21 @@ async def solve_group_placement(
             reason="No topology domain has any capacity for this group.",
             needed=total,
         )
+    # 🔴 Every refusal gets the numbers, not just the MustGather ones.
+    #
+    # `needed`, `available` and `unmeasured` are filled in on every path
+    # through `_fit_in_domain`, and until now only the two branches below them
+    # spent those numbers on a sentence. The default path — no gather
+    # requirement at all, which is most deployments — reached the caller as the
+    # bare string `_fit_in_domain` set, "not enough room", while the shortfall
+    # sat in the fields unread. Beside the single-instance refusal, which names
+    # the claim and what the roomiest worker had, that read as an order of
+    # magnitude less information about the same event.
+    #
+    # Without a floor the search ends at the cluster root, and the root wins
+    # ties (see the `>=` above), so `best` is the root's own attempt: its
+    # numbers are the whole cluster's and the sentence says so rather than
+    # naming a domain whose only name is an internal layer id.
     if enforced.must and not best.unmeasured:
         best.reason = (
             f"The group needs {best.needed} placements in one "
@@ -263,6 +278,22 @@ async def solve_group_placement(
             f"The group needs {best.needed} placements in one "
             f"{enforced.layer!r}, but capacity could not be measured on "
             f"{best.unmeasured} worker(s), so whether it fits is unknown."
+        )
+    elif not best.unmeasured:
+        best.reason = (
+            f"The group needs {best.needed} placements and the cluster has "
+            f"room for {best.available}."
+        )
+    else:
+        # Same distinction the MustGather branch draws, and for the same
+        # reason: "full" is the one answer that stops an operator looking for
+        # a mistake, and here the mistake is usually a worker that stopped
+        # reporting rather than a cluster that is out of cards.
+        best.reason = (
+            f"The group needs {best.needed} placements and the cluster has "
+            f"room for {best.available}, but capacity could not be measured "
+            f"on {best.unmeasured} worker(s) — the shortfall may be smaller "
+            f"than it looks, or there may be none."
         )
     return best
 

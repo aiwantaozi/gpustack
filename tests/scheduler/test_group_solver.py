@@ -598,3 +598,161 @@ async def test_a_floorless_refusal_separates_short_from_unmeasured():
     assert "could not be measured" in got.reason
     # Both halves, because either alone points somewhere wrong.
     assert "4" in got.reason
+
+
+# --- the router: checked, never assigned ------------------------------------ #
+
+
+def _router(replicas=1):
+    return [RoleDemand(role="router", replicas=replicas, weight=0.0)]
+
+
+def _capacity_with_router(per_worker, router_on):
+    """GPU roles get `per_worker` slots each; the router only fits on the
+    workers named in `router_on`.
+
+    `per_worker` may be an int (the same everywhere) or a dict keyed by worker
+    id, which is how a test forces the gang onto one particular host.
+    """
+
+    def gpu_slots(worker_id):
+        if isinstance(per_worker, dict):
+            return per_worker.get(worker_id, 0)
+        return per_worker
+
+    async def capacity(role, worker_ids, placed):
+        if role == "router":
+            return {w: (1 if w in router_on else 0) for w in worker_ids}
+        used = {}
+        for entry in placed:
+            if getattr(entry, "role", "") != "router":
+                used[entry.worker_id] = used.get(entry.worker_id, 0) + 1
+        return {w: max(0, gpu_slots(w) - used.get(w, 0)) for w in worker_ids}
+
+    return capacity
+
+
+@pytest.mark.asyncio
+async def test_a_group_whose_router_has_nowhere_to_go_is_refused():
+    """🔴 The gap this closes. The router takes no accelerator, so it is not a
+    demand and the solver never saw it — and a group admitted onto hardware
+    with no room for its router never becomes servable, because the router is
+    what answers requests. `evaluate_group` said so in its own docstring: "a
+    cluster with room for the GPU members but not for the router still
+    evaluates as compatible"."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router(2, router_on=set()),
+        layers,
+        GatherRequest(),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.role == "router"
+    assert "'router'" in got.reason
+    # The gang fit, so the counting sentence must not be pasted over this one:
+    # "the cluster has room for 2" of 2 would contradict the refusal it is
+    # attached to.
+    assert "placements" not in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_router_that_fits_does_not_change_the_placement():
+    """It is checked, not assigned: the row does not exist yet — the
+    dependency gate creates it a pass later, from peer addresses that are not
+    known while this runs."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router(2, router_on={1}),
+        layers,
+        GatherRequest(),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupPlacement)
+    assert "router" not in got.assignments
+
+
+@pytest.mark.asyncio
+async def test_the_router_does_not_inflate_what_the_group_needs():
+    """Counting it among the demands would make a 4P4D need nine placements in
+    one domain and refuse racks that would have served. It constrains
+    feasibility, never size."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root,
+        pd(4, 4),
+        _capacity_with_router(1, router_on={1}),
+        layers,
+        GatherRequest(),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.needed == 8  # not 9
+    assert got.role != "router"
+
+
+@pytest.mark.asyncio
+async def test_without_a_floor_the_router_may_live_anywhere_in_the_cluster():
+    """A tight domain must not be rejected over a router that had somewhere
+    else to go: no gather requirement means no claim about where members sit,
+    so refusing here would spread the gang for nothing."""
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router({1: 2, 2: 0}, router_on={2}),
+        layers,
+        GatherRequest(),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupPlacement)
+    assert set(got.assignments["prefill"]) == {1}
+
+
+@pytest.mark.asyncio
+async def test_must_gather_keeps_the_router_inside_the_floor():
+    """The operator set a floor, and a router away from its members crosses it
+    on every request — it answers all of them.
+
+    The gang can only fit on w1, so the floor puts it in rack-a; the router
+    only fits on w2, in rack-b. Without the floor this is the previous test
+    and it deploys.
+    """
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router({1: 2, 2: 0}, router_on={2}),
+        layers,
+        GatherRequest(layer="RackLayer", must=True),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert got.role == "router"
+
+
+@pytest.mark.asyncio
+async def test_a_group_with_no_router_is_unaffected():
+    """Every pre-PD deployment and every group whose router role is absent
+    takes exactly the path it took before."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root, pd(1, 1), _capacity_with_router(2, router_on=set()), layers
+    )
+
+    assert isinstance(got, GroupPlacement)

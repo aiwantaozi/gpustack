@@ -229,6 +229,13 @@ async def _run(placement, commit_map=None, topology=None, group_instances=None):
         async def commit(self, role, worker_ids, already):
             return (commit_map or {}).get(role, [])
 
+        def notes_for(self, role):
+            # The selectors' own account of why nothing fit, keyed by the role
+            # the solver stopped on. Spelled out here rather than stubbed away
+            # because a refusal that loses it is exactly the regression the
+            # assertion below watches for.
+            return [f"{role} needs 20.31 GiB of VRAM."] if role else []
+
     with (
         patch.object(
             group_schedule.Cluster, "one_by_id", AsyncMock(return_value=cluster)
@@ -279,12 +286,17 @@ async def test_an_infeasible_group_places_nothing_and_says_why():
         reason="The group needs 4 placements in one 'Rack', and the roomiest one holds 2.",
         layer="Rack",
         best_domain="rack-a",
+        role="prefill",
         needed=4,
         available=2,
     )
     by_instance, messages = await _run(placement)
     assert by_instance is None
     assert "roomiest" in messages[0]
+    # 🔴 And the size beside the count. The solver reasons in placements and
+    # the selectors in GiB; a refusal carrying only the first cannot tell a
+    # group that is slightly too big from one that was never going to fit.
+    assert any("20.31 GiB" in message for message in messages[1:])
 
 
 @pytest.mark.asyncio

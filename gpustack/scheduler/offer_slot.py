@@ -73,6 +73,14 @@ class OfferSlot:
     # `set_global_config` produced zeros on every worker and a group refusal
     # that named capacity.
     unavailable: Optional[str] = None
+    # What the selector said on the round that found no room, in its own words
+    # -- the claim in GiB, what the roomiest card had, the shortfall. The
+    # single-instance refusal has carried these all along; a group refusal
+    # could only count members, so "the group needs 4 placements and the
+    # cluster has room for 2" never said how big one member is or what stood
+    # in its way. Same source, so the two paths cannot describe one cluster
+    # differently.
+    notes: List[str] = field(default_factory=list)
 
     @property
     def counted_to_exhaustion(self) -> bool:
@@ -125,6 +133,11 @@ async def count_offer_slots(
 
         candidate = _usable(candidates)
         if candidate is None:
+            # The round that found no room is the one worth quoting, and it is
+            # always this one: the loop stops here. Asked of the selector
+            # rather than reconstructed, because the sentences it produces are
+            # the same ones the single-instance refusal shows.
+            result.notes = list(_notes_of(selector))
             return result
 
         result.slots += 1
@@ -132,6 +145,23 @@ async def count_offer_slots(
         hypothetical.append(_stand_in_for(candidate, worker))
 
     return result
+
+
+def _notes_of(selector) -> List[str]:
+    """The selector's own account of why nothing fit.
+
+    Defensive because `make_selector` is a caller-supplied callable and the
+    tests hand in stubs: a counting pass must not fail over a diagnostic, and
+    a missing explanation is a worse message rather than a broken schedule.
+    """
+    getter = getattr(selector, "get_messages", None)
+    if getter is None:
+        return []
+    try:
+        return [note for note in (getter() or []) if note]
+    except Exception as e:  # pragma: no cover - diagnostics only
+        logger.debug("Selector could not explain itself: %s", e)
+        return []
 
 
 def _usable(candidates) -> Optional[Any]:

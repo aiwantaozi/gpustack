@@ -37,7 +37,11 @@ from gpustack.schemas.models import (
     role_takes_no_accelerator,
 )
 from gpustack.schemas.principals import _platform_principal_id
-from gpustack.scheduler.group_capacity import GroupCapacity, role_demands
+from gpustack.scheduler.group_capacity import (
+    GroupCapacity,
+    attendant_demands,
+    role_demands,
+)
 from gpustack.scheduler.group_schedule import (
     cache_instances_in,
     gather_request,
@@ -328,13 +332,16 @@ async def evaluate_group(
     `GroupCapacity.commit` produces -- the very objects the group scheduler
     writes onto instance rows.
 
-    ⚠️ **The router is priced, not placed.** `role_demands` leaves out every
-    role that takes no accelerator, so the solver never sees the router and
-    this function adds its container memory afterwards. That mirrors the
-    scheduler, where a router is placed by the per-instance path rather than
-    with the group -- so a cluster with room for the GPU members but not for
-    the router still evaluates as compatible, in both places for the same
-    reason.
+    ⚠️ **The router is priced here and checked, but still not placed.** It
+    stays out of `role_demands` -- counting it among the gang would make a 4P4D
+    need nine placements in one domain -- so this function adds its container
+    memory to the total afterwards. What changed is that it now travels as an
+    `attendant`: the solver verifies a worker can host it before calling the
+    group placeable. Until then a cluster with room for the GPU members and
+    none for the router evaluated as compatible, in both places for the same
+    reason, and the deployment it promised then sat with a router that could
+    not be scheduled -- which is a group that serves nothing, since a router
+    answers every request.
     """
     # 🔴 A `ModelSpec` is not quite a `Model`, and the role projection
     # revalidates it through `ModelBase` — where two of these fields are not
@@ -390,10 +397,17 @@ async def evaluate_group(
         config, group_model, workers, model_instances, cache_instances
     )
     placement = await solve_group_placement(
-        view.root, demands, capacity, view.scopes(), gather_request(group_model)
+        view.root,
+        demands,
+        capacity,
+        view.scopes(),
+        gather_request(group_model),
+        attendants=[RoleDemand(**d) for d in attendant_demands(group_model)],
     )
     if not isinstance(placement, GroupPlacement):
-        return None, [], [getattr(placement, "reason", "The group does not fit.")]
+        reason = getattr(placement, "reason", "The group does not fit.")
+        notes = capacity.notes_for(getattr(placement, "role", None))
+        return None, [], [reason] + notes
 
     # `already` accumulates across roles for the same reason the capacity count
     # does: the second role has to see what the first one took, or both are

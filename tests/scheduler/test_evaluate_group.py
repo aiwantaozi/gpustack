@@ -70,6 +70,13 @@ async def _run(placement, commit_map=None, spec=None, workers=None):
         async def commit(self, role, worker_ids, already):
             return (commit_map or {}).get(role, [])
 
+        def notes_for(self, role):
+            # What the selectors said about this role, in GiB. The evaluation
+            # and the scheduler read it from the same place on purpose: a form
+            # that explains a refusal differently from the deployment that
+            # follows is two answers about one cluster.
+            return [f"{role} needs 20.31 GiB of VRAM."] if role else []
+
     view = SimpleNamespace(root=SimpleNamespace(), scopes=lambda: [])
 
     with (
@@ -255,6 +262,9 @@ async def test_a_role_bearing_model_never_reaches_find_candidate():
 
         async def commit(self, role, worker_ids, already):
             return commit.get(role, [])
+
+        def notes_for(self, role):
+            return []
 
     view = SimpleNamespace(root=SimpleNamespace(), scopes=lambda: [])
     find_candidate = AsyncMock(return_value=(None, []))

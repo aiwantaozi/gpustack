@@ -112,6 +112,11 @@ class GroupCapacity:
         # (role, worker_id) -> the candidates the count produced there, in the
         # order it produced them. See `_translate`.
         self._offers: Dict[tuple, List[object]] = {}
+        # role -> the selectors' own account of why no more fit, deduplicated.
+        # A group refusal counts members; these are what one member costs and
+        # what stood in its way, and without them the two refusal paths
+        # describe the same cluster in incomparable units.
+        self._notes: Dict[str, List[str]] = {}
 
     async def __call__(
         self,
@@ -175,12 +180,40 @@ class GroupCapacity:
                 # gets the second set of cards, and remembering only the first
                 # is what made every later member invisible to the next role.
                 self._offers[(role, worker_id)] = list(offer.placements)
+            self._remember_notes(role, offer.notes)
             if offer.unavailable and offer.slots == 0:
                 # Nothing was proven about this worker. Leaving it out is the
                 # difference between "no room" and "we could not look".
                 continue
             out[worker_id] = self._within_port_budget(role, worker_id, offer)
         return out
+
+    # How many lines of explanation a refusal may carry. The claim is the same
+    # sentence on every worker, so deduplication does most of the work; the cap
+    # is for the per-worker lines on a fleet where dozens are equally full, and
+    # a refusal nobody reads to the end explains nothing.
+    _MAX_NOTES = 6
+
+    def _remember_notes(self, role: str, notes: Sequence[str]) -> None:
+        """Keep each distinct explanation once, in the order first seen.
+
+        Across workers rather than per worker: the line that matters most --
+        what one member of this role costs -- is identical everywhere, and the
+        ones that differ name the worker they came from.
+        """
+        if not notes:
+            return
+        kept = self._notes.setdefault(role, [])
+        for note in notes:
+            text = note.strip()
+            if text and text not in kept and len(kept) < self._MAX_NOTES:
+                kept.append(text)
+
+    def notes_for(self, role: Optional[str]) -> List[str]:
+        """Why this role found no room, for a caller building a refusal."""
+        if not role:
+            return []
+        return list(self._notes.get(role, []))
 
     def _within_port_budget(self, role: str, worker_id: int, offer) -> int:
         """`offer.slots`, capped by what the host has ports for.
@@ -455,6 +488,9 @@ def role_demands(model: Model) -> List[dict]:
             # A router occupies no accelerator, so it neither competes for
             # cards nor constrains which domain the group lands in. Counting it
             # would make a 4P4D look like nine members needing one domain.
+            # `attendant_demands` picks it up instead: its container memory
+            # still has to exist somewhere, it just must not inflate the
+            # gang's size.
             continue
         projected = role_effective_model(model, spec.name)
         per_member = _cards_per_member(projected)
@@ -466,6 +502,29 @@ def role_demands(model: Model) -> List[dict]:
             }
         )
     return demands
+
+
+def attendant_demands(model: Model) -> List[dict]:
+    """The group's members that occupy no accelerator -- the router.
+
+    The complement of `role_demands`, and the two must stay complementary: a
+    role counted in both would be placed twice, and a role in neither is the
+    state this function exists to end.
+
+    They are demands for feasibility and not for sizing. A router answers every
+    request, so a group whose router cannot be scheduled serves nothing -- but
+    it competes for no card, and adding it to the gang would make a 4P4D need
+    nine placements in one domain and refuse racks that would have served.
+
+    `weight` is zero because ordering is a contest for cards and they are not
+    in it; they are checked after the gang is placed, against what it left.
+    """
+    return [
+        {"role": spec.name, "replicas": max(int(spec.replicas or 0), 0), "weight": 0.0}
+        for spec in model.roles or []
+        if role_takes_no_accelerator(model, spec.name)
+        and max(int(spec.replicas or 0), 0) > 0
+    ]
 
 
 def _cards_per_member(model) -> int:

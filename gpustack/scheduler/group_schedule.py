@@ -40,7 +40,11 @@ from gpustack.schemas.models import (
     RoleNameEnum,
 )
 from gpustack.schemas.workers import Worker
-from gpustack.scheduler.group_capacity import GroupCapacity, role_demands
+from gpustack.scheduler.group_capacity import (
+    GroupCapacity,
+    attendant_demands,
+    role_demands,
+)
 from gpustack.scheduler.group_solver import (
     GatherRequest,
     GroupPlacement,
@@ -146,10 +150,27 @@ async def schedule_group(
     # gone with the second chain: there is one tree, so there is one search.
     request = gather_request(model)
     placement = await solve_group_placement(
-        view.root, demands, capacity, view.scopes(), request
+        view.root,
+        demands,
+        capacity,
+        view.scopes(),
+        request,
+        # The router, checked but never assigned here: it is created a pass
+        # later by the dependency gate, from peer addresses that do not exist
+        # yet. Passing it in is what stops a group being admitted onto hardware
+        # with no room for the one member that answers requests.
+        attendants=[RoleDemand(**d) for d in attendant_demands(model)],
     )
     if not isinstance(placement, GroupPlacement):
-        return None, [getattr(placement, "reason", "The group does not fit.")]
+        # The count and the size, together. The solver speaks in placements
+        # ("needs 4, the cluster has room for 2") because that is the unit it
+        # reasons in; the selectors speak in GiB. A refusal with only the first
+        # leaves the reader unable to tell a group that is slightly too big
+        # from one that was never going to fit, which is the difference between
+        # freeing a card and choosing another model.
+        reason = getattr(placement, "reason", "The group does not fit.")
+        notes = capacity.notes_for(getattr(placement, "role", None))
+        return None, [reason] + [f"\n{note}" for note in notes]
 
     logger.info(
         "Group %s placed in %s %r",

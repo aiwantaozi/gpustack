@@ -113,6 +113,10 @@ class GroupInfeasible:
     reason: str
     layer: Optional[str] = None
     best_domain: Optional[str] = None
+    # The role the walk stopped on. Carried so the caller can ask the capacity
+    # function what that role's selectors said -- the claim in GiB and what
+    # stood in its way -- and put it beside a count that cannot express either.
+    role: Optional[str] = None
     needed: int = 0
     available: int = 0
     # Workers whose capacity could not be measured at all. `available` counts
@@ -156,6 +160,7 @@ async def solve_group_placement(
     capacity: CapacityFn,
     scopes: Sequence[Union[GatherScope, str]],
     gather: GatherRequest = GatherRequest(),
+    attendants: Sequence[RoleDemand] = (),
 ) -> object:
     """Place the group, or say why not.
 
@@ -214,7 +219,14 @@ async def solve_group_placement(
             sized.append((sum(sizing.get(w, 0) for w in members), d.name, d))
         for _size, _name, domain in sorted(sized, key=lambda t: (t[0], t[1])):
             placement = await _fit_in_domain(
-                domain, scope.name, ordered_roles, capacity
+                domain,
+                scope.name,
+                ordered_roles,
+                capacity,
+                attendants,
+                attendant_worker_ids=(
+                    None if enforced.must else root.descendant_worker_ids()
+                ),
             )
             if isinstance(placement, GroupPlacement):
                 return placement
@@ -232,7 +244,9 @@ async def solve_group_placement(
     # gathers into: everything is under it, so reaching here means only that
     # the members are somewhere in this cluster.
     if not enforced.must:
-        placement = await _fit_in_domain(root, root.layer, ordered_roles, capacity)
+        placement = await _fit_in_domain(
+            root, root.layer, ordered_roles, capacity, attendants
+        )
         if isinstance(placement, GroupPlacement):
             return placement
         # `>=`, for the same reason the loop above uses it: a tie goes to the
@@ -251,21 +265,34 @@ async def solve_group_placement(
             reason="No topology domain has any capacity for this group.",
             needed=total,
         )
-    # 🔴 Every refusal gets the numbers, not just the MustGather ones.
-    #
-    # `needed`, `available` and `unmeasured` are filled in on every path
-    # through `_fit_in_domain`, and until now only the two branches below them
-    # spent those numbers on a sentence. The default path — no gather
-    # requirement at all, which is most deployments — reached the caller as the
-    # bare string `_fit_in_domain` set, "not enough room", while the shortfall
-    # sat in the fields unread. Beside the single-instance refusal, which names
-    # the claim and what the roomiest worker had, that read as an order of
-    # magnitude less information about the same event.
-    #
-    # Without a floor the search ends at the cluster root, and the root wins
-    # ties (see the `>=` above), so `best` is the root's own attempt: its
-    # numbers are the whole cluster's and the sentence says so rather than
-    # naming a domain whose only name is an internal layer id.
+    return _describe(best, enforced, attendants)
+
+
+def _describe(
+    best: GroupInfeasible,
+    enforced: GatherRequest,
+    attendants: Sequence[RoleDemand],
+) -> GroupInfeasible:
+    """Turn the numbers every refusal already carries into its sentence.
+
+    🔴 They used to be spent only by the two MustGather branches. The default
+    path -- no gather requirement at all, which is most deployments -- reached
+    the caller as the bare string `_fit_in_domain` set, "not enough room",
+    while the shortfall sat in the fields unread. Beside the single-instance
+    refusal, which names the claim and what the roomiest worker had, that was
+    an order of magnitude less information about the same event.
+
+    Without a floor the search ends at the cluster root, and the root wins ties
+    (see the `>=` in the caller), so `best` is the root's own attempt: its
+    numbers are the whole cluster's, and the sentence says so rather than
+    naming a domain whose only name is an internal layer id.
+    """
+    if best.role and best.role in {a.role for a in attendants}:
+        # An attendant refusal already says which role and where, and it is the
+        # one case the counting sentences below would misdescribe: the gang
+        # fits, so "the cluster has room for 4" of 4 would read as a
+        # contradiction of the refusal it is attached to.
+        return best
     if enforced.must and not best.unmeasured:
         best.reason = (
             f"The group needs {best.needed} placements in one "
@@ -295,6 +322,7 @@ async def solve_group_placement(
             f"on {best.unmeasured} worker(s) — the shortfall may be smaller "
             f"than it looks, or there may be none."
         )
+    return best
     return best
 
 
@@ -341,8 +369,35 @@ async def _fit_in_domain(
     layer: str,
     roles: Sequence[RoleDemand],
     capacity: CapacityFn,
+    attendants: Sequence[RoleDemand] = (),
+    attendant_worker_ids: Optional[Sequence[int]] = None,
 ) -> object:
-    """Place every role inside one domain, or report how far it got."""
+    """Place every role inside one domain, or report how far it got.
+
+    ``attendants`` are the group's members that occupy no accelerator -- the
+    router. They are checked, never assigned: the solver answers "which worker"
+    for the gang, and a router is created a pass later by the dependency gate,
+    against peer addresses that do not exist while this runs.
+
+    🔴 **Checked at all because they were invisible.** They are left out of
+    ``roles`` on purpose: counting a router among the demands would make a 4P4D
+    need room for nine placements in one domain, and under ``MustGather`` that
+    refuses racks that would have served. But left out entirely, the group is
+    admitted onto hardware with no room for its router, which then fails to
+    schedule and the group never becomes servable -- a router answers every
+    request, so a group without one is a group that serves nothing. Its
+    ``evaluate_group`` twin said so outright: "a cluster with room for the GPU
+    members but not for the router still evaluates as compatible".
+
+    So they constrain feasibility without constraining size: they are not in
+    ``needed``, they do not order domains, and they never widen the gang.
+
+    ``attendant_worker_ids`` is where they are allowed to land. The caller
+    passes this domain's workers under ``MustGather`` -- a floor the operator
+    set, and a router away from its members crosses that boundary on every
+    request -- and the whole cluster otherwise, so a tight domain is not
+    rejected over a router that had somewhere else to go.
+    """
     worker_ids = domain.descendant_worker_ids()
     total = sum(r.replicas for r in roles)
     if not worker_ids:
@@ -369,6 +424,7 @@ async def _fit_in_domain(
                 ),
                 layer=layer,
                 best_domain=domain.name,
+                role=role.role,
                 needed=total,
                 available=placed_total + sum(slots.values()),
                 unmeasured=unmeasured,
@@ -379,6 +435,36 @@ async def _fit_in_domain(
             placed.extend([_Committed(worker_id, role.role)] * count)
         placement.assignments[role.role] = assigned
         placed_total += role.replicas
+
+    # Last, and with the gang standing in: the question is whether a router
+    # fits *beside* the members, on what they leave behind.
+    where = list(attendant_worker_ids) if attendant_worker_ids else worker_ids
+    for attendant in attendants:
+        slots = await capacity(attendant.role, where, placed)
+        if _share_out(slots, attendant.replicas, placed) is None:
+            unmeasured = len([w for w in where if w not in slots])
+            scope = "this cluster" if where is not worker_ids else f"{domain.name!r}"
+            return GroupInfeasible(
+                reason=(
+                    f"The group's accelerator-bearing members fit, but nothing "
+                    f"in {scope} has room for the {attendant.role!r} role"
+                    + (
+                        "."
+                        if not unmeasured
+                        else f", and capacity could not be measured on "
+                        f"{unmeasured} of {len(where)} workers."
+                    )
+                ),
+                layer=layer,
+                best_domain=domain.name,
+                role=attendant.role,
+                needed=total,
+                # The gang's own arithmetic, unchanged: an attendant is not a
+                # placement the group is short of, and counting it here would
+                # make the shortfall read as one card too few.
+                available=placed_total,
+                unmeasured=unmeasured,
+            )
 
     return placement
 

@@ -13,6 +13,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 from gpustack.policies.scorers.group_locality_scorer import GroupLocalityScorer
 from gpustack.policies.scorers.pairing_affinity_scorer import PairingAffinityScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
+from gpustack.policies.scorers.topology_proximity_scorer import (
+    TopologyProximityScorer,
+)
 from gpustack.policies.scorers.model_file_locality_scorer import (
     ModelFileLocalityScorer,
 )
@@ -46,12 +49,14 @@ from gpustack.policies.worker_filters.gpu_matching_filter import GPUMatchingFilt
 from gpustack.policies.worker_filters.local_path_filter import LocalPathFilter
 from gpustack.policies.worker_filters.pd_mode_filter import PDModeRuntimeFilter
 from gpustack.policies.worker_filters.cluster_filter import ClusterFilter
+from gpustack.policies.worker_filters.gather_floor_filter import GatherFloorFilter
 from gpustack.scheduler.model_registry import detect_model_type
 from gpustack.scheduler.meta_registry import get_model_meta
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack import envs
 from gpustack.schemas.inference_backend import is_built_in_backend
+from gpustack.schemas.clusters import Cluster, GatherStrategyEnum
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.models import (
     BackendEnum,
@@ -76,6 +81,7 @@ from gpustack.scheduler.group_schedule import (
     is_group_forming,
     schedule_group,
 )
+from gpustack.scheduler.topology_view import TopologyView, build_view
 from gpustack.scheduler.calculator import (
     GPUOffloadEnum,
     calculate_gguf_model_resource_claim,
@@ -677,6 +683,65 @@ def _group_scorer(
     )
 
 
+async def _group_topology(
+    session: AsyncSession,
+    model: Model,
+    group_id: Optional[str],
+    workers: List[Worker],
+) -> Optional[TopologyView]:
+    """The cluster's tree, read only when a group member is being placed.
+
+    Gated on `group_id` because that is the only thing the tree is used for
+    here, and it is None for every deployment without roles -- so the read this
+    costs is never paid by the models that were being scheduled before any of
+    this existed. The worker list is the caller's, already in hand; only the
+    cluster row is fetched.
+    """
+    if not group_id or not model.roles:
+        return None
+    try:
+        cluster = await Cluster.one_by_id(session, model.cluster_id)
+        return build_view(
+            getattr(cluster, "topology", None),
+            [w for w in workers if w.cluster_id == model.cluster_id],
+        )
+    except Exception as e:
+        # A tree that cannot be read is not a floor of zero and not a distance
+        # of infinity. Placing without it is the answer this path gave before
+        # either policy existed, and the outcome is still reported by
+        # `_gather_unmet`.
+        logger.warning("Could not read the topology for model %s: %s", model.name, e)
+        return None
+
+
+def _gather_floor(
+    model: Model,
+    group_id: Optional[str],
+    model_instances: List[ModelInstance],
+    view: Optional[TopologyView],
+    anchors: List[str],
+) -> Optional[GatherFloorFilter]:
+    """The floor filter for this member, or None when no floor was asked for.
+
+    `PreferGather` gets none: it is a target, not a floor -- it is allowed to
+    end up looser and says so on the model afterwards. Filtering for it would
+    turn "aim for this" into "refuse below this", which is the other option and
+    the one the operator did not pick.
+    """
+    if view is None:
+        return None
+    gather = getattr(model, "gather", None)
+    if getattr(gather, "strategy", None) != GatherStrategyEnum.MUST_GATHER:
+        return None
+    return GatherFloorFilter(
+        layer=getattr(gather, "layer", None),
+        group_id=group_id,
+        model_instances=model_instances,
+        view=view,
+        weight_bearing=anchors,
+    )
+
+
 async def find_candidate(
     session: AsyncSession,
     config: Config,
@@ -741,6 +806,27 @@ async def find_candidate(
     # Same reason, same moment: `resources` is role-OWN too, and only the
     # accelerator-free branch consumes it.
     ram_claim = role_container_resources(model, role).memory if cpu_only else None
+    # Read here too, and for the third time for the same reason: both of these
+    # are properties of the MODEL and its ROLES, and the projection below
+    # flattens the roles away.
+    topology = await _group_topology(session, model, group_id, workers)
+    anchors = [
+        spec.name
+        for spec in (model.roles or [])
+        if not role_takes_no_accelerator(model, spec.name)
+    ]
+    floor = _gather_floor(model, group_id, model_instances, topology, anchors)
+    proximity = (
+        TopologyProximityScorer(
+            group_id,
+            model_instances,
+            topology,
+            anchors,
+            max_score=envs.SCHEDULER_TOPOLOGY_PROXIMITY_MAX_SCORE,
+        )
+        if topology is not None
+        else None
+    )
 
     # Apply the role's overrides once, here. Every filter, selector and scorer
     # below is constructed from `model` and reads Model-level fields directly;
@@ -757,6 +843,11 @@ async def find_candidate(
         LocalPathFilter(model),
         PDModeRuntimeFilter(model),
     ]
+    if floor is not None:
+        # Last, so its message names the workers the cheaper filters left --
+        # "kept 0 of 1" after a label selector has already cut the fleet to one
+        # host says something different from "kept 0 of 40".
+        filters.append(floor)
 
     worker_filter_chain = WorkerFilterChain(filters)
     workers, filter_messages = await worker_filter_chain.filter(workers)
@@ -793,6 +884,14 @@ async def find_candidate(
     group_scorer = _group_scorer(group_id, role, cpu_only, model_instances)
     if group_scorer is not None:
         candidate_scorers.append(group_scorer)
+    if proximity is not None:
+        # Beside the group scorer rather than instead of it: that one answers
+        # "which host has the most of the opposite role" -- the odds a
+        # request's two ends land together -- and this one answers "how far is
+        # this host from the group at all". Under 3P1D the first deliberately
+        # prefers the host holding the single decode over the one holding two
+        # prefills, which no notion of distance would produce.
+        candidate_scorers.append(proximity)
     candidates = await CandidateScoreChain(candidate_scorers).score(candidates)
 
     # Pick the highest score candidate.

@@ -330,6 +330,15 @@ SCHEDULER_SCALE_DOWN_OFFLOAD_MAX_SCORE = float(
 SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE", 1)
 )
+# Per topology rung shared with the group's placed members, when scaling one
+# out or placing its router. Above `PlacementScorer`'s 100-point spread so
+# capacity cannot outvote a whole rung of the operator's own tree; it needs no
+# ceiling relative to the pairing bonus, because a candidate on a peer's host
+# shares every rung that host's rack does and one more. Set to 0 to place a
+# later member by resource fit alone, as before this existed.
+SCHEDULER_TOPOLOGY_PROXIMITY_MAX_SCORE = float(
+    os.getenv("GPUSTACK_SCHEDULER_TOPOLOGY_PROXIMITY_MAX_SCORE", 150)
+)
 # How long `POST /models/{id}/restart` keeps answering 409 to a second request
 # before assuming the first one is not coming back. Not a tidy-up: a group that
 # never reaches RUNNING is exactly the one an operator needs to restart again,

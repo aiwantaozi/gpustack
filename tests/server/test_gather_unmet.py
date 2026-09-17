@@ -96,11 +96,31 @@ async def test_a_tighter_placement_than_asked_for_is_not_degraded():
 
 
 @pytest.mark.asyncio
-async def test_must_gather_never_reports_a_miss():
-    """It refused at admission instead. A marker here would be a second,
-    weaker answer to a question already settled."""
+async def test_must_gather_reports_a_miss_it_should_never_have():
+    """🔴 This asserted the opposite, on the reasoning that `MustGather`
+    "refused at admission instead". True of the formation, which goes through
+    the solver; false of everything after it. A scaled-out member and the
+    router are placed by the per-instance path, so the one strategy whose whole
+    point is strictness was also the one that could be violated in total
+    silence.
+
+    `GatherFloorFilter` is the enforcement. This is the net under it, for the
+    cases that filter deliberately declines to force — members already spread,
+    or unclassified at the layer, where refusing a new member would not put
+    back a floor that is already gone. So under `MustGather` this should always
+    be false, and a true here is an invariant that broke, not a report."""
     must = GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer=lid("rack"))
-    workers = [_worker(1, {RACK: "R1"}), _worker(2, {RACK: "R2"})]
+    workers = [
+        _worker(1, {ROOM: "H", RACK: "R1"}),
+        _worker(2, {ROOM: "H", RACK: "R2"}),
+    ]
+    assert await _check(must, workers, [_instance(1), _instance(2)]) is True
+
+
+@pytest.mark.asyncio
+async def test_must_gather_inside_the_floor_reports_nothing():
+    must = GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer=lid("rack"))
+    workers = [_worker(1, {RACK: "R1"}), _worker(2, {RACK: "R1"})]
     assert await _check(must, workers, [_instance(1), _instance(2)]) is False
 
 

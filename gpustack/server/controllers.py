@@ -2540,10 +2540,22 @@ async def _gather_unmet(
 ) -> bool:
     """Whether the group landed looser than the layer it asked for.
 
-    Only meaningful under `PreferGather` with a layer: that pair means "aim
-    for this, ship it either way", and without an answer afterwards the ask
-    is recorded in the spec while the outcome is recorded nowhere.
-    `MustGather` never reaches here — it refused at admission instead.
+    Under `PreferGather` that pair means "aim for this, ship it either way",
+    and without an answer afterwards the ask is recorded in the spec while the
+    outcome is recorded nowhere.
+
+    🔴 **`MustGather` reaches here too, and used to be excluded.** The reasoning
+    was that it "refused at admission instead" — true of the formation, which
+    goes through the solver, and false of everything after it. A scaled-out
+    member and the router are placed by the per-instance path, which had no
+    floor to honour, so the one strategy whose whole point is strictness was
+    also the one with no enforcement and no report: it could be violated in
+    complete silence. `GatherFloorFilter` is the enforcement; this is what
+    catches the cases the filter deliberately declines to force — members
+    already spread across domains, or sitting in the unclassified bucket, where
+    refusing a new member would not put back a floor that is already gone.
+    Under `MustGather` this should therefore always be false, which makes it an
+    invariant check rather than a report.
 
     Computed from where the members actually are, not from what the solver
     decided. The solver's verdict is not kept, and it would go stale anyway:
@@ -2557,7 +2569,10 @@ async def _gather_unmet(
     gather = getattr(model, "gather", None)
     layer = getattr(gather, "layer", None)
     strategy = getattr(gather, "strategy", None)
-    if not layer or strategy != GatherStrategyEnum.PREFER_GATHER:
+    if not layer or strategy not in (
+        GatherStrategyEnum.PREFER_GATHER,
+        GatherStrategyEnum.MUST_GATHER,
+    ):
         return False
 
     # 🔴 Accelerator-bearing members only, which for today's shapes means

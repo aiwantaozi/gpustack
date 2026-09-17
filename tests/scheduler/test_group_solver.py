@@ -756,3 +756,45 @@ async def test_a_group_with_no_router_is_unaffected():
     )
 
     assert isinstance(got, GroupPlacement)
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_wide_router_refusal_does_not_name_an_internal_layer():
+    """🔴 The root's own name is `ClusterTopologyLayer`, a layer id nobody
+    outside the scheduler has seen. The wording branch keyed off an identity
+    comparison between two lists, and the root fallback did not pass its
+    workers -- so a refusal that had searched the whole cluster reported it as
+    a domain, by that name."""
+    root, layers = tree([worker(1, "w1", "rack-a")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router(2, router_on=set()),
+        layers,
+        GatherRequest(),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert "this cluster" in got.reason
+    assert "ClusterTopologyLayer" not in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_floored_router_refusal_still_names_the_domain():
+    """The other half: under `MustGather` the search really was confined to one
+    domain, and naming it is the whole value of the message."""
+    root, layers = tree([worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")])
+
+    got = await solve_group_placement(
+        root,
+        pd(1, 1),
+        _capacity_with_router({1: 2, 2: 0}, router_on={2}),
+        layers,
+        GatherRequest(layer="RackLayer", must=True),
+        attendants=_router(),
+    )
+
+    assert isinstance(got, GroupInfeasible)
+    assert "rack-a" in got.reason

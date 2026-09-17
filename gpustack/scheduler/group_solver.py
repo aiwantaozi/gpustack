@@ -245,7 +245,16 @@ async def solve_group_placement(
     # the members are somewhere in this cluster.
     if not enforced.must:
         placement = await _fit_in_domain(
-            root, root.layer, ordered_roles, capacity, attendants
+            root,
+            root.layer,
+            ordered_roles,
+            capacity,
+            attendants,
+            # The root's own name is `ClusterTopologyLayer`, an internal layer
+            # id. Passing its workers explicitly takes the "this cluster"
+            # branch, which is both what this call means and the only wording
+            # an operator can read.
+            attendant_worker_ids=root.descendant_worker_ids(),
         )
         if isinstance(placement, GroupPlacement):
             return placement
@@ -322,7 +331,6 @@ def _describe(
             f"on {best.unmeasured} worker(s) — the shortfall may be smaller "
             f"than it looks, or there may be none."
         )
-    return best
     return best
 
 
@@ -438,12 +446,19 @@ async def _fit_in_domain(
 
     # Last, and with the gang standing in: the question is whether a router
     # fits *beside* the members, on what they leave behind.
-    where = list(attendant_worker_ids) if attendant_worker_ids else worker_ids
+    # `None` means "inside this domain", which is what `MustGather` asks for.
+    # Stated as its own name rather than left to an identity comparison on the
+    # two lists: the caller that widened the search to the whole cluster passes
+    # the root's workers, and `where is not worker_ids` read that correctly
+    # only by accident -- it also reported the root's own domain name, which is
+    # the internal layer id `ClusterTopologyLayer`.
+    scoped_to_domain = attendant_worker_ids is None
+    where = worker_ids if scoped_to_domain else list(attendant_worker_ids)
     for attendant in attendants:
         slots = await capacity(attendant.role, where, placed)
         if _share_out(slots, attendant.replicas, placed) is None:
             unmeasured = len([w for w in where if w not in slots])
-            scope = "this cluster" if where is not worker_ids else f"{domain.name!r}"
+            scope = f"{domain.name!r}" if scoped_to_domain else "this cluster"
             return GroupInfeasible(
                 reason=(
                     f"The group's accelerator-bearing members fit, but nothing "

@@ -339,6 +339,18 @@ SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE = float(
 SCHEDULER_TOPOLOGY_PROXIMITY_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_TOPOLOGY_PROXIMITY_MAX_SCORE", 150)
 )
+# How long a member of a `MustGather` group may sit unplaced before the model
+# says so (`gather_blocked_scale_out`). Not a timeout on anything — nothing
+# expires when it passes — it is only the difference between "the scheduler has
+# not run yet" and "the scheduler has run and there is nowhere inside the
+# domain to put this". Every scale-up spends the first of those, so a marker
+# without the dwell would flash on every one of them and be read as noise by
+# the time it means something. Sized well above a scheduling pass and well
+# below the patience of someone watching a scale-up. Set to 0 to report the
+# refusal as soon as a member exists unplaced.
+SCHEDULER_GATHER_BLOCKED_DWELL_SECONDS = int(
+    os.getenv("GPUSTACK_SCHEDULER_GATHER_BLOCKED_DWELL_SECONDS", 120)
+)
 # How long `POST /models/{id}/restart` keeps answering 409 to a second request
 # before assuming the first one is not coming back. Not a tidy-up: a group that
 # never reaches RUNNING is exactly the one an operator needs to restart again,

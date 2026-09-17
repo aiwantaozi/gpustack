@@ -866,6 +866,37 @@ class DegradationReasonEnum(str, Enum):
     Placement-only and knowable as soon as the members are bound, like
     `PAIRING_REMOTE` beside it: no traffic has to happen for it to be true."""
 
+    GATHER_BLOCKED_SCALE_OUT = "gather_blocked_scale_out"
+    """A member cannot be placed without leaving the domain this deployment is
+    pinned to, and the deployment asked to be refused rather than spread.
+
+    The other half of `MustGather`, and the half nobody could see. Under it
+    `GatherFloorFilter` refuses every worker outside the domain the running
+    members occupy -- the strategy working exactly as specified -- but the
+    refusal lands on one pending instance's `state_message` and nowhere else:
+    the model stays RUNNING with an empty `degradations` list, so a scale-up
+    that will never complete is indistinguishable from one still in flight
+    unless the user opens each member in turn. `GATHER_UNMET` does not cover
+    it either, by construction: that one fires only once the floor is ALREADY
+    broken, which under `MustGather` is an invariant check rather than a
+    report.
+
+    🔴 **It does not claim the floor is the cause.** A group with no room left
+    anywhere -- inside the domain or outside it -- presents identically: a
+    weight-bearing member placed, a sibling pending, nothing moving. The two
+    are not separable from the model row, and pretending otherwise would send
+    the operator to edit a gather policy when the answer was to add a worker.
+    The wording is therefore true under both readings: a member is not being
+    placed, and this deployment is one that would rather wait than spread.
+    Which of the two it is, the member's `state_message` says.
+
+    Deliberately absent during formation, where no member is placed yet and
+    the solver -- not the filter -- is the one refusing; a group that cannot
+    form fails scheduling with the shortfall named, which is a different
+    report with a different audience. And deliberately delayed by a dwell, so
+    an ordinary scale-up does not wear the marker for the seconds between the
+    row being created and the scheduler reaching it."""
+
     PLACEMENT_DRIFTED = "placement_drifted"
     """Members are deployed somewhere other than where one created now would
     go — almost always an upgrade that introduced per-tenant namespaces, and

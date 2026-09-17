@@ -2692,6 +2692,96 @@ async def _gather_unmet(
     return rank.get(actual, 0) < rank.get(layer, len(order))
 
 
+def _gather_blocked_scale_out(model: Model, instances: Sequence[ModelInstance]) -> bool:
+    """Whether a member is sitting unplaced under an active `MustGather` floor.
+
+    🔴 **The successful refusal had no reporter at all.** `GatherFloorFilter`
+    does exactly what `MustGather` asks -- it drops every worker outside the
+    domain the group's running members occupy, so a scaled-out member is not
+    placed rather than placed elsewhere -- and the entire trace of that is one
+    pending instance's `state_message`. The model stays `running` with an empty
+    `degradations` list, which is the same thing it says about a scale-up that
+    is merely still in flight. Measured in an e2e round: a 1P1D told to grow to
+    2P sat with a pending prefill and a model row that reported nothing, and
+    the only way to learn why was to open each member in turn.
+
+    `_gather_unmet` above is not this and cannot be made into it. It fires when
+    the floor has already been BROKEN, which under `MustGather` is an invariant
+    check -- the case where the filter deliberately declines to force. The case
+    where the filter succeeds is the common one and was silent.
+
+    🔴 **This does not prove the floor is the cause, and must not read as if it
+    did.** A cluster with no free cards anywhere presents identically: a
+    weight-bearing member placed, a sibling pending, nothing moving. Separating
+    the two would mean re-running the filter chain against every worker from
+    here, and the answer would be stale by the time it was published. So the
+    marker states what is certainly true -- a member is unplaced, and this
+    deployment would rather wait than spread -- and leaves the discrimination
+    to the member's own `state_message`, which names whichever filter emptied
+    the list.
+
+    Three conditions, each excluding a case that would make the marker lie:
+
+    * `MustGather` with a layer. `PreferGather` never refuses, so an unplaced
+      member there is a capacity fact with nothing to do with gather.
+    * A weight-bearing member already placed. That is what makes the floor
+      *active*: the filter anchors on the group's placed members, so with none
+      of them placed there is no domain to be kept inside. It is also what
+      excludes formation, which is refused by the solver rather than the filter
+      and fails scheduling with the shortfall named -- a different report.
+    * An unplaced member older than the dwell, so an ordinary scale-up does not
+      wear the marker during the seconds between its row being created and the
+      scheduler reaching it.
+    """
+    from gpustack.schemas.models import GatherStrategyEnum, role_takes_no_accelerator
+
+    gather = getattr(model, "gather", None)
+    layer = getattr(gather, "layer", None)
+    if not layer or getattr(gather, "strategy", None) != GatherStrategyEnum.MUST_GATHER:
+        return False
+
+    # 🔴 Weight-bearing only, and for the same reason the filter anchors on
+    # those alone (`role_demands` excludes the router): a router holds no
+    # weights, so it is subject to the floor without being what defines it.
+    # A group whose router happened to be placed first has established no
+    # domain, and treating it as an anchor would arm the marker during
+    # formation -- the one case this has to stay quiet through.
+    #
+    # Collected as generations rather than as a yes/no, because the scope of
+    # the second question follows from it: a generation being torn down and
+    # rebuilt has unplaced rows of its own, and counting those would put the
+    # marker on a restart -- which is a group forming again, i.e. exactly the
+    # case above. An orphan carrying no `group_id` anchors nothing for the same
+    # reason it is not a member of anything.
+    anchored_groups = {
+        instance.group_id
+        for instance in instances
+        if instance.worker_id is not None
+        and instance.group_id is not None
+        and not role_takes_no_accelerator(model, instance.role)
+    }
+    if not anchored_groups:
+        return False
+
+    now = datetime.now(timezone.utc)
+    dwell = envs.SCHEDULER_GATHER_BLOCKED_DWELL_SECONDS
+    for instance in instances:
+        if instance.worker_id is not None or instance.group_id not in anchored_groups:
+            continue
+        created = getattr(instance, "created_at", None)
+        if created is None:
+            # A row with no stamp cannot be shown to have waited. Silence is
+            # the honest answer -- the alternative reports every such member as
+            # blocked the instant it appears, which is the flashing this dwell
+            # exists to prevent.
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() >= dwell:
+            return True
+    return False
+
+
 def _leaves_of(node) -> List:
     """Every host node under `node`."""
     if not node:
@@ -2769,6 +2859,14 @@ async def _degradation_reasons(
     if await _gather_unmet(session, model, instances):
         # Says what the spec cannot: the ask is stored, the outcome was not.
         reasons.append(DegradationReasonEnum.GATHER_UNMET.value)
+
+    if _gather_blocked_scale_out(model, instances):
+        # The complement of the marker above, and the case that actually
+        # happens: `GatherFloorFilter` refusing a member *successfully*. That
+        # refusal is the strategy working, which is why it is a marker and not
+        # an error -- but it was reported nowhere on the model, so a scale-up
+        # that will never complete looked exactly like one still in flight.
+        reasons.append(DegradationReasonEnum.GATHER_BLOCKED_SCALE_OUT.value)
 
     if await _no_atomic_admission(session, model):
         # A property of the configuration, so it is true from the moment the

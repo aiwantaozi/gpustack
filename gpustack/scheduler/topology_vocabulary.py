@@ -664,19 +664,3 @@ def english_label(name: str) -> str:
     The UI ignores this and renders ``displayName or t(name)`` itself, which is
     why an operator's own wording never passes through here."""
     return _ENGLISH.get(name, name)
-
-
-def labels_of(resolved: ResolvedTopology) -> Dict[str, str]:
-    """Layer id -> what to call it, for a server-side sentence.
-
-    ``display_name`` when the operator set one, the English fallback
-    otherwise. Built once per request and passed down rather than recomputed
-    per rung, because the callers that need it (gather feasibility) name
-    several layers in one response.
-    """
-    out = {
-        layer.id: layer.display_name or english_label(layer.name)
-        for layer in resolved.layers
-    }
-    out[NODE_LAYER] = resolved.host_display_name or english_label(NODE_LAYER_SLUG)
-    return out

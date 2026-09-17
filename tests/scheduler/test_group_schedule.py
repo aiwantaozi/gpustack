@@ -207,9 +207,13 @@ def _candidate(worker_id: int, gpu_indexes):
 async def _run(placement, commit_map=None, topology=None, group_instances=None):
     cluster = SimpleNamespace(id=1, topology=topology)
     model = _model()
+    # `cluster_id` is spelled out because `schedule_group` narrows the fleet to
+    # the model's own cluster before it builds the tree — `Worker.all` hands it
+    # every cluster's workers — and a stand-in without the field is not a
+    # worker any of those paths could ever receive.
     workers = [
-        SimpleNamespace(id=1, name="w1", labels={}, status=None),
-        SimpleNamespace(id=2, name="w2", labels={}, status=None),
+        SimpleNamespace(id=1, name="w1", labels={}, status=None, cluster_id=1),
+        SimpleNamespace(id=2, name="w2", labels={}, status=None, cluster_id=1),
     ]
     rows = (
         group_instances

@@ -675,6 +675,46 @@ async def test_e_a_fleet_that_is_merely_full_says_so_in_placements(config):
     assert "could not be measured" not in messages[0]
 
 
+@pytest.mark.asyncio
+async def test_e_a_label_selector_matching_nothing_is_a_measured_zero(config):
+    """🔴 A filter that excluded every worker measured the cluster; it did not
+    fail to.
+
+    From a live e2e run: a group whose `worker_selector` named a label no
+    worker carries was refused with "the cluster has room for 0, but capacity
+    could not be measured on 17 worker(s) — the shortfall may be smaller than
+    it looks, or there may be none". Nothing was unmeasurable. The filters had
+    answered, definitively, about every worker, and the hedge sent the reader
+    looking for a broken agent instead of at the typo in their own selector —
+    while the single-instance path, given the same selector, printed "Matched
+    0/3 workers by label selector".
+
+    So both halves are asserted. The wording must be the plain count, with no
+    telemetry clause; and the refusal must carry the filters' own lines, which
+    are the only place the *reason* for the zero is written down.
+    """
+    model = _pd_model(2, 2)
+    model.worker_selector = {"worker-name": "no-such-worker-e2e"}
+
+    placed, messages = await _place(config, model, _fleet("A100x2", 3))
+
+    assert placed is None
+    assert messages[0] == (
+        "The group needs 4 placements and the cluster has room for 0."
+    )
+    assert "could not be measured" not in messages[0]
+    # The note the single-instance path prints, now on this one too. Matched
+    # as a prefix because the backend appends its own aside about Linux.
+    assert any(
+        "Matched 0/3 workers by label selector: "
+        "{'worker-name': 'no-such-worker-e2e'}." in message
+        for message in messages[1:]
+    ), messages
+    assert any(
+        "Matched 3 workers by cluster selector." in message for message in messages[1:]
+    ), messages
+
+
 # --- F. members wider than one machine -------------------------------------- #
 
 
@@ -756,3 +796,77 @@ async def test_f_a_role_that_fits_one_machine_never_spans(config):
 
     assert placed is not None
     assert len(placed["prefill"][0][1]) == 4
+
+
+# --- G. the fleet is one cluster's, not the whole server's ------------------ #
+
+
+def _foreign(workers, cluster_id: int = 2):
+    """Move these machines to another cluster, the way `Worker.all` finds them.
+
+    `_fleet` stamps `cluster_id = 1` on everything because `ClusterFilter` is
+    real here; this undoes it for the hosts a test wants present-but-forbidden.
+    """
+    for worker in workers:
+        worker.cluster_id = cluster_id
+    return workers
+
+
+@pytest.mark.asyncio
+async def test_g_the_tree_is_built_over_one_cluster_not_the_whole_fleet(config):
+    """🔴 `schedule_group` is handed `Worker.all(session)` — every worker this
+    server knows, in every cluster — and must narrow it before it builds
+    anything.
+
+    The two sibling paths already do: the per-instance topology read spells
+    `[w for w in workers if w.cluster_id == model.cluster_id]`, and
+    `evaluate_group` is only ever given one cluster's workers because its
+    caller groups them first. This one did not, and an e2e run on a 3-worker
+    cluster inside a 17-worker fleet was refused "capacity could not be
+    measured on 17 worker(s)" — fourteen machines the deployment could never
+    have used, and nothing an operator did to them could change the answer.
+
+    The tree is the assertion because it is where the damage is: every foreign
+    host becomes a domain of its own that the solver walks and pays a full
+    selector sweep on, and the sweep can only ever answer zero — `ClusterFilter`
+    sits at the head of the capacity chain. That last fact is also why the
+    *refusal* below reads the same either way, so it is asserted too but it is
+    not the thing under test: with filtered-out workers now counted as measured
+    zeros (see section E), foreign hosts are invisible in the numbers and only
+    the tree and the wasted sweeps give them away.
+
+    `build_view` and `GroupCapacity` are wrapped, not replaced — both spies
+    call straight through, so the placement below is still decided by the real
+    tree and the real selectors, which is the rule this file is built on.
+    """
+    own = _fleet("A100x2", 1)
+    foreign = _foreign(_fleet("H100x8", 2))
+    seen: Dict[str, List[int]] = {}
+
+    real_build_view = group_schedule.build_view
+    real_capacity = group_schedule.GroupCapacity
+
+    def spy_build_view(topology, workers):
+        seen["tree"] = sorted(w.id for w in workers)
+        return real_build_view(topology, workers)
+
+    def spy_capacity(config_, model, workers, *args, **kwargs):
+        seen["measured"] = sorted(w.id for w in workers)
+        return real_capacity(config_, model, workers, *args, **kwargs)
+
+    with (
+        patch.object(group_schedule, "build_view", spy_build_view),
+        patch.object(group_schedule, "GroupCapacity", spy_capacity),
+    ):
+        placed, messages = await _place(config, _pd_model(2, 2), own + foreign)
+
+    # Host 8 is this model's cluster; 22 and 23 belong to another one.
+    assert seen["tree"] == [8]
+    assert seen["measured"] == [8]
+
+    # And the counts are the single-cluster counts: two cards, four members.
+    assert placed is None
+    assert messages[0] == (
+        "The group needs 4 placements and the cluster has room for 2."
+    )
+    assert "could not be measured" not in messages[0]

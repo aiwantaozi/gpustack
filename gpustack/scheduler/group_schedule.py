@@ -127,8 +127,21 @@ async def schedule_group(
     cluster = (
         await Cluster.one_by_id(session, model.cluster_id) if model.cluster_id else None
     )
+    # 🔴 The model's own cluster, and only it. `workers` arrives from
+    # `Worker.all(session)` — every worker this server knows, across every
+    # cluster — and both sibling paths narrow it before they use it: the
+    # per-instance topology read spells the same comprehension, and
+    # `evaluate_group` is never handed more than one cluster's workers because
+    # its caller groups them first. Left whole, the tree is built over hosts
+    # this deployment can never land on: the solver walks a foreign single-host
+    # domain per foreign worker and pays a full selector sweep on each, and the
+    # refusal then counts them. An e2e run on a 3-worker cluster inside a
+    # 17-worker fleet was refused with "capacity could not be measured on 17
+    # worker(s)" — fourteen of which were never candidates and nothing an
+    # operator did to them could have changed the answer.
+    in_cluster = [w for w in workers if w.cluster_id == model.cluster_id]
     try:
-        view = build_view(cluster.topology if cluster else None, workers)
+        view = build_view(cluster.topology if cluster else None, in_cluster)
     except TopologyError as e:
         # A declaration that cannot become a tree is an operator error, not a
         # capacity one. Refusing the group with the reason beats placing it
@@ -143,7 +156,15 @@ async def schedule_group(
     # a host running one has fewer ports for the group — and a group is placed
     # onto cache-bearing hosts on purpose, not by accident.
     cache_instances = await cache_instances_in(session, model.cluster_id)
-    capacity = GroupCapacity(config, model, workers, model_instances, cache_instances)
+    # The same narrowed list the tree was built from. `ClusterFilter` inside
+    # `GroupCapacity` would reach the same verdict, but it would reach it after
+    # the foreign workers have already been counted into the "matched N by
+    # cluster selector" line the refusal now carries — and a capacity function
+    # that measures workers the solver was never offered is one more place for
+    # the two to disagree.
+    capacity = GroupCapacity(
+        config, model, in_cluster, model_instances, cache_instances
+    )
     # One chain, walked from the host upward. Picking which chain to walk used
     # to be a step here — the layer name was looked up to decide whether the
     # search followed the network rungs or the accelerator ones — and it is

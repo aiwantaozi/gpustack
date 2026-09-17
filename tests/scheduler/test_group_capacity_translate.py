@@ -283,3 +283,67 @@ async def test_a_worker_that_reports_no_memory_is_unknown_not_full():
 
     assert 1 not in slots
     assert slots[2] == 2
+
+
+@pytest.mark.asyncio
+async def test_every_worker_filtered_out_is_a_measured_zero_not_a_gap():
+    """🔴 The other half of the rule above, and the one that reads backwards.
+
+    An empty `eligible` is not an empty measurement: it is the filter chain
+    having ruled out every worker on purpose. Reported as absence it made the
+    solver count the whole cluster as unmeasurable, and a group whose
+    `worker_selector` named a label no worker carries was refused with "the
+    cluster has room for 0, but capacity could not be measured on 17 worker(s)
+    — the shortfall may be smaller than it looks, or there may be none". The
+    selector was a typo and nothing was unmeasured.
+    """
+    workers = [_worker(1), _worker(2)]
+    cap = _dealing_capacity(workers, ("prefill",))
+    cap._eligible["prefill"] = {}
+
+    slots = await cap(role="prefill", worker_ids=[1, 2], already_placed=[])
+
+    assert slots == {1: 0, 2: 0}
+
+
+# --- the refusal's two kinds of note ---------------------------------------- #
+
+
+def test_filter_notes_come_first_and_are_not_crowded_out_by_capacity_notes():
+    """Why the filters' messages are kept in a list of their own.
+
+    `_MAX_NOTES` caps the capacity notes because on a wide fleet they are one
+    line per equally-full worker, and a refusal nobody reads to the end
+    explains nothing. Pushed through the same budget, those per-worker lines
+    arrive first and evict the two that carry the answer — "Matched 0/N workers
+    by label selector", which names the mistake, and the VRAM claim, which is
+    the only number in the refusal an operator can act on.
+
+    So: two lists, one cap, filter lines first, and the cap still applied to
+    the capacity ones.
+    """
+    cap = _capacity([_worker(1)])
+    label = "Matched 0/3 workers by label selector: {'worker-name': 'nope'}."
+    cap._filter_notes["prefill"] = [label]
+    cap._remember_notes(
+        "prefill",
+        ["The model requires approximately 20.31 GiB of VRAM."]
+        + [f"Worker w{n} has no room." for n in range(10)],
+    )
+
+    notes = cap.notes_for("prefill")
+
+    assert notes[0] == label
+    assert "The model requires approximately 20.31 GiB of VRAM." in notes
+    # The cap still bounds the per-worker half, and only that half.
+    assert len(notes) == 1 + GroupCapacity._MAX_NOTES
+
+
+def test_a_note_both_sides_produced_is_reported_once():
+    """The same sentence twice in a refusal reads as two separate findings."""
+    cap = _capacity([_worker(1)])
+    both = "Matched 1 worker by cluster selector."
+    cap._filter_notes["prefill"] = [both]
+    cap._remember_notes("prefill", [both, "The model requires 20.31 GiB."])
+
+    assert cap.notes_for("prefill") == [both, "The model requires 20.31 GiB."]

@@ -117,6 +117,19 @@ class GroupCapacity:
         # what stood in its way, and without them the two refusal paths
         # describe the same cluster in incomparable units.
         self._notes: Dict[str, List[str]] = {}
+        # role -> what the FILTER CHAIN said while narrowing the fleet, kept in
+        # a list of its own rather than pushed through `_remember_notes`.
+        # 🔴 The separation is the point: `_MAX_NOTES` caps the capacity notes
+        # because on a fleet of equally-full workers those are one line per
+        # worker, and a refusal nobody reads to the end explains nothing. The
+        # filter lines are one per filter and they are the ones that name the
+        # *mistake* — "Matched 0/3 workers by label selector: {...}" — so
+        # sharing the budget would let a wide fleet's per-worker lines crowd
+        # out either those or "The model requires approximately X GiB of VRAM",
+        # which is the note the whole refusal is measured against. Two lists,
+        # one cap, and `notes_for` puts the filter lines first because they
+        # explain why the capacity lines are about so few workers.
+        self._filter_notes: Dict[str, List[str]] = {}
         # (role, primary worker id) -> the machines one member of that role
         # occupies, primary first. Empty for every role that fits on a single
         # machine, which is every role placed today.
@@ -136,9 +149,19 @@ class GroupCapacity:
         about what the first one took.
         """
         eligible = await self._eligible_for(role)
-        if not eligible:
-            return {}
-
+        # 🔴 No early return when nothing is eligible. An empty `eligible` is
+        # not a gap in what we know — it is the filter chain having excluded
+        # every worker on purpose, which is a measured zero and exactly the
+        # verdict the per-worker branch below reaches one worker at a time
+        # (`eligible.get(worker_id) is None` -> `out[worker_id] = 0`). Handing
+        # back `{}` made the solver read every worker as unmeasured, and an
+        # e2e run whose `worker_selector` named a label no worker carries was
+        # refused with "the cluster has room for 0, but capacity could not be
+        # measured on 17 worker(s) — the shortfall may be smaller than it looks,
+        # or there may be none": a hedge about broken telemetry put in front of
+        # an operator whose selector was simply a typo, while the
+        # single-instance path answered the same question with "Matched 0/3
+        # workers by label selector".
         projected = self._projected[role]
         instances = self._model_instances + self._translate(already_placed)
         limit = self._limit_for(role)
@@ -248,6 +271,14 @@ class GroupCapacity:
             if worker_id in eligible and not _reports_no_memory(eligible[worker_id])
         ]
         if len(usable) < 2:
+            # Fewer than two machines to combine, so there is no combination to
+            # try and `measured` is already the whole answer. This is also the
+            # door the all-filtered-out case leaves by: with nothing eligible,
+            # `usable` is empty and every entry in `measured` is the definite
+            # zero the caller just wrote. Nothing above it reads `eligible`
+            # except through `worker_ids`, and `self._projected[role]` is
+            # written by `_eligible_for` before it filters anything, so both
+            # reads on the way here hold for a role no worker can host.
             return measured
 
         offer = await count_offer_slots(
@@ -312,10 +343,27 @@ class GroupCapacity:
                 kept.append(text)
 
     def notes_for(self, role: Optional[str]) -> List[str]:
-        """Why this role found no room, for a caller building a refusal."""
+        """Why this role found no room, for a caller building a refusal.
+
+        Filter notes first, capacity notes after, and the order is the reading
+        order: which workers were even considered, and only then what one
+        member costs on them. A refusal that opens with "the largest worker
+        offered 576 GiB" after a selector matched nothing is answering a
+        question about a fleet the deployment was never allowed to use.
+
+        Deduplicated across the two lists as well as within them: a filter and
+        a selector can reach the same sentence about the same worker, and the
+        same line twice in a refusal reads as two separate findings.
+        """
         if not role:
             return []
-        return list(self._notes.get(role, []))
+        out: List[str] = []
+        for note in list(self._filter_notes.get(role, [])) + list(
+            self._notes.get(role, [])
+        ):
+            if note not in out:
+                out.append(note)
+        return out
 
     def _within_port_budget(self, role: str, worker_id: int, offer) -> int:
         """`offer.slots`, capped by what the host has ports for.
@@ -485,7 +533,15 @@ class GroupCapacity:
             ]
         )
         try:
-            kept, _ = await chain.filter(list(self._workers.values()))
+            # The second half of that tuple is why a worker is not here, in the
+            # filters' own words, and it used to be dropped on the floor. It is
+            # the same text `find_candidate` prints on the single-instance path
+            # ("Matched 3 workers by cluster selector.", "Matched 0/3 workers by
+            # label selector: {'worker-name': ...}."), and without it a group
+            # refusal could count members but never say that the count is zero
+            # because a selector matched nothing — the two paths described the
+            # same cluster and only one of them named the reason.
+            kept, messages = await chain.filter(list(self._workers.values()))
         except Exception as e:
             # A broken filter is not an empty cluster. Returning nothing here
             # would make every domain look too small and the refusal would
@@ -497,6 +553,20 @@ class GroupCapacity:
                 e,
             )
             kept = list(self._workers.values())
+            # No messages either: the chain stopped part-way, so whatever it
+            # had said so far describes a narrowing that was then thrown away.
+            # Repeating it beside a fleet we are deliberately treating as
+            # wholly eligible would contradict the very list we return.
+            messages = []
+
+        # Deduplicated and stripped here rather than in `notes_for`, because
+        # this runs once per role (the result is cached on `_eligible`) while
+        # `notes_for` runs once per refusal read.
+        filter_notes = self._filter_notes.setdefault(role, [])
+        for message in messages:
+            text = (message or "").strip()
+            if text and text not in filter_notes:
+                filter_notes.append(text)
 
         self._eligible[role] = {w.id: w for w in kept}
         return self._eligible[role]

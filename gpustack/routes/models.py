@@ -298,7 +298,9 @@ async def get_model_pd_metrics(
     # marker is this value at exactly zero, and a second implementation of one
     # number is how a marker and a figure come to disagree.
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
-    result.pairing_locality = pairing_locality(model, instances)
+    locality = pairing_locality(model, instances)
+    result.pairing_locality = locality.value
+    result.pairing_locality_source = locality.source
     return result
 
 

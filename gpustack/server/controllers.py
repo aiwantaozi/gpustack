@@ -7,7 +7,7 @@ import asyncio
 from datetime import datetime, timezone
 from importlib.resources import files
 from functools import partial
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional, Set
+from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Tuple, Optional, Set
 from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -2424,9 +2424,37 @@ async def reconcile_route_target_states(session: AsyncSession, model: Model) -> 
     return changed
 
 
+class PairingLocality(NamedTuple):
+    """The locality figure and why it reads the way it does.
+
+    Two fields rather than one because `None` was already carrying two
+    meanings and is about to carry a third, and they call for different
+    things on screen: "not yet" becomes a number later, "never" does not.
+    A code rather than a magic value, following `status` and
+    `request_count_source` on the same response -- a reader should not have
+    to know that -1 means anything.
+    """
+
+    value: Optional[float]
+    source: str
+
+
+#: The question has not been asked yet: no group, or a role with no running
+#: member. It will have an answer once the members are up.
+LOCALITY_UNKNOWN = "unknown"
+#: Measured from where the members landed. `value` is the figure.
+LOCALITY_MEASURED = "measured"
+#: The roles hold disjoint machines *and* at least one member spans more than
+#: one -- so the zero is a fact about the shape of the deployment rather than
+#: a placement that could have gone better. Rendering it as a verdict would
+#: put a permanent degradation on exactly the deployments that need to span,
+#: and it is not one an operator can act on.
+LOCALITY_SPANNING = "spanning_members"
+
+
 def pairing_locality(
     model: Model, instances: Sequence[ModelInstance]
-) -> Optional[float]:
+) -> PairingLocality:
     """The chance a request's KV transfer stays inside one host.
 
     Not "how many pairs are local", because nothing pairs them: the router
@@ -2450,11 +2478,12 @@ def pairing_locality(
     falls below `1/x` all the way to 0 — which the group solver's round-robin
     dealing exists to prevent, and which manual card selection still reaches.
 
-    None when the question does not apply — not a group, or a role with no
-    running member, where 0 would read as a verdict rather than as silence.
+    `value` is None when the question does not apply — not a group, or a role
+    with no running member, where 0 would read as a verdict rather than as
+    silence — and `source` says which kind of silence it is.
     """
     if not model.roles:
-        return None
+        return PairingLocality(None, LOCALITY_UNKNOWN)
 
     by_role: Dict[str, Dict[int, int]] = {}
     for instance in instances:
@@ -2471,14 +2500,47 @@ def pairing_locality(
     prefill = by_role.get(RoleNameEnum.PREFILL.value) or {}
     decode = by_role.get(RoleNameEnum.DECODE.value) or {}
     if not prefill or not decode:
-        return None
+        return PairingLocality(None, LOCALITY_UNKNOWN)
 
     prefill_total = sum(prefill.values())
     decode_total = sum(decode.values())
-    return sum(
+    value = sum(
         (count / prefill_total) * (decode.get(worker_id, 0) / decode_total)
         for worker_id, count in prefill.items()
     )
+
+    # 🔴 Zero with a spanning member is not the zero this figure was written
+    # for. A member that occupies several machines leaves the two roles on
+    # disjoint sets of them, so the arithmetic bottoms out for a reason that
+    # has nothing to do with how well the group was placed -- and the marker
+    # derived from it would then sit permanently on precisely the deployments
+    # that have to span, saying something no operator can act on. Reported as
+    # a kind of silence instead, with the reason attached.
+    #
+    # Only when the value is zero: a member spanning machines with the roles
+    # still sharing one (manual card selection reaches this) is an ordinary
+    # measurement and stays one.
+    if value == 0 and _spans_machines(model, instances):
+        return PairingLocality(None, LOCALITY_SPANNING)
+    return PairingLocality(value, LOCALITY_MEASURED)
+
+
+def _spans_machines(model: Model, instances: Sequence[ModelInstance]) -> bool:
+    """Whether any weight-bearing member occupies more than one worker.
+
+    Read off `distributed_servers`, which is where a member records the
+    workers it holds besides its own -- the field every other consumer of
+    "where is this member" still forgets (see `_gather_unmet`).
+    """
+    from gpustack.schemas.models import role_takes_no_accelerator
+
+    for instance in instances:
+        if role_takes_no_accelerator(model, instance.role):
+            continue
+        servers = getattr(instance, "distributed_servers", None)
+        if servers and getattr(servers, "subordinate_workers", None):
+            return True
+    return False
 
 
 async def _no_atomic_admission(session: AsyncSession, model: Model) -> bool:
@@ -2655,7 +2717,7 @@ def _pairing_remote(model: Model, instances: Sequence[ModelInstance]) -> bool:
     being strictly worse than not disaggregating (§0.2 T4).
     """
     locality = pairing_locality(model, instances)
-    return locality is not None and locality == 0
+    return locality.value is not None and locality.value == 0
 
 
 async def _degradation_reasons(

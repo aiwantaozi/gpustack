@@ -350,6 +350,27 @@ class PDMetricsPublic(BaseModel):
     drift, and the marker and the figure disagreeing is worse than either
     being absent."""
 
+    pairing_locality_source: str = "unknown"
+    """Why `pairing_locality` reads the way it does, so a blank is not read as
+    a broken panel.
+
+    - `measured` — the figure above is the answer.
+    - `unknown` — no group, or a role with no running member yet. It will have
+      an answer once they are up.
+    - `spanning_members` — the roles hold disjoint machines *and* at least one
+      member occupies more than one, so the zero is a fact about the shape of
+      the deployment rather than a placement that could have gone better.
+
+    A code rather than a sentinel number, like `status` and
+    `request_count_source` above: nothing should have to know that -1 means
+    something.
+
+    🔴 The `pairing_remote` degradation comes out of the same function, so
+    `spanning_members` suppresses it for free — which is the property that
+    keeps the marker from contradicting the figure printed beside it. Without
+    that, a deployment whose members have to span machines would carry a
+    permanent degradation naming something no operator can act on."""
+
 
 def _selectors(model_id: int, counted_role: str) -> dict:
     """What each declared scope expands to.

@@ -28,7 +28,7 @@ def _instance(role, worker_id, state=ModelInstanceStateEnum.RUNNING):
 
 def test_one_host_makes_every_transfer_local():
     instances = [_instance("prefill", 1), _instance("decode", 1)]
-    assert pairing_locality(_model(), instances) == 1.0
+    assert pairing_locality(_model(), instances).value == 1.0
     assert _pairing_remote(_model(), instances) is False
 
 
@@ -40,7 +40,7 @@ def test_roles_split_across_hosts_can_never_be_local():
         _instance("decode", 2),
         _instance("decode", 2),
     ]
-    assert pairing_locality(_model(), instances) == 0.0
+    assert pairing_locality(_model(), instances).value == 0.0
     assert _pairing_remote(_model(), instances) is True
 
 
@@ -55,7 +55,7 @@ def test_an_even_spread_reproduces_the_one_over_x_ceiling():
     for x in (2, 3, 4):
         instances = [_instance("prefill", w) for w in range(1, x + 1)]
         instances += [_instance("decode", w) for w in range(1, x + 1)]
-        assert pairing_locality(_model(), instances) == pytest.approx(1 / x)
+        assert pairing_locality(_model(), instances).value == pytest.approx(1 / x)
         assert _pairing_remote(_model(), instances) is False
 
 
@@ -74,17 +74,17 @@ def test_packing_the_same_group_tighter_beats_one_over_x():
     # m == x: one prefill and one decode per host.
     spread = [_instance("prefill", w) for w in range(1, 5)]
     spread += [_instance("decode", w) for w in range(1, 5)]
-    assert pairing_locality(_model(), spread) == pytest.approx(1 / 4)
+    assert pairing_locality(_model(), spread).value == pytest.approx(1 / 4)
 
     # m == 2: two of each per host.
     packed = [_instance("prefill", w) for w in (1, 1, 2, 2)]
     packed += [_instance("decode", w) for w in (1, 1, 2, 2)]
-    assert pairing_locality(_model(), packed) == pytest.approx(1 / 2)
+    assert pairing_locality(_model(), packed).value == pytest.approx(1 / 2)
 
     # m == 1.
     single = [_instance("prefill", 1) for _ in range(4)]
     single += [_instance("decode", 1) for _ in range(4)]
-    assert pairing_locality(_model(), single) == pytest.approx(1.0)
+    assert pairing_locality(_model(), single).value == pytest.approx(1.0)
 
 
 def test_spreading_past_one_pair_per_host_falls_below_the_floor():
@@ -97,7 +97,7 @@ def test_spreading_past_one_pair_per_host_falls_below_the_floor():
     """
     unmixed = [_instance("prefill", w) for w in (1, 2)]
     unmixed += [_instance("decode", w) for w in (3, 4)]
-    assert pairing_locality(_model(), unmixed) == 0.0
+    assert pairing_locality(_model(), unmixed).value == 0.0
     assert _pairing_remote(_model(), unmixed) is True
 
 
@@ -108,7 +108,7 @@ def test_a_partial_overlap_is_between_the_two():
         _instance("prefill", 2),
         _instance("decode", 1),
     ]
-    assert pairing_locality(_model(), instances) == pytest.approx(0.5)
+    assert pairing_locality(_model(), instances).value == pytest.approx(0.5)
     assert _pairing_remote(_model(), instances) is False
 
 
@@ -120,7 +120,7 @@ def test_only_running_members_count():
         _instance("decode", 2),
         _instance("decode", 1, state=ModelInstanceStateEnum.INITIALIZING),
     ]
-    assert pairing_locality(_model(), instances) == 0.0
+    assert pairing_locality(_model(), instances).value == 0.0
 
 
 def test_the_router_is_not_part_of_the_pairing():
@@ -130,7 +130,7 @@ def test_the_router_is_not_part_of_the_pairing():
         _instance("decode", 1),
         _instance("router", 2),
     ]
-    assert pairing_locality(_model(), instances) == 1.0
+    assert pairing_locality(_model(), instances).value == 1.0
 
 
 @pytest.mark.parametrize(
@@ -148,11 +148,102 @@ def test_silence_rather_than_zero_when_the_question_does_not_apply(instances):
     A role with no running member has no placement to judge, and reporting 0
     there would mark every group PAIRING_REMOTE for the whole window between
     the first member starting and the last."""
-    assert pairing_locality(_model(), instances) is None
+    assert pairing_locality(_model(), instances).value is None
     assert _pairing_remote(_model(), instances) is False
 
 
 def test_a_model_without_roles_is_not_a_group():
     model = SimpleNamespace(roles=None)
-    assert pairing_locality(model, [_instance("prefill", 1)]) is None
+    assert pairing_locality(model, [_instance("prefill", 1)]).value is None
     assert _pairing_remote(model, [_instance("prefill", 1)]) is False
+
+
+# --- a member that spans machines -------------------------------------------- #
+
+
+def _spanning(role, worker_id, others, state=ModelInstanceStateEnum.RUNNING):
+    """A member holding `worker_id` plus the workers in `others`.
+
+    The extra machines live on `distributed_servers`, which is where a
+    multi-worker instance records them and which every other "where is this
+    member" reader in the server still forgets.
+    """
+    return SimpleNamespace(
+        role=role,
+        worker_id=worker_id,
+        state=state,
+        distributed_servers=SimpleNamespace(
+            subordinate_workers=[SimpleNamespace(worker_id=w) for w in others]
+        ),
+    )
+
+
+def test_a_spanning_member_turns_the_zero_into_silence():
+    """🔴 A member on several machines leaves the two roles on disjoint sets of
+    them, so the arithmetic bottoms out for a reason that has nothing to do
+    with how well the group was placed. Printed as a verdict it would put a
+    permanent degradation on exactly the deployments that have to span, naming
+    something no operator can act on."""
+    instances = [
+        _spanning("prefill", 1, [2]),
+        _spanning("decode", 3, [4]),
+    ]
+
+    locality = pairing_locality(_model(), instances)
+
+    assert locality.value is None
+    assert locality.source == "spanning_members"
+
+
+def test_the_marker_goes_quiet_with_it():
+    """Same function, so the suppression is not a second decision that could
+    disagree with the figure printed beside it."""
+    instances = [
+        _spanning("prefill", 1, [2]),
+        _spanning("decode", 3, [4]),
+    ]
+
+    assert _pairing_remote(_model(), instances) is False
+
+
+def test_a_spanning_member_sharing_a_host_is_still_measured():
+    """Manual card selection reaches this: a member across two machines with
+    room left on one of them, and a peer placed there. The roles do share a
+    host, so this is an ordinary measurement and must stay one."""
+    instances = [
+        _spanning("prefill", 1, [2]),
+        _instance("decode", 1),
+    ]
+
+    locality = pairing_locality(_model(), instances)
+
+    assert locality.value == 1.0
+    assert locality.source == "measured"
+
+
+def test_single_machine_members_keep_reporting_zero():
+    """The case the marker was written for: pick host A's cards for prefill and
+    host B's for decode and nothing spans anything. That zero is a placement
+    that could have gone better, and it must keep saying so."""
+    instances = [_instance("prefill", 1), _instance("decode", 2)]
+
+    locality = pairing_locality(_model(), instances)
+
+    assert locality.value == 0.0
+    assert locality.source == "measured"
+    assert _pairing_remote(_model(), instances) is True
+
+
+def test_the_router_does_not_make_a_group_look_spanning():
+    """It occupies no accelerator and is excluded everywhere else for that
+    reason; a router with subordinates would otherwise silence the figure for
+    the two roles that do the pairing."""
+    instances = [
+        _instance("prefill", 1),
+        _instance("decode", 2),
+        _spanning("router", 3, [4]),
+    ]
+
+    assert pairing_locality(
+        _model(("prefill", "decode", "router")), instances
+    ).source == ("measured")

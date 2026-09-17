@@ -2,7 +2,7 @@ import logging
 from typing import List, Optional, Sequence, Tuple
 
 from gpustack.policies.base import WorkerFilter
-from gpustack.schemas.models import ModelInstance
+from gpustack.schemas.models import ModelInstance, member_worker_ids
 from gpustack.schemas.workers import Worker
 from gpustack.scheduler.topology_view import TopologyView
 
@@ -62,11 +62,15 @@ class GatherFloorFilter(WorkerFilter):
             return workers, []
 
         anchors = {
-            instance.worker_id
+            worker_id
             for instance in self._model_instances
             if instance.group_id == self._group_id
-            and instance.worker_id is not None
             and instance.role in self._weight_bearing
+            # Every machine the member holds, not only the one its row is
+            # filed under: a member that spans machines is *in* the domain on
+            # all of them, and anchoring on the primary alone would let the
+            # floor be computed from a partial picture of where the group is.
+            for worker_id in member_worker_ids(instance)
         }
         if not anchors:
             # Nothing placed yet. Either this is the formation -- which does not

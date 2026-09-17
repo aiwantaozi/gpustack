@@ -63,6 +63,7 @@ from gpustack.schemas.models import (
     RoleStatus,
     SourceEnum,
     get_backend,
+    member_worker_ids,
     role_effective_model,
 )
 from gpustack.schemas.gpu_instance_types import GPUInstanceType
@@ -2492,10 +2493,9 @@ def pairing_locality(
             continue
         if instance.state != ModelInstanceStateEnum.RUNNING:
             continue
-        if instance.worker_id is None:
-            continue
-        by_role.setdefault(role, {})
-        by_role[role][instance.worker_id] = by_role[role].get(instance.worker_id, 0) + 1
+        for worker_id in member_worker_ids(instance):
+            by_role.setdefault(role, {})
+            by_role[role][worker_id] = by_role[role].get(worker_id, 0) + 1
 
     prefill = by_role.get(RoleNameEnum.PREFILL.value) or {}
     decode = by_role.get(RoleNameEnum.DECODE.value) or {}
@@ -2509,18 +2509,23 @@ def pairing_locality(
         for worker_id, count in prefill.items()
     )
 
-    # 🔴 Zero with a spanning member is not the zero this figure was written
-    # for. A member that occupies several machines leaves the two roles on
-    # disjoint sets of them, so the arithmetic bottoms out for a reason that
-    # has nothing to do with how well the group was placed -- and the marker
-    # derived from it would then sit permanently on precisely the deployments
-    # that have to span, saying something no operator can act on. Reported as
-    # a kind of silence instead, with the reason attached.
+    # 🔴 **The formula does not survive a member that spans machines**, and the
+    # first cut of this guard only caught the case where it happened to bottom
+    # out at zero. It is wrong more widely than that.
     #
-    # Only when the value is zero: a member spanning machines with the roles
-    # still sharing one (manual card selection reaches this) is an ordinary
-    # measurement and stays one.
-    if value == 0 and _spans_machines(model, instances):
+    # The sum assumes the router's two picks are independent *and* that each
+    # pick lands somewhere — true while an instance is one machine. KV is
+    # sharded by TP rank, so a decode rank needs particular prefill ranks'
+    # shards; once the ranks of one member are spread over several machines,
+    # whether a pair is local depends on the rank mapping, which this sum
+    # cannot see. Worked example: prefill on {1,2} and decode on {2,3} at equal
+    # TP, ranks laid out in order — every rank pair is remote, and the sum says
+    # 0.25.
+    #
+    # Absent beats wrong, and this figure is not decoration: `pairing_remote`
+    # is derived from it. So a spanning member is reported as a kind of
+    # silence, whatever the arithmetic came to.
+    if _spans_machines(model, instances):
         return PairingLocality(None, LOCALITY_SPANNING)
     return PairingLocality(value, LOCALITY_MEASURED)
 
@@ -2528,17 +2533,15 @@ def pairing_locality(
 def _spans_machines(model: Model, instances: Sequence[ModelInstance]) -> bool:
     """Whether any weight-bearing member occupies more than one worker.
 
-    Read off `distributed_servers`, which is where a member records the
-    workers it holds besides its own -- the field every other consumer of
-    "where is this member" still forgets (see `_gather_unmet`).
+    Read through `member_worker_ids`, the one place that knows a member is not
+    only the machine its row is filed under.
     """
     from gpustack.schemas.models import role_takes_no_accelerator
 
     for instance in instances:
         if role_takes_no_accelerator(model, instance.role):
             continue
-        servers = getattr(instance, "distributed_servers", None)
-        if servers and getattr(servers, "subordinate_workers", None):
+        if len(member_worker_ids(instance)) > 1:
             return True
     return False
 
@@ -2645,11 +2648,11 @@ async def _gather_unmet(
     # because the *proxy* landed on another host — a placement the solver
     # never constrained and would make again.
     worker_ids = {
-        instance.worker_id
+        worker_id
         for instance in instances
-        if instance.worker_id is not None
-        and instance.state == ModelInstanceStateEnum.RUNNING
+        if instance.state == ModelInstanceStateEnum.RUNNING
         and not role_takes_no_accelerator(model, instance.role)
+        for worker_id in member_worker_ids(instance)
     }
     # One member, or none placed yet: there is no distance between members to
     # be wrong about. Silence rather than a pass — the question has not been

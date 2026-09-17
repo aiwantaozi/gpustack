@@ -5,7 +5,7 @@ from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
     ScheduleCandidatesScorer,
 )
-from gpustack.schemas.models import ModelInstance
+from gpustack.schemas.models import ModelInstance, member_worker_ids
 from gpustack.scheduler.topology import (
     NODE_LAYER,
     ROOT_LAYER,
@@ -78,11 +78,13 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
             return candidates
 
         placed = {
-            instance.worker_id
+            worker_id
             for instance in self._model_instances
-            if instance.group_id == self._group_id
-            and instance.worker_id is not None
-            and instance.role in self._anchors
+            if instance.group_id == self._group_id and instance.role in self._anchors
+            # A member that spans machines is near a candidate from any of
+            # them; measuring only from its primary would call a candidate
+            # sharing a rack with the member's other half "far".
+            for worker_id in member_worker_ids(instance)
         }
         if not placed:
             # Nothing to be near yet. Every candidate scores zero and the

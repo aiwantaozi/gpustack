@@ -206,10 +206,20 @@ def test_the_marker_goes_quiet_with_it():
     assert _pairing_remote(_model(), instances) is False
 
 
-def test_a_spanning_member_sharing_a_host_is_still_measured():
-    """Manual card selection reaches this: a member across two machines with
-    room left on one of them, and a peer placed there. The roles do share a
-    host, so this is an ordinary measurement and must stay one."""
+def test_a_spanning_member_is_silence_even_when_the_roles_share_a_host():
+    """🔴 This asserted the opposite one commit ago, on the reading that a
+    shared host makes the sum an ordinary measurement. It does not.
+
+    The formula assumes each pick lands somewhere — true while an instance is
+    one machine. KV is sharded by TP rank, so a decode rank needs particular
+    prefill ranks' shards; once one member's ranks are spread over several
+    machines, whether a pair is local depends on the rank mapping, which a sum
+    over worker counts cannot see. Prefill on {1,2} and decode on {2,3} at
+    equal TP with ranks laid out in order: every rank pair is remote, and the
+    sum says 0.25.
+
+    Absent beats wrong, and this figure is not decoration — `pairing_remote`
+    is derived from it."""
     instances = [
         _spanning("prefill", 1, [2]),
         _instance("decode", 1),
@@ -217,8 +227,8 @@ def test_a_spanning_member_sharing_a_host_is_still_measured():
 
     locality = pairing_locality(_model(), instances)
 
-    assert locality.value == 1.0
-    assert locality.source == "measured"
+    assert locality.value is None
+    assert locality.source == "spanning_members"
 
 
 def test_single_machine_members_keep_reporting_zero():

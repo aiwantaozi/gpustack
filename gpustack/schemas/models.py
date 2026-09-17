@@ -1238,6 +1238,40 @@ def servable_instances(model, instances):
     ]
 
 
+def member_worker_ids(instance) -> List[int]:
+    """Every machine this instance occupies, not just the one it is filed under.
+
+    🔴 **One reader, because there were four and they disagreed.** An instance
+    that spans machines records the extra ones on
+    `distributed_servers.subordinate_workers`; `worker_id` alone is the machine
+    its row is filed under. Everything that asks "where is this member" was
+    reading that one field: the gather floor, the breach report it is meant to
+    be caught by, the pairing-locality sum, and the proximity scorer. So a
+    member on three machines was invisible on two of them to all four —
+    anchoring a floor on the wrong domain, under-reporting the breach, and
+    scoring a candidate against a group it could not fully see.
+
+    Reachable today without any cross-node support in the group solver: a
+    scaled-out member goes down the per-instance path with the whole worker
+    list, and `distributed_inference_across_workers` defaults to true for
+    vLLM, SGLang and MindIE.
+
+    Order is the instance's own — primary first — because that is the order
+    the ranks are laid out in, and a caller that cares which machine holds
+    rank 0 must not have to guess.
+    """
+    primary = getattr(instance, "worker_id", None)
+    out: List[int] = [] if primary is None else [primary]
+    servers = getattr(instance, "distributed_servers", None)
+    for subordinate in (
+        (getattr(servers, "subordinate_workers", None) or []) if servers else []
+    ):
+        worker_id = getattr(subordinate, "worker_id", None)
+        if worker_id is not None and worker_id not in out:
+            out.append(worker_id)
+    return out
+
+
 def role_takes_no_accelerator(model, role_name: Optional[str]) -> bool:
     """Whether this role should be placed without claiming any GPU.
 

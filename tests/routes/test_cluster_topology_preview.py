@@ -22,11 +22,12 @@ RACK = "topology.gpustack.ai/rack"
 ROOM = "topology.gpustack.ai/zone"
 CLIQUE = "nvidia.com/gpu.clique"
 DOMAIN = "topology.gpustack.ai/accelerator-domain"
-SWITCH = "topology.gpustack.ai/switch"
-SWITCH_NAME = "topology.gpustack.ai/switch-name"
+# The leaf-switch rung, as a fleet running Topograph publishes it — the one
+# source that fills this rung, which is why the tests read it here.
+SWITCH = "fabric.topograph.run/tier-0"
 
 # The two layers an operator declares for facts the fleet publishes. Neither is
-# built in any more, which is the whole of the change: the worker still writes
+# built in any more, which is the whole of the change: something else writes
 # the label, the operator decides it names a place.
 DOMAIN_LAYER = layer_dict("accelerator_domain", [DOMAIN, CLIQUE], parent="rack")
 SWITCH_LAYER = layer_dict("switch", [SWITCH], parent="rack")
@@ -170,7 +171,7 @@ async def test_locations_report_where_each_value_came_from():
             1,
             "w1",
             {RACK: "R1"},
-            facts={CLIQUE: "u.3", SWITCH: "aa:bb", SWITCH_NAME: "leaf-3"},
+            facts={CLIQUE: "u.3", SWITCH: "aa:bb"},
         ),
     ]
     result = await _get(workers, saved=saved)
@@ -181,19 +182,6 @@ async def test_locations_report_where_each_value_came_from():
     assert location[lid("switch")].value == "aa:bb"
     assert location[lid("accelerator_domain")].value == "u.3"
     assert location[lid("accelerator_domain")].source == "discovered"
-
-
-@pytest.mark.asyncio
-async def test_the_switch_name_is_carried_beside_the_chassis_id():
-    """🔴 Keyed off the label key, not the layer's name. `switch` used to be a
-    built-in id and the display name hung off that id; the rung is now whatever
-    the operator called it, so the only thing that says "this value is a switch
-    chassis id" is the key it came from."""
-    saved = _topology(layers=[layer_dict("Leaf switch", [SWITCH], parent="rack")])
-    workers = [_worker(1, "w1", facts={SWITCH: "aa:bb", SWITCH_NAME: "leaf-3"})]
-    result = await _get(workers, saved=saved)
-
-    assert result.workers[0].location[lid("Leaf switch")].display == "leaf-3"
 
 
 @pytest.mark.asyncio
@@ -528,9 +516,13 @@ async def test_the_domain_and_switch_keys_are_offered_as_candidates():
         CLIQUE,
         "accelerator.topograph.run/domain",
         "network.topology.nvidia.com/accelerator",
-        SWITCH,
         "fabric.topograph.run/tier-0",
     } <= offered
+    # 🔴 And one key is deliberately NOT offered: nothing writes
+    # `topology.gpustack.ai/switch`, and its value would be a chassis MAC that
+    # no operator types, so offering it advertises a rung that can only be
+    # empty. Topograph's tier-0 above is the same rung with a real source.
+    assert "topology.gpustack.ai/switch" not in offered
     # And every `fits` points at a rung that still exists.
     for known in result.vocabulary.known_keys:
         assert set(known.fits) <= {"zone", "rack"}, known.key

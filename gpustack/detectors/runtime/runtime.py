@@ -128,10 +128,7 @@ class Runtime(GPUDetector):
 # Where a device sits beyond the host, as the runtime reports it.             #
 # --------------------------------------------------------------------------- #
 
-ACCELERATOR_DOMAIN_KEY = "topology.gpustack.ai/accelerator-domain"
 NVIDIA_CLIQUE_KEY = "nvidia.com/gpu.clique"
-SWITCH_KEY = "topology.gpustack.ai/switch"
-SWITCH_NAME_KEY = "topology.gpustack.ai/switch-name"
 
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
@@ -150,14 +147,4 @@ def _topology_hints(appendix: dict) -> dict:
     if cluster_uuid and cluster_uuid != _ZERO_UUID and clique is not None:
         hints[NVIDIA_CLIQUE_KEY] = f"{cluster_uuid}.{clique}"
 
-    super_pod = appendix.get("super_pod_id")
-    if super_pod is not None:
-        hints[ACCELERATOR_DOMAIN_KEY] = f"spod-{super_pod}"
-
-    chassis = appendix.get("roce_lldp_chassis_id")
-    if chassis:
-        hints[SWITCH_KEY] = str(chassis)
-        name = appendix.get("roce_lldp_system_name")
-        if name:
-            hints[SWITCH_NAME_KEY] = str(name)
     return hints

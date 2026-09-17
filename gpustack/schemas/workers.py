@@ -168,11 +168,10 @@ class GPUDeviceStatus(GPUDeviceInfo):
     )
     """
     Where this device sits beyond the host, as the device itself reports it:
-    the NVLink/HCCS domain it belongs to and the switch its RDMA port is cabled
-    to. Keyed by topology label key (`nvidia.com/gpu.clique`,
-    `topology.gpustack.ai/accelerator-domain`, `topology.gpustack.ai/switch`...).
-    Per device; the worker-level `WorkerStatus.topology_facts` is derived from
-    these and is what the scheduler reads.
+    today the NVLink domain it belongs to, keyed by topology label key
+    (`nvidia.com/gpu.clique`). Per device; the worker-level
+    `WorkerStatus.topology_facts` is derived from these and is what the
+    scheduler reads.
     """
 
 
@@ -297,9 +296,9 @@ class WorkerStatus(SystemInfo):
         sa_column=Column(JSON), default=None
     )
     """
-    The worker's discovered position, keyed by topology label key: its
-    accelerator domain and the access switch its ports hang off. Read under
-    `Worker.labels`, so a hand-filled label always wins over a discovered fact.
+    The worker's discovered position, keyed by topology label key: today the
+    NVLink domain its cards agree on. Read under `Worker.labels`, so a
+    hand-filled label always wins over a discovered fact.
     """
 
     model_config = ConfigDict(from_attributes=True)

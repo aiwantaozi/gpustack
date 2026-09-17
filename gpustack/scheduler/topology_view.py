@@ -30,8 +30,6 @@ from gpustack.scheduler.topology import (
     nodes_at_layer,
 )
 from gpustack.scheduler.topology_vocabulary import (
-    SWITCH_KEY,
-    SWITCH_NAME_KEY,
     ResolvedLayer,
     ResolvedTopology,
     source_of,
@@ -165,16 +163,10 @@ def _locations_of(worker, resolved: ResolvedTopology) -> Dict[str, Location]:
             discovered = next(
                 (facts[k] for k in layer.label_keys if facts.get(k)), None
             )
-            # Keyed off the *label key*, not the layer's name: the switch is no
-            # longer a built-in rung, so the only thing that identifies "this
-            # value is a switch chassis id, and the worker also told us its
-            # name" is the key the value came from. A layer named anything at
-            # all reading the switch key still gets the readable name.
-            display = (
-                facts.get(SWITCH_NAME_KEY)
-                if key == SWITCH_KEY and key in facts
-                else None
-            )
+            # No key pairs a readable name with its value today. The field
+            # stays for the ones that will: keyed off the label key, so a value
+            # that reads as an identifier can carry a name beside it.
+            display = None
             out[layer.id] = Location(
                 value=value,
                 source=source_of(worker, key),

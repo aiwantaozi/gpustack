@@ -14,7 +14,6 @@ measure leaves a trace on the row the server and the UI already read.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,23 +22,22 @@ from gpustack.worker.collector import WorkerStatusCollector
 
 
 def _collector(system_info_error=None, gpu_error=None):
-    with patch("gpustack.worker.collector.HostSwitchProbe", MagicMock()):
-        collector = WorkerStatusCollector(
-            cfg=SimpleNamespace(
-                get_gpu_devices=lambda: None,
-                get_system_info=lambda: None,
-                get_system_reserved=lambda: {},
-                advertise_address=None,
-                worker_port=10150,
-                worker_metrics_port=10151,
-                disable_worker_metrics=False,
-                proxy_mode="tunnel",
-            ),
-            worker_ip_getter=lambda: "10.0.0.1",
-            worker_ifname_getter=lambda: "eth0",
-            worker_id_getter=lambda: 1,
-            worker_uuid_getter=lambda: "uuid",
-        )
+    collector = WorkerStatusCollector(
+        cfg=SimpleNamespace(
+            get_gpu_devices=lambda: None,
+            get_system_info=lambda: None,
+            get_system_reserved=lambda: {},
+            advertise_address=None,
+            worker_port=10150,
+            worker_metrics_port=10151,
+            disable_worker_metrics=False,
+            proxy_mode="tunnel",
+        ),
+        worker_ip_getter=lambda: "10.0.0.1",
+        worker_ifname_getter=lambda: "eth0",
+        worker_id_getter=lambda: 1,
+        worker_uuid_getter=lambda: "uuid",
+    )
 
     def detect_system_info():
         if system_info_error:

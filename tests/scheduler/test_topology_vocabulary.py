@@ -307,9 +307,18 @@ def test_the_domain_and_switch_keys_are_offered_as_candidates():
         CLIQUE,
         "accelerator.topograph.run/domain",
         "network.topology.nvidia.com/accelerator",
-        SWITCH,
         "fabric.topograph.run/tier-0",
     } <= keys
+
+
+def test_our_own_switch_key_is_not_offered():
+    """🔴 A candidate key earns its place by having a source. Nothing writes
+    `topology.gpustack.ai/switch`, and its value would be a switch chassis MAC
+    — not something an operator can look up and type — so offering it would
+    advertise a rung that can only ever be empty. Topograph's tier-0 is the
+    same rung from a source that does exist, which is why it stays in the list
+    above."""
+    assert SWITCH not in {k.key for k in KNOWN_KEYS}
 
 
 def test_every_candidate_key_fits_a_rung_that_exists():

@@ -95,10 +95,11 @@ class VocabularyField:
 # is the one that was missing. A fleet on k8s now lands in the right rung with
 # no labelling at all.
 #
-# `switch` stays out for its original reason: it is a fact the worker
-# discovers and writes as a label, so it needs no built-in rung — an operator
-# who wants to place by it adds a layer pointing at its key, which is the same
-# operation as adding one for the accelerator domain.
+# `switch` stays out, and now has no key of ours at all: nothing in the fleet
+# publishes one, and a rung with no source is a rung that can only be empty. An
+# operator who wants to place by the switch declares a layer over whatever key
+# their own tooling writes — Topograph's `fabric.topograph.run/tier-0`, say —
+# which is the same operation as adding one for the accelerator domain.
 #
 # ⚠️ `builtin-000002` (`row`) is retired and deliberately NOT reused. Ids are
 # allocation order and a stored `Model.gather.layer` points at one; handing
@@ -126,16 +127,6 @@ VOCABULARY_SLUGS: Dict[str, str] = {f.id: f.slug for f in VOCABULARY}
 """Built-in id -> canonical name. What a stored layer's ``name`` must equal
 while it is one of ours (``validate_declaration``), so a client cannot write
 the *translated* label there and freeze the row into one person's UI language."""
-
-SWITCH_KEY = GPUSTACK_PREFIX + "switch"
-"""The leaf switch a worker's ports are cabled to, as its LLDP neighbour
-reports itself. Written by the worker, never built in: it is a *fact*, and a
-fact becomes a place only when an operator declares a layer that reads it."""
-
-SWITCH_NAME_KEY = GPUSTACK_PREFIX + "switch-name"
-"""Where the worker records the switch's own name beside its chassis id, so the
-UI can show ``CE8875-50`` instead of a MAC. Read for display only; membership
-is decided by the chassis id."""
 
 RESERVED_IDS = frozenset({ROOT_LAYER, NODE_LAYER})
 """Names no declared layer may take: the implicit root, and the leaf.
@@ -174,15 +165,20 @@ class KnownKey:
 
 # 🔴 ``fits`` names the built-in rung a key is *nearest* to, and that is all it
 # is: a hint for where to insert the layer that reads it. The accelerator-domain
-# and switch keys are in here rather than in ``VOCABULARY`` for the reason at
-# the top of this module — they are facts the fleet publishes, and which rung
-# they amount to is the operator's call, not ours.
+# key is in here rather than in ``VOCABULARY`` for the reason at the top of this
+# module — it is a fact the fleet publishes, and which rung it amounts to is the
+# operator's call, not ours.
+#
+# 🔑 A key earns its place here by having a source. Offering one that nothing
+# writes and nobody can type advertises a rung that can only ever be empty,
+# which is worse than leaving the operator to paste the key themselves.
 KNOWN_KEYS: Tuple[KnownKey, ...] = (
     KnownKey(
         GPUSTACK_PREFIX + "accelerator-domain",
         "GPUStack",
         ("rack", "zone"),
-        "NVLink/HCCS/UB domain, as the worker's runtime reports it.",
+        "NVLink/HCCS/UB domain. Hand-filled for now: on Ascend the super pod "
+        "id is read with npu-smi, and nothing publishes it automatically.",
     ),
     KnownKey(
         "nvidia.com/gpu.clique",
@@ -201,12 +197,6 @@ KNOWN_KEYS: Tuple[KnownKey, ...] = (
         "NVIDIA",
         ("rack", "zone"),
         "NVLink domain.",
-    ),
-    KnownKey(
-        GPUSTACK_PREFIX + "switch",
-        "GPUStack",
-        ("rack",),
-        "The switch closest to the node, as the worker's LLDP probe heard it.",
     ),
     KnownKey(
         "fabric.topograph.run/tier-0",

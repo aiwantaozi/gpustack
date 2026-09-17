@@ -1,7 +1,7 @@
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -1259,31 +1259,8 @@ async def _refuse_a_floor_no_member_can_meet(
         # that has to span simply misses it and says so afterwards.
         return
 
-    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
-    if effective_cluster_id is None:
-        return
-
-    # Widths first: a deployment that never stated one cannot contradict
-    # anything, and asking the cluster about it would be a query for nothing.
-    widths = [
-        (spec.name, _role_gpu_width(model_in, spec.name))
-        for spec in getattr(model_in, "roles", None) or []
-    ]
-    widths = [(name, width) for name, width in widths if width]
-    if not widths:
-        return
-
-    workers = await Worker.all_by_field(session, "cluster_id", effective_cluster_id)
-    widest = max(
-        (len((w.status.gpu_devices or []) if w.status else []) for w in workers),
-        default=0,
-    )
-    if widest == 0:
-        return
-
-    for name, width in widths:
-        if width <= widest:
-            continue
+    spanning, widest = await roles_that_must_span(session, model_in, cluster_id)
+    for name, width in spanning:
         raise BadRequestException(
             message=(
                 f"Role {name!r} needs {width} GPUs and the widest worker "
@@ -1293,6 +1270,53 @@ async def _refuse_a_floor_no_member_can_meet(
                 f"Lower the parallel size, or choose a looser topology floor."
             )
         )
+
+
+async def roles_that_must_span(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    cluster_id: Optional[int] = None,
+) -> Tuple[List[Tuple[str, int]], int]:
+    """Which roles cannot fit one machine, and how wide the widest machine is.
+
+    Arithmetic, not a placement solve — which is the whole reason it is safe to
+    ask while a form is still being typed. It compares a width the operator has
+    already stated against a fact about the cluster; it does not select
+    candidates, does not consult free capacity, and its answer does not move
+    while the rest of the form is filled in. `gather-feasibility` died of being
+    the other thing: a verdict about a finished configuration, asked of a half
+    finished one, which conflated «this tier does not fit» with «I cannot tell
+    yet».
+
+    Empty is the answer for everything it cannot be sure of — a width the
+    engine was never told, a cluster whose workers cannot be read, a backend
+    whose width this does not know how to ask for. Both callers treat «not
+    sure» as «not spanning», which is the behaviour that existed before this
+    could be asked at all.
+    """
+    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
+    if effective_cluster_id is None:
+        return [], 0
+
+    # Widths first: a deployment that never stated one cannot span anything,
+    # and asking the cluster about it would be a query for nothing.
+    widths = [
+        (spec.name, _role_gpu_width(model_in, spec.name))
+        for spec in getattr(model_in, "roles", None) or []
+    ]
+    widths = [(name, width) for name, width in widths if width]
+    if not widths:
+        return [], 0
+
+    workers = await Worker.all_by_field(session, "cluster_id", effective_cluster_id)
+    widest = max(
+        (len((w.status.gpu_devices or []) if w.status else []) for w in workers),
+        default=0,
+    )
+    if widest == 0:
+        return [], 0
+
+    return [(name, width) for name, width in widths if width > widest], widest
 
 
 def _role_gpu_width(model_in, role_name: str) -> Optional[int]:
@@ -1746,6 +1770,58 @@ async def validate_shared_kv_cache(
                     f"({ranges})."
                 )
             )
+
+
+class SpanningRole(BaseModel):
+    name: str
+    gpus: int
+
+
+class SpanningPreview(BaseModel):
+    """Which members of this draft cannot fit on one machine.
+
+    Empty `roles` means «no, or not knowable», and the caller must treat those
+    two the same: everything here is an addition to what a form could already
+    say, never a precondition for saying it.
+    """
+
+    roles: List[SpanningRole]
+    widest_worker_gpus: int
+
+
+@router.post("/spanning-roles", response_model=SpanningPreview)
+async def preview_spanning_roles(
+    session: SessionDep, ctx: TenantContextDep, model_in: ModelCreate
+):
+    """Answer «will a member of this have to occupy more than one machine».
+
+    🔴 The deploy form's «at least about X% of requests pair on one host» is a
+    FLOOR, and cross-machine members turn it the wrong way round rather than
+    merely loosening it: a member too wide for any machine takes whole machines
+    (the engine selectors allocate every GPU of every worker they pick), so no
+    machine holds both a prefill and a decode and the true figure is exactly
+    zero. A note reading «at least 25%» beside a real 0 is worse than no note.
+
+    Asked of the server rather than computed in the form because the width is
+    the engine's own arithmetic -- vLLM spells it `--tensor-parallel-size`,
+    SGLang `--tp-size`, and both fold in pipeline and data parallelism. A
+    second reading of those flags in TypeScript is a second answer to one
+    question, and the two would drift.
+
+    Safe to ask mid-typing because it is arithmetic and not a solve: see
+    `roles_that_must_span`.
+    """
+    # Visibility, not ownership: nothing is created here, and the answer is
+    # about the cluster's machines rather than about anything the caller owns.
+    if model_in.cluster_id is not None:
+        assert_cluster_visible(
+            ctx, await Cluster.one_by_id(session, model_in.cluster_id)
+        )
+    spanning, widest = await roles_that_must_span(session, model_in)
+    return SpanningPreview(
+        roles=[SpanningRole(name=name, gpus=width) for name, width in spanning],
+        widest_worker_gpus=widest,
+    )
 
 
 @router.post(

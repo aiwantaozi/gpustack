@@ -237,6 +237,7 @@ async def _place(
     model: Model,
     workers: Sequence,
     topology=None,
+    raw: bool = False,
 ) -> Tuple[Optional[Placement], List[str]]:
     """Drive `schedule_group` and read the answer off the member rows.
 
@@ -244,6 +245,11 @@ async def _place(
     `(None, messages)` when the group was refused. A role with no entry was
     given no worker — which is the expected state for the router and the
     refused state for everything else.
+
+    `raw=True` hands back the candidates themselves instead, for the few
+    assertions that are about what a member holds besides its primary machine
+    — the summary above is keyed by one worker and cannot express a member
+    that spans.
     """
     rows = _members(model)
     cluster = SimpleNamespace(id=1, topology=topology)
@@ -268,6 +274,8 @@ async def _place(
 
     if by_instance is None:
         return None, messages
+    if raw:
+        return by_instance, messages
 
     placed: Placement = {}
     for row in rows:
@@ -667,33 +675,84 @@ async def test_e_a_fleet_that_is_merely_full_says_so_in_placements(config):
     assert "could not be measured" not in messages[0]
 
 
-# --- F. the current cross-machine boundary ---------------------------------- #
+# --- F. members wider than one machine -------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_f_a_role_wider_than_one_machine_cannot_form_a_group(config):
-    """🔑 **Records today's behaviour, and is expected to be inverted soon.**
+async def test_f_a_role_wider_than_one_machine_spans_several(config):
+    """🔑 **This asserted the refusal until cross-machine members landed.**
 
-    Thirty-two H100s, and a group of two members at
-    `--tensor-parallel-size=16` is refused with "room for 0". Not a sizing
-    result: the note beside it says the largest worker offers 576 GiB across
-    8/8 cards. `count_offer_slots` hands the selector **one worker at a time**,
-    so a member wider than a single machine can never be counted, however much
-    the cluster holds in total — while the ordinary per-instance path builds
-    exactly such a placement through its distributed-inference branch.
+    Thirty-two H100s and a 1P1D at `--tensor-parallel-size=16`: each member
+    needs sixteen cards and no host has more than eight. The fleet was never
+    short of VRAM — the note beside the old refusal said the largest worker
+    offered 576 GiB across 8/8 cards — so this was a structural limit, not a
+    sizing one. `count_offer_slots` handed the selector one worker at a time,
+    and the selectors' cross-node branch refuses a list shorter than two, so a
+    member wider than a single machine could not be counted however much the
+    cluster held. Meanwhile the ordinary per-instance path built exactly such a
+    placement through the same branch, which is why a scaled-out member could
+    span and its own siblings could not.
 
-    ⚠️ When cross-machine group members land, this test must be rewritten to
-    assert the group *is* placed — two members of 16 cards spanning hosts 22+23
-    and 24+25 — rather than deleted. The refusal below is the baseline that
-    tells the change apart from a coincidence.
+    Each member now lands on two hosts, and the two members take four hosts
+    between them without overlapping.
     """
     model = _pd_model(1, 1, params=["--tensor-parallel-size=16"])
     placed, messages = await _place(config, model, _fleet("H100x8", 4))
 
+    assert placed is not None, messages
+    prefill_host, prefill_cards = placed["prefill"][0]
+    decode_host, decode_cards = placed["decode"][0]
+    # Whole machines: the selector takes every card of every host it combines.
+    assert prefill_cards == list(range(8))
+    assert decode_cards == list(range(8))
+    assert prefill_host != decode_host
+
+
+@pytest.mark.asyncio
+async def test_f_a_member_that_spans_reports_every_machine_it_holds(config):
+    """🔴 The half that the rest of the server reads. A spanning member records
+    its other machines on `distributed_servers`, and four places in the server
+    ask "where is this member" — the gather floor, the breach report, the
+    locality sum, the proximity scorer. A candidate that came back without
+    them would leave all four looking at half a placement."""
+    model = _pd_model(1, 1, params=["--tensor-parallel-size=16"])
+    by_instance, _messages = await _place(config, model, _fleet("H100x8", 4), raw=True)
+
+    assert by_instance is not None
+    spans = {
+        len(
+            [candidate.worker.id]
+            + [s.worker_id for s in (candidate.subordinate_workers or [])]
+        )
+        for candidate in by_instance.values()
+    }
+    assert spans == {2}
+
+
+@pytest.mark.asyncio
+async def test_f_a_deployment_that_forbids_splitting_a_member_is_refused(config):
+    """The switch is an answer, not a gap. A deployment that turned off
+    cross-node inference has said its members may not be split, and the group
+    is refused rather than quietly spanning anyway — the refusal is what sends
+    the reader to that switch instead of to a bigger machine."""
+    model = _pd_model(1, 1, params=["--tensor-parallel-size=16"])
+    model.distributed_inference_across_workers = False
+    placed, messages = await _place(config, model, _fleet("H100x8", 4))
+
     assert placed is None
-    assert messages[0] == (
-        "The group needs 2 placements and the cluster has room for 0."
+    assert "room for 0" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_f_a_role_that_fits_one_machine_never_spans(config):
+    """The compatibility guarantee, and the reason the cost of all this is
+    zero for every deployment placed today: the wider search runs only when no
+    single machine holds even one member."""
+    placed, _messages = await _place(
+        config,
+        _pd_model(1, 1, params=["--tensor-parallel-size=4"]),
+        _fleet("H100x8", 4),
     )
-    # The fleet is not short of VRAM, which is what makes this a structural
-    # limit rather than a capacity one.
-    assert any("8/8 of GPUs meet the VRAM" in message for message in messages[1:])
+
+    assert placed is not None
+    assert len(placed["prefill"][0][1]) == 4

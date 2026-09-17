@@ -117,6 +117,10 @@ class GroupCapacity:
         # what stood in its way, and without them the two refusal paths
         # describe the same cluster in incomparable units.
         self._notes: Dict[str, List[str]] = {}
+        # (role, primary worker id) -> the machines one member of that role
+        # occupies, primary first. Empty for every role that fits on a single
+        # machine, which is every role placed today.
+        self._spans: Dict[tuple, List[int]] = {}
 
     async def __call__(
         self,
@@ -186,6 +190,104 @@ class GroupCapacity:
                 # difference between "no room" and "we could not look".
                 continue
             out[worker_id] = self._within_port_budget(role, worker_id, offer)
+
+        if any(out.values()):
+            return out
+        return await self._spanning(role, worker_ids, eligible, instances, limit, out)
+
+    async def _spanning(
+        self,
+        role: str,
+        worker_ids: Sequence[int],
+        eligible: Dict[int, Worker],
+        instances: List[object],
+        limit: int,
+        measured: Dict[int, int],
+    ) -> Dict[int, int]:
+        """Capacity for a member that needs more machines than any one has.
+
+        🔴 **Reached only when no single machine holds even one.** That is the
+        whole compatibility argument: a role that fits on a host never comes
+        here, so every deployment placed today is placed by exactly the code
+        that placed it yesterday, and pays nothing for this — not even the
+        extra selector pass.
+
+        **The width is discovered, not computed.** Deriving it would mean
+        reimplementing the selectors' own rules about which machines may be
+        combined — equal GPU counts, one accelerator type, attention heads
+        divisible by the tensor-parallel size — and a second implementation of
+        those is a second set of answers. So the domain is handed over whole
+        and the selector says what it made of it; how many machines it took is
+        read back off the candidate.
+
+        The results are keyed by each combination's *primary* machine, which
+        keeps the solver's arithmetic untouched: it goes on dealing members to
+        worker ids, one per slot, and never learns that some of those slots are
+        two machines wide. `commit` reassembles the rest from `_spans`.
+        """
+        if role_takes_no_accelerator(self._model, role):
+            # A proxy is one process. There is nothing to spread and no
+            # collective to pay for spreading it.
+            return measured
+        # Read off the PROJECTION, not the Model. `Model` is a SQLModel table
+        # class, so its validators do not run on construction and the field
+        # arrives as None -- the default that makes this true for vLLM, SGLang
+        # and MindIE is applied by `ModelSpecBase.set_defaults`, which the role
+        # projection goes through. Reading the raw row would switch the whole
+        # path off for every deployment whose column was never written.
+        if not getattr(
+            self._projected[role].model, "distributed_inference_across_workers", False
+        ):
+            # The deployment said its members may not be split. That is an
+            # answer, not a gap: the refusal that follows should send the
+            # reader to this switch rather than to a bigger machine.
+            return measured
+        usable = [
+            eligible[worker_id]
+            for worker_id in worker_ids
+            if worker_id in eligible and not _reports_no_memory(eligible[worker_id])
+        ]
+        if len(usable) < 2:
+            return measured
+
+        offer = await count_offer_slots(
+            make_selector=lambda instances_now, p=self._projected[role]: (
+                self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
+            ),
+            workers=usable,
+            model_instances=instances,
+            limit=limit,
+        )
+        self._remember_notes(role, offer.notes)
+        if not offer.placements:
+            return measured
+
+        out = dict(measured)
+        for candidate in offer.placements:
+            primary = candidate.worker.id
+            span = [primary] + [
+                subordinate.worker_id
+                for subordinate in (
+                    getattr(candidate, "subordinate_workers", None) or []
+                )
+            ]
+            self._offers[(role, primary)] = [candidate]
+            self._spans[(role, primary)] = span
+            # 🔑 The cap is the tightest of the machines the member lands on,
+            # not the primary's. A member needs its side-channel ports on every
+            # host that carries one of its ranks, so a host short of them stops
+            # the whole combination rather than a fraction of it.
+            allowed = min(
+                self._within_port_budget(role, worker_id, offer) for worker_id in span
+            )
+            out[primary] = min(out.get(primary, 0) + 1, max(allowed, 0))
+        logger.debug(
+            "Role %r does not fit on any single machine; %d combination(s) of "
+            "%d machines each",
+            role,
+            len(offer.placements),
+            len(self._spans.get((role, offer.placements[0].worker.id), [])),
+        )
         return out
 
     # How many lines of explanation a refusal may carry. The claim is the same
@@ -436,11 +538,25 @@ class GroupCapacity:
             worker = eligible.get(worker_id)
             if worker is None:
                 return []
+            # The machines this member lands on. For a role that fits on one,
+            # that is the worker the solve named -- which is every role placed
+            # today. For a wider one it is the combination the count recorded
+            # under that primary, re-derived here rather than replayed, for the
+            # same reason the single-machine case is: `already_placed` has
+            # moved on since the count, and a cached candidate would be an
+            # answer to the older question.
+            span = [
+                eligible[w]
+                for w in self._spans.get((role, worker_id), [worker_id])
+                if w in eligible
+            ]
+            if not span:
+                return []
             offer = await count_offer_slots(
                 make_selector=lambda instances_now, p=projected: (
                     self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
                 ),
-                workers=[worker],
+                workers=span,
                 model_instances=instances,
                 limit=count,
             )

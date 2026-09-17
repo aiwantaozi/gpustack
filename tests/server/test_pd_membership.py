@@ -649,3 +649,83 @@ def test_the_sglang_recipes_need_no_flag_to_make_membership_usable():
         assert mode.router.membership_api.requires_args == [], name
         assert mode.router.membership_api.available is True, name
         assert mode.router.membership_api_usable is True, name
+
+
+# --- «restart on error» off means the platform does not repair, either -------
+
+
+def _pd_model(restart_on_error: bool):
+    from gpustack.schemas.models import Model, RoleSpec
+
+    model = Model(name="pd", restart_on_error=restart_on_error)
+    model.id = 4242
+    model.roles = [
+        RoleSpec(name="prefill", replicas=1),
+        RoleSpec(name="decode", replicas=1),
+        RoleSpec(name="router", replicas=1),
+    ]
+    return model
+
+
+def test_an_unreadable_registry_says_the_repair_was_declined():
+    """🔴 The group that looked like it was restarting forever.
+
+    Recreating the router is a recovery like any other, and a more disruptive
+    one than most: the replacement is a NEW member with a fresh name and a
+    zeroed restart count, so a deployment with «restart on error» off never
+    settled into a state anyone could inspect — it just kept producing routers.
+
+    The switch now gates it, and the outcome has to SAY so: parked with the
+    bare "could not be read" reads identically to parked one pass before the
+    platform recreates the router, and those are opposite situations for
+    whoever is watching.
+    """
+    from gpustack.server.controllers import _explain_unreadable
+
+    bare = MembershipOutcome(
+        ok=False, unreadable=True, reason="the router's member list could not be read"
+    )
+
+    pd_membership.forget(4242)
+    explained = _explain_unreadable(_pd_model(restart_on_error=False), bare)
+    assert explained.unreadable is True
+    assert "did NOT do it" in explained.reason
+    assert "restart on error" in explained.reason
+
+    # With the switch on and the budget unspent, the platform is about to try:
+    # nothing to explain, so the outcome is passed through untouched.
+    assert _explain_unreadable(_pd_model(restart_on_error=True), bare) is bare
+    pd_membership.forget(4242)
+
+
+def test_a_spent_restart_budget_still_outranks_the_switch():
+    """Having tried and got nowhere is a stronger statement than having been
+    told not to try, so it keeps its own message — the operator needs to know
+    the path is suspect, not that a switch is off."""
+    from gpustack.server.controllers import _explain_unreadable
+
+    pd_membership.forget(4242)
+    for _ in range(pd_membership.RESTART_AFTER_UNREADABLE_PASSES):
+        pd_membership.record(4242, _unreadable_outcome())
+    for _ in range(pd_membership.RESTART_ATTEMPT_LIMIT):
+        pd_membership.note_restart_ordered(4242)
+    assert pd_membership.restarts_exhausted(4242)
+
+    explained = _explain_unreadable(
+        _pd_model(restart_on_error=False),
+        MembershipOutcome(ok=False, unreadable=True, reason="x"),
+    )
+    assert "tunnel" in explained.reason, explained.reason
+    pd_membership.forget(4242)
+
+
+def test_a_readable_outcome_is_never_reworded():
+    """The rewording is about one failure; everything else passes through, or a
+    successful registration would start carrying a failure's explanation."""
+    from gpustack.server.controllers import _explain_unreadable
+
+    ok = MembershipOutcome(ok=True, registered=["http://10.0.0.1:40010"])
+    assert _explain_unreadable(_pd_model(restart_on_error=False), ok) is ok
+
+    refused = MembershipOutcome(ok=False, reason="the router did not admit x")
+    assert _explain_unreadable(_pd_model(restart_on_error=False), refused) is refused

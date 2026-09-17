@@ -3028,27 +3028,59 @@ async def _reconcile_router_membership(
         if worst is None or (worst.ok and not outcome.ok):
             worst = outcome
     if worst is not None:
-        if worst.unreadable and pd_membership.restarts_exhausted(model.id):
-            # 🔴 The message changes because the suspicion does. Up to here
-            # "unreadable" could have been a wedged router, and the repair was
-            # to restart it. Having restarted it and read nothing, what is left
-            # is the path: the server cannot reach the router's port. On a
-            # `tunnel`-mode worker that is the proxy — the only route inward —
-            # and no further restart can discover that for the operator.
-            worst = pd_membership.MembershipOutcome(
-                ok=False,
-                unreadable=True,
-                reason=(
-                    "the router's member list cannot be read from the server, "
-                    "and restarting the router did not change that — so the "
-                    "router's port is not reachable rather than the process "
-                    "being stuck. On a worker in `tunnel` proxy mode the only "
-                    "route inward is the server's proxy port; check that it is "
-                    "running and that the worker's tunnel is connected."
-                ),
-                registered=worst.registered,
-            )
-        pd_membership.record(model.id, worst)
+        pd_membership.record(model.id, _explain_unreadable(model, worst))
+
+
+def _explain_unreadable(
+    model: Model, outcome: "pd_membership.MembershipOutcome"
+) -> "pd_membership.MembershipOutcome":
+    """Re-word an unreadable registry according to what happens next.
+
+    The bare reason — "the member list could not be read" — is the same
+    sentence whether the platform is about to recreate the router, has already
+    tried and got nowhere, or has been told not to try at all. Those are three
+    different situations for whoever is watching the deployment, so each gets
+    its own account; anything else is returned untouched.
+    """
+    if not outcome.unreadable:
+        return outcome
+
+    if pd_membership.restarts_exhausted(model.id):
+        # 🔴 The message changes because the suspicion does. Up to here
+        # "unreadable" could have been a wedged router, and the repair was to
+        # restart it. Having restarted it and read nothing, what is left is
+        # the path: the server cannot reach the router's port. On a
+        # `tunnel`-mode worker that is the proxy — the only route inward —
+        # and no further restart can discover that for the operator.
+        reason = (
+            "the router's member list cannot be read from the server, "
+            "and restarting the router did not change that — so the "
+            "router's port is not reachable rather than the process "
+            "being stuck. On a worker in `tunnel` proxy mode the only "
+            "route inward is the server's proxy port; check that it is "
+            "running and that the worker's tunnel is connected."
+        )
+    elif not model.restart_on_error:
+        # 🔴 Say that the repair exists and was not taken, rather than leaving
+        # a group parked with no account of why. Without this the deployment
+        # reads the same whether the platform is about to recreate the router
+        # or has decided not to.
+        reason = (
+            "the router's member list could not be read. Recreating the "
+            "router is what usually repairs this, and the platform did NOT "
+            "do it because this deployment has «restart on error» off — so "
+            "the group stays as it is. Restart it manually once you have "
+            "looked, or turn the switch on to let the platform try."
+        )
+    else:
+        return outcome
+
+    return pd_membership.MembershipOutcome(
+        ok=False,
+        unreadable=True,
+        reason=reason,
+        registered=outcome.registered,
+    )
 
 
 async def _restart_unreachable_routers(
@@ -3166,7 +3198,17 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
     # `unreadable` means; a router that refuses a member is alive and
     # disagreeing, and would refuse the same thing again from an empty
     # registry.
-    if pd_membership.should_restart_router(model.id):
+    #
+    # 🔴 And only when the deployment asked to be repaired at all.
+    # `restart_on_error` is the deployment's answer to "recover by yourself or
+    # stop and let me look", and recreating the router is a recovery like any
+    # other — more disruptive than most, since the replacement is a NEW member
+    # with a fresh name and a zeroed restart count, which is precisely why a
+    # group with the switch off looked like it was restarting forever and
+    # never settled into a state anyone could inspect. With it off the group
+    # stays where it failed and says why; `POST /{id}/restart` is the manual
+    # way out.
+    if model.restart_on_error and pd_membership.should_restart_router(model.id):
         pd_membership.note_restart_ordered(model.id)
         await _restart_unreachable_routers(session, model, instances)
 

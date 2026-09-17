@@ -169,7 +169,7 @@ class GroupCapacity:
                 make_selector=lambda instances_now, p=projected: (
                     self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
                 ),
-                worker=worker,
+                workers=[worker],
                 model_instances=instances,
                 limit=limit,
             )
@@ -326,10 +326,10 @@ class GroupCapacity:
                     worker_id,
                 )
                 continue
-            worker = self._workers.get(worker_id)
-            if worker is None:
-                continue
-            out.append(_stand_in_for(offers[index], worker))
+            # The candidate carries its own primary worker and, when it spans
+            # machines, its subordinates -- which `compute_worker_allocated`
+            # bills to the right one. Nothing here has to know which.
+            out.append(_stand_in_for(offers[index]))
         return out
 
     def _selector(self, model, instances, cpu_only, ram_claim=None):
@@ -440,7 +440,7 @@ class GroupCapacity:
                 make_selector=lambda instances_now, p=projected: (
                     self._selector(p.model, instances_now, p.cpu_only, p.ram_claim)
                 ),
-                worker=worker,
+                workers=[worker],
                 model_instances=instances,
                 limit=count,
             )

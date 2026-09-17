@@ -90,11 +90,11 @@ class OfferSlot:
 
 async def count_offer_slots(
     make_selector,
-    worker,
+    workers: Sequence[Any],
     model_instances: Sequence[Any],
     limit: int,
 ) -> OfferSlot:
-    """How many more members of this role ``worker`` can take, up to ``limit``.
+    """How many more members of this role ``workers`` can take, up to ``limit``.
 
     ``make_selector`` is a callable taking the (growing) instance list and
     returning a fresh selector. A fresh one each round rather than a mutated
@@ -104,8 +104,18 @@ async def count_offer_slots(
     ``limit`` is normally the group's member count. Capacity beyond what the
     caller wants to place is not a number anyone needs, and computing it costs
     a full selector pass per extra slot.
+
+    🔑 **A set of machines, not one.** Handed a single worker this is what it
+    always was. Handed several, the selectors' own cross-node branch becomes
+    reachable -- it refuses a list shorter than two outright -- and a member
+    that needs more cards than any one machine has can be counted at all. The
+    combinations that come back are disjoint by construction, because each one
+    is stood in before the next is asked for, so counting a domain this way
+    yields the number of members it holds rather than a number per machine.
     """
-    result = OfferSlot(worker_id=worker.id)
+    result = OfferSlot(worker_id=workers[0].id if workers else 0)
+    if not workers:
+        return result
     if limit <= 0:
         return result
 
@@ -115,7 +125,7 @@ async def count_offer_slots(
     for _ in range(bound):
         try:
             selector = make_selector(hypothetical)
-            candidates = await selector.select_candidates([worker])
+            candidates = await selector.select_candidates(list(workers))
         except Exception as e:
             # A selector that raises means this worker's capacity is unknown,
             # not zero. Returning what was already proven keeps the group
@@ -123,8 +133,8 @@ async def count_offer_slots(
             # difference is only ever "this domain looks smaller than it is" —
             # which costs a tighter placement, never a wrong one.
             logger.warning(
-                "Stopped counting capacity on worker %s after %d: %s",
-                getattr(worker, "name", worker.id),
+                "Stopped counting capacity on %s after %d: %s",
+                ", ".join(str(getattr(w, "name", w.id)) for w in workers),
                 result.slots,
                 e,
             )
@@ -142,7 +152,7 @@ async def count_offer_slots(
 
         result.slots += 1
         result.placements.append(candidate)
-        hypothetical.append(_stand_in_for(candidate, worker))
+        hypothetical.append(_stand_in_for(candidate))
 
     return result
 
@@ -180,9 +190,16 @@ def _usable(candidates) -> Optional[Any]:
     return None
 
 
-def _stand_in_for(candidate, worker) -> _PlacedStandIn:
+def _stand_in_for(candidate) -> _PlacedStandIn:
+    """The candidate as the allocation accounting reads it.
+
+    Keyed off the candidate's own worker rather than the one the caller asked
+    about: with several machines in play they are not the same, and the
+    subordinates ride along on `distributed_servers`, which
+    `compute_worker_allocated` already reads and bills to the right machine.
+    """
     return _PlacedStandIn(
-        worker_id=worker.id,
+        worker_id=candidate.worker.id,
         gpu_indexes=candidate.gpu_indexes,
         gpu_type=candidate.gpu_type,
         computed_resource_claim=candidate.computed_resource_claim,

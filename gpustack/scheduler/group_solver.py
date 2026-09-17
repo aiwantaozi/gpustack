@@ -347,6 +347,17 @@ def _enforced_gather(names: Sequence[str], gather: GatherRequest) -> GatherReque
     A stale name means someone renamed or removed a layer somewhere else. That
     must not take a running deployment down.
     """
+    # A `prefer` loses its layer here, and that costs nothing at placement
+    # time — which is worth writing down, because dropping a value the operator
+    # chose reads like a bug until you check what the layer is for. It is a
+    # CEILING: the walk stops there instead of widening to the cluster root.
+    # And the walk is already tightest-first, returning the first domain that
+    # fits, so «prefer rack» and «prefer host» produce the same placement — the
+    # tightest one available. The only thing a ceiling adds is the refusal, and
+    # refusing is exactly what `prefer` says not to do.
+    #
+    # The layer is not discarded, only unused here: `_gather_unmet` reads it
+    # off the model afterwards to say whether the target was met.
     if not gather.must or not gather.layer:
         return GatherRequest(layer=None, must=False)
     if gather.layer not in names:

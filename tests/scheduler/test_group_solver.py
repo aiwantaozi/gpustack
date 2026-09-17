@@ -798,3 +798,64 @@ async def test_a_floored_router_refusal_still_names_the_domain():
 
     assert isinstance(got, GroupInfeasible)
     assert "rack-a" in got.reason
+
+
+@pytest.mark.asyncio
+async def test_a_preferred_layer_changes_no_placement_because_the_walk_is_already_tightest_first():
+    """🔴 Why `_enforced_gather` may drop a `prefer`'s layer.
+
+    Dropping a value the operator chose reads like a bug until you check what
+    the layer is for. It is a CEILING — the walk stops there instead of
+    widening to the cluster root — and refusing above it is the whole of what
+    it buys. `prefer` says do not refuse, so the ceiling has nothing to do.
+
+    What makes that safe is the walk, not the gather: it goes tightest rung
+    first and returns the first domain that fits, so it is already doing
+    «as close as possible». This asserts the equality rather than the
+    reasoning — three different preferred rungs and no requirement at all must
+    all put the group in the same place, or the layer was load-bearing after
+    all and dropping it was a bug.
+    """
+    workers = [
+        zoned(1, "w1", "z1", "rack-a"),
+        zoned(2, "w2", "z1", "rack-a"),
+        zoned(3, "w3", "z1", "rack-b"),
+    ]
+    root, layers = tree(workers, zone_rack_layers())
+
+    asks = [
+        GatherRequest(),
+        GatherRequest(layer=NODE_LAYER, must=False),
+        GatherRequest(layer="RackLayer", must=False),
+        GatherRequest(layer="ZoneLayer", must=False),
+    ]
+    placements = []
+    for ask in asks:
+        got = await solve_group_placement(root, pd(2, 2), flat_capacity(2), layers, ask)
+        assert isinstance(got, GroupPlacement)
+        placements.append((got.layer, got.domain, sorted(got.assignments.items())))
+
+    assert len(set(map(str, placements))) == 1, placements
+    # And it is the tightest rung that fits, not the widest — otherwise the
+    # equality above would hold for an uninteresting reason.
+    assert placements[0][0] == "RackLayer"
+
+
+@pytest.mark.asyncio
+async def test_a_preferred_floor_never_refuses_what_must_gather_would():
+    """The same fixture that makes `MustGather(rack)` refuse, asked as a
+    preference: it has to place. This is the half a future «let prefer use its
+    layer too» change would break first."""
+    workers = [worker(1, "w1", "rack-a"), worker(2, "w2", "rack-b")]
+    root, layers = tree(workers)
+
+    refused = await solve_group_placement(
+        root, pd(2, 2), flat_capacity(2), layers, GatherRequest("RackLayer", must=True)
+    )
+    assert isinstance(refused, GroupInfeasible)
+
+    placed = await solve_group_placement(
+        root, pd(2, 2), flat_capacity(2), layers, GatherRequest("RackLayer", must=False)
+    )
+    assert isinstance(placed, GroupPlacement)
+    assert placed.layer == ROOT_LAYER

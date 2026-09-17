@@ -29,7 +29,7 @@ from gpustack.schemas.models import (
     ModelListParams,
 )
 from gpustack.schemas.cache_services import CacheService
-from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.clusters import Cluster, GatherStrategyEnum
 from gpustack.schemas.gpu_instance_types import GPUInstanceType
 from gpustack.schemas.workers import GPUDeviceStatus, Worker
 from gpustack.utils.version import version_in_range
@@ -65,6 +65,7 @@ from gpustack.schemas.models import (
     ModelPublic,
     ModelsPublic,
     RoleNameEnum,
+    role_effective_model,
 )
 from gpustack.schemas.model_routes import (
     AccessPolicyEnum,
@@ -1199,6 +1200,7 @@ async def validate_gather_layer(
     )
 
     if layer == NODE_LAYER:
+        await _refuse_a_floor_no_member_can_meet(session, model_in, cluster_id, stored)
         return
 
     effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
@@ -1221,6 +1223,111 @@ async def validate_gather_layer(
                 f"Available: {', '.join(names)}."
             )
         )
+
+
+async def _refuse_a_floor_no_member_can_meet(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    cluster_id: Optional[int],
+    stored: Optional[Model],
+):
+    """Refuse «all members on one machine» when a member cannot fit on one.
+
+    🔴 **The one contradiction cross-machine members introduce.** A floor at the
+    host rung says every member of the group sits on a single machine; a role
+    whose tensor-parallel width exceeds any machine in the cluster needs two.
+    Both are things the operator asked for, and no placement satisfies them
+    together.
+
+    Caught here rather than left to the solver because the two answers read
+    completely differently. At placement time it surfaces as a group that never
+    leaves PENDING with a capacity sentence beside it -- and the cluster is not
+    short of capacity, so the reader goes looking for cards that are already
+    there. At submit time it is one sentence naming the two settings that
+    disagree, while both are still on screen.
+
+    Silent about everything it cannot be sure of: a parallel width the engine
+    was never told, a cluster whose workers cannot be read, a backend whose
+    width this does not know how to ask for. A refusal is only worth issuing
+    when the contradiction is certain.
+    """
+    gather = getattr(model_in, "gather", None) or (
+        getattr(stored, "gather", None) if stored is not None else None
+    )
+    if getattr(gather, "strategy", None) != GatherStrategyEnum.MUST_GATHER:
+        # `PreferGather` at the host rung is a target, not a promise. A member
+        # that has to span simply misses it and says so afterwards.
+        return
+
+    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
+    if effective_cluster_id is None:
+        return
+
+    # Widths first: a deployment that never stated one cannot contradict
+    # anything, and asking the cluster about it would be a query for nothing.
+    widths = [
+        (spec.name, _role_gpu_width(model_in, spec.name))
+        for spec in getattr(model_in, "roles", None) or []
+    ]
+    widths = [(name, width) for name, width in widths if width]
+    if not widths:
+        return
+
+    workers = await Worker.all_by_field(session, "cluster_id", effective_cluster_id)
+    widest = max(
+        (len((w.status.gpu_devices or []) if w.status else []) for w in workers),
+        default=0,
+    )
+    if widest == 0:
+        return
+
+    for name, width in widths:
+        if width <= widest:
+            continue
+        raise BadRequestException(
+            message=(
+                f"Role {name!r} needs {width} GPUs and the widest worker "
+                f"in this cluster has {widest}, so it has to span machines — "
+                f"but this deployment also asks for every member to be on one "
+                f"machine, and to be refused rather than placed outside it. "
+                f"Lower the parallel size, or choose a looser topology floor."
+            )
+        )
+
+
+def _role_gpu_width(model_in, role_name: str) -> Optional[int]:
+    """How many GPUs one member of this role wants, or None if not stated.
+
+    Asked of the selectors rather than re-derived: they already turn a mixed
+    bag of `--tensor-parallel-size` / `--tp-size` / `--pipeline-parallel-size`
+    / data parallelism into a world size, per engine, and a second reading of
+    those flags here is a second answer to one question.
+    """
+    from gpustack.policies.candidate_selectors import (
+        SGLangResourceFitSelector,
+        VLLMResourceFitSelector,
+    )
+    from gpustack.schemas.models import get_backend
+
+    try:
+        projected = role_effective_model(model_in, role_name)
+        backend = get_backend(projected)
+    except Exception:
+        return None
+    selectors = {
+        BackendEnum.VLLM: VLLMResourceFitSelector,
+        BackendEnum.SGLANG: SGLangResourceFitSelector,
+    }
+    selector = selectors.get(backend)
+    if selector is None:
+        return None
+    try:
+        world_size, _strategies = selector.get_world_size_from_backend_parameters(
+            projected
+        )
+    except Exception:
+        return None
+    return world_size
 
 
 async def validate_gpu_type_selector(

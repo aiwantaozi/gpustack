@@ -253,3 +253,106 @@ def test_a_role_speculative_override_changes_the_generation():
         )
     )
     assert plain != speculating
+
+
+# ---------------------------------------------------------------------------
+# «Every member on one machine» against a member that needs two.
+# ---------------------------------------------------------------------------
+
+
+async def _validate_host_floor(
+    params, workers, strategy=GatherStrategyEnum.MUST_GATHER, backend="vLLM"
+):
+    """Run the route-level check for a floor at the built-in host rung."""
+    from unittest.mock import AsyncMock, patch
+
+    from gpustack.routes.models import validate_gather_layer
+    from gpustack.schemas.models import RoleSpec
+    from gpustack.scheduler.topology import NODE_LAYER
+
+    model = Model(
+        name="m1",
+        source="huggingface",
+        huggingface_repo_id="x/y",
+        backend=backend,
+        backend_parameters=params,
+        gather=GatherSpec(strategy=strategy, layer=NODE_LAYER),
+    )
+    model.cluster_id = 1
+    model.roles = [
+        RoleSpec(name="prefill", replicas=1),
+        RoleSpec(name="decode", replicas=1),
+        RoleSpec(name="router", replicas=1),
+    ]
+    with patch(
+        "gpustack.schemas.workers.Worker.all_by_field",
+        new=AsyncMock(return_value=workers),
+    ):
+        await validate_gather_layer(None, model, cluster_id=1)
+
+
+def _host(cards):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=1,
+        status=SimpleNamespace(
+            gpu_devices=[SimpleNamespace(index=i) for i in range(cards)]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_host_floor_and_a_member_that_needs_two_hosts_is_refused():
+    """🔴 The one contradiction cross-machine members introduce, and it is two
+    things the operator asked for rather than a capacity shortfall.
+
+    Left to the solver it surfaces as a group that never leaves PENDING beside
+    a sentence about capacity — on a cluster that is not short of any. Caught
+    here it is one sentence naming the two settings that disagree, while both
+    are still on screen."""
+    from gpustack.api.exceptions import BadRequestException
+
+    with pytest.raises(BadRequestException) as refused:
+        await _validate_host_floor(["--tensor-parallel-size=16"], [_host(8)])
+
+    assert "needs 16 GPUs" in refused.value.message
+    assert "widest worker" in refused.value.message
+
+
+@pytest.mark.asyncio
+async def test_a_member_that_fits_one_host_is_accepted():
+    await _validate_host_floor(["--tensor-parallel-size=8"], [_host(8)])
+
+
+@pytest.mark.asyncio
+async def test_prefer_gather_at_the_host_rung_is_a_target_not_a_promise():
+    """It is allowed to be missed, and says so afterwards. Refusing here would
+    turn "aim for this" into "refuse below this", which is the other option and
+    the one the operator did not pick."""
+    await _validate_host_floor(
+        ["--tensor-parallel-size=16"],
+        [_host(8)],
+        strategy=GatherStrategyEnum.PREFER_GATHER,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_width_the_engine_was_never_told_is_left_alone():
+    """A refusal is only worth issuing when the contradiction is certain."""
+    await _validate_host_floor([], [_host(8)])
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_with_no_readable_workers_is_left_alone():
+    await _validate_host_floor(["--tensor-parallel-size=16"], [])
+
+
+@pytest.mark.asyncio
+async def test_sglang_spells_the_same_width_differently():
+    """`--tp-size` rather than `--tensor-parallel-size`, which is why the width
+    is asked of the selectors instead of re-read here."""
+    from gpustack.api.exceptions import BadRequestException
+
+    with pytest.raises(BadRequestException):
+        await _validate_host_floor(["--tp-size=16"], [_host(8)], backend="SGLang")

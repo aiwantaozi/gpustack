@@ -897,6 +897,30 @@ class DegradationReasonEnum(str, Enum):
     an ordinary scale-up does not wear the marker for the seconds between the
     row being created and the scheduler reaching it."""
 
+    ENGINE_VERSION_BELOW_RECIPE_FLOOR = "engine_version_below_recipe_floor"
+    """The pinned engine version is below the floor this PD recipe declares.
+
+    The floor is not stylistic. `sglang-nixl` and `sglang-mooncake` declare
+    `>=0.5.7` because a member's id stopped being its URL and became a UUID
+    the registry mints at that version: on an older build `DELETE
+    /workers/{url}` answers 400, so a scaled-down member is never removed from
+    the router's registry and keeps taking traffic after GPUStack believes it
+    is gone.
+
+    🔴 **A degradation and not a 400, unlike a cache provider's `versions`.**
+    The cache range is enforced at admission because an out-of-range engine
+    there is handed injected args it cannot parse and fails to start -- a
+    refusal costs nothing, since the deployment was not going to run. This
+    floor is different: the group runs, and the version string it was pinned
+    to may be a self-built image with a private number that happens to carry
+    the fix. Rejecting would break those deployments to prevent a failure they
+    do not have.
+
+    Set only for a version `version_in_range` positively reports as out of
+    range. Unpinned, unparseable and unknown-to-us all leave it unset -- the
+    same fail-open the cache check takes, and for the same reason: an exotic
+    version string must never be the thing that condemns a deployment."""
+
     PLACEMENT_DRIFTED = "placement_drifted"
     """Members are deployed somewhere other than where one created now would
     go — almost always an upgrade that introduced per-tenant namespaces, and

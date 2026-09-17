@@ -2782,6 +2782,86 @@ def _gather_blocked_scale_out(model: Model, instances: Sequence[ModelInstance]) 
     return False
 
 
+def _engine_version_below_recipe_floor(model: Model) -> bool:
+    """Whether a pinned engine version sits under the recipe's declared floor.
+
+    `backend_versions` in `pd-modes.yaml` was carrying no weight at all: an
+    e2e round created PD models pinned to SGLang 0.5.5, vLLM 0.19.0, a
+    nonexistent 9.9.9 and the string `not-a-version`, and all four were
+    accepted with HTTP 200 and nothing said afterwards.
+
+    🔴 The `>=0.5.7` on the two SGLang recipes is a correctness floor, not a
+    preference. A member's id stopped being its URL and became a UUID the
+    registry mints at that version (2a098200), so on an older build
+    `DELETE /workers/{url}` answers 400 -- a scaled-down member stays in the
+    router's registry and keeps taking traffic while GPUStack reports it gone.
+
+    **Reported, not refused**, which is the deliberate difference from the
+    cache provider's `versions` next door in `create_model`. That one rejects
+    with a 400 because an out-of-range engine there receives injected args it
+    cannot parse (`--shutdown-timeout`) and never starts, so refusing costs a
+    deployment that was not going to run anyway. Here the group runs, and the
+    number may belong to a self-built image with a private version that
+    carries the fix; a 400 would break those to prevent a failure they do not
+    have.
+
+    Same fail-open as that check, and for the same reason: only a version
+    `version_in_range` positively reports as OUT of range counts. None,
+    unparseable and unpinned all leave the marker unset -- an exotic version
+    string must never be the thing that condemns a deployment.
+    """
+    from gpustack.schemas.models import role_takes_no_accelerator
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+    from gpustack.utils.version import version_in_range
+
+    disaggregation = getattr(model, "disaggregation", None)
+    if disaggregation is None:
+        return False
+
+    mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
+    mode = get_pd_mode(mode_name)
+    if mode is None or not mode.backend_versions:
+        # `custom` declares no range because it injects nothing, and a recipe
+        # that has not stated a floor has not claimed one. Both are "no answer",
+        # never "compatible".
+        return False
+
+    # 🔴 Per role, not per model, and the same expression `_build_instance_create`
+    # writes onto the member row -- `role.backend_version or
+    # model.backend_version` -- because that row is what actually starts. A
+    # group whose model-level pin is fine can still run one decode on a build
+    # that cannot be scaled down, and one is enough: that member is the one
+    # that keeps serving after GPUStack believes it removed it.
+    #
+    # Spelled out rather than taken from `role_effective_model`, which resolves
+    # the identical value: the projection validates a whole Model per role, and
+    # this runs on every reconcile of every PD deployment for one string.
+    #
+    # 🔴 **Weight-bearing roles only, and the router is the reason that is not
+    # pedantry.** `backend_versions` describes the *engine* -- `>=0.5.7` is a
+    # statement about SGLang -- and the router is the one role whose engine is
+    # genuinely its own: the deploy form keeps an image-and-version section for
+    # it precisely because "a `vllm-router` is not the model's engine". The
+    # built-in recipes run it out of the model's own runner image, so its
+    # version is usually the engine's and comparing them is merely redundant;
+    # a hand-written router image is where it stops being redundant and starts
+    # being wrong, because that version number answers a different question and
+    # would condemn a deployment whose engine is perfectly in range.
+    pinned = {
+        getattr(role, "backend_version", None)
+        or getattr(model, "backend_version", None)
+        for role in (model.roles or [])
+        if not role_takes_no_accelerator(model, role.name)
+    }
+    pinned.add(getattr(model, "backend_version", None))
+
+    return any(
+        version_in_range(version, mode.backend_versions) is False
+        for version in pinned
+        if version
+    )
+
+
 def _leaves_of(node) -> List:
     """Every host node under `node`."""
     if not node:
@@ -2867,6 +2947,15 @@ async def _degradation_reasons(
         # an error -- but it was reported nowhere on the model, so a scale-up
         # that will never complete looked exactly like one still in flight.
         reasons.append(DegradationReasonEnum.GATHER_BLOCKED_SCALE_OUT.value)
+
+    if _engine_version_below_recipe_floor(model):
+        # Placement has nothing to do with this one: it is true of the spec
+        # from the moment the group is created, like `no_atomic_admission`
+        # below. What it buys is that the consequence is invisible until it
+        # bites -- on SGLang below 0.5.7 a scaled-down member is never removed
+        # from the router's registry and goes on taking traffic, which reads as
+        # a routing bug and not as a version pin.
+        reasons.append(DegradationReasonEnum.ENGINE_VERSION_BELOW_RECIPE_FLOOR.value)
 
     if await _no_atomic_admission(session, model):
         # A property of the configuration, so it is true from the moment the

@@ -794,8 +794,29 @@ class PDMode(BaseModel):
     nothing). ``PD_MODE_BACKENDS`` must agree; the loader asserts it."""
 
     backend_versions: Optional[str] = None
-    """Human-readable compatible version range. Informational, like a cache
-    provider's ``versions``."""
+    """Engine versions this recipe is known to work against, in
+    ``version_in_range`` spelling (e.g. ``">=0.5.7"``).
+
+    🔴 **Reported, never refused** — which is where the old note comparing it
+    to a cache provider's ``versions`` was wrong in the one way that matters:
+    that range is ENFORCED, with a 400 at ``create_model``. It can be, because
+    an out-of-range engine there is handed injected args it cannot parse and
+    never starts, so the refusal costs a deployment that was not going to run.
+    A recipe's floor is different in kind: the group runs either way, and the
+    number may belong to a self-built image whose private version carries the
+    fix. So a version outside this range sets the
+    ``engine_version_below_recipe_floor`` degradation on the model and nothing
+    is rejected.
+
+    It is not decorative either, whatever the old wording suggested. The
+    ``>=0.5.7`` on the SGLang recipes exists because a member's id became a
+    registry-minted UUID at that version, so an older build answers 400 to
+    ``DELETE /workers/{url}`` and a scaled-down member keeps taking traffic.
+
+    Unparseable and unpinned versions fail open, the same way the cache check
+    does: the marker is set only for a version positively shown to be out of
+    range. None means the recipe declares no floor, never "any version is
+    fine"."""
 
     gpu_filters: Optional[GPUFilters] = None
     """Which accelerators this recipe may be injected into.

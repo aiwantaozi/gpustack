@@ -104,24 +104,55 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
         if not anchors:
             return candidates
 
+        # 🔴 **Lexicographic, not a weighted sum**, and the weight below is how
+        # that is spelled. A candidate that spans machines has two distances
+        # and they pull against each other: how far its own machines are from
+        # each other, and how far the whole of it is from the rest of the
+        # group. They are not comparable quantities -- the first carries the
+        # tensor-parallel all-reduce, once per layer per token, and the second
+        # carries the KV transfer, once per request. Adding them would let a
+        # large enough gain on the second buy a worse first, which is never
+        # right at that ratio.
+        #
+        # So internal spread decides, and closeness to the group only breaks
+        # ties among candidates that are equally tight inside. Written as a
+        # penalty rather than a bonus so a single machine -- which has no pair
+        # to be apart, and is every candidate on the path this code was written
+        # for -- scores exactly what it scored before: zero for a worker whose
+        # position is unknown, and the closeness term alone otherwise. `depth`
+        # is bounded by the declared rungs, so a multiplier one past the
+        # tightest makes any penalty outweigh any closeness gain, which is what
+        # "lexicographic" means here. `PairingAffinityScorer` spells the same
+        # trick the same way, and for the same reason.
+        tightest = max(depth.values(), default=0)
+
         for candidate in candidates:
-            worker_id = getattr(candidate.worker, "id", None)
-            here = leaves.get(worker_id)
-            if here is None:
+            span = [
+                leaves[worker_id]
+                for worker_id in _candidate_workers(candidate)
+                if worker_id in leaves
+            ]
+            if not span:
                 continue
-            # The tightest layer this worker shares with ANY placed member.
+            # The tightest layer this candidate shares with ANY placed member.
             # Any rather than all: the member is one process talking to one
             # peer at a time, so being in a rack with three of them is not
             # three times better than being in a rack with one -- that is
             # `PairingAffinityScorer`'s question, and it is already asked.
-            best = max(
+            near = max(
                 (
-                    depth.get(common_layer(anchor, here) or ROOT_LAYER, 0)
+                    depth.get(common_layer(anchor, node) or ROOT_LAYER, 0)
                     for anchor in anchors
+                    for node in span
                 ),
                 default=0,
             )
-            candidate.score = (candidate.score or 0) + self._max_score * best
+            apart = tightest - _internal_depth(span, depth)
+            candidate.score = (
+                (candidate.score or 0)
+                + self._max_score * near
+                - self._max_score * (tightest + 1) * apart
+            )
 
         return candidates
 
@@ -145,6 +176,37 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
         depths[NODE_LAYER] = len(order) + 1
         depths[ROOT_LAYER] = 0
         return depths
+
+
+def _candidate_workers(candidate) -> List[int]:
+    """Every machine this candidate would occupy, primary first.
+
+    A candidate that spans machines carries the rest on
+    `subordinate_workers`; scoring only its primary would call it close to a
+    group it is half a cluster away from.
+    """
+    primary = getattr(getattr(candidate, "worker", None), "id", None)
+    out: List[int] = [] if primary is None else [primary]
+    for subordinate in getattr(candidate, "subordinate_workers", None) or []:
+        worker_id = getattr(subordinate, "worker_id", None)
+        if worker_id is not None and worker_id not in out:
+            out.append(worker_id)
+    return out
+
+
+def _internal_depth(span: List, depth: Dict[str, int]) -> int:
+    """How tight this candidate is inside itself, loosest pair deciding.
+
+    A single machine is as tight as it gets -- there is no pair to be apart --
+    which is what keeps every placement made today scoring exactly as it did.
+    """
+    if len(span) < 2:
+        return max(depth.values(), default=0)
+    return min(
+        depth.get(common_layer(a, b) or ROOT_LAYER, 0)
+        for index, a in enumerate(span)
+        for b in span[index + 1 :]
+    )
 
 
 def _leaves(node) -> List:

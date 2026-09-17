@@ -183,3 +183,108 @@ async def test_a_zero_weight_turns_it_off():
     scored = await scorer.score([_candidate(w) for w in workers])
 
     assert all(c.score is None for c in scored)
+
+
+# --- candidates that span machines ------------------------------------------- #
+
+
+def _spanning_candidate(primary, others):
+    return SimpleNamespace(
+        worker=primary,
+        score=None,
+        subordinate_workers=[SimpleNamespace(worker_id=w.id) for w in others],
+    )
+
+
+async def _score_candidates(workers, placed, candidates, anchors=("prefill",)):
+    scorer = TopologyProximityScorer(
+        "g1", placed, _view(workers), anchors, max_score=150.0
+    )
+    scored = await scorer.score(candidates)
+    return [c.score or 0 for c in scored]
+
+
+@pytest.mark.asyncio
+async def test_a_tight_candidate_beats_a_closer_but_looser_one():
+    """🔴 The whole reason this is lexicographic. The two distances are not
+    comparable quantities: a candidate's own machines carry the tensor-parallel
+    all-reduce, once per layer per token, and the gap to the rest of the group
+    carries the KV transfer, once per request. Summing them would let a large
+    enough gain on the second buy a worse first."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),  # where the group already is
+        _worker(2, "rack-a", "zone-1"),
+        _worker(3, "rack-b", "zone-1"),
+        _worker(4, "rack-b", "zone-1"),
+    ]
+    placed = [_instance(1, "prefill", worker_id=1)]
+
+    # 甲: both its machines in one rack, but a rack away from the group.
+    tight_but_far = _spanning_candidate(workers[2], [workers[3]])
+    # 乙: one machine in the group's own rack, the other a rack away.
+    loose_but_near = _spanning_candidate(workers[1], [workers[2]])
+
+    tight, loose = await _score_candidates(
+        workers, placed, [tight_but_far, loose_but_near]
+    )
+
+    assert tight > loose
+
+
+@pytest.mark.asyncio
+async def test_two_equally_tight_candidates_are_split_by_closeness():
+    """The second term still decides, just only among candidates the first
+    term calls equal — which is what makes it a tie-break rather than a
+    weight."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-a", "zone-1"),
+        _worker(3, "rack-b", "zone-1"),
+        _worker(4, "rack-b", "zone-1"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    near = _spanning_candidate(workers[1], [workers[0]])
+    far = _spanning_candidate(workers[2], [workers[3]])
+
+    near_score, far_score = await _score_candidates(workers, placed, [near, far])
+
+    assert near_score > far_score
+
+
+@pytest.mark.asyncio
+async def test_a_single_machine_candidate_is_never_penalised():
+    """It has no pair to be apart. The penalty exists so that every placement
+    made today scores exactly what it scored before this notion existed."""
+    workers = [_worker(1, "rack-a"), _worker(2, "rack-a")]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    scores = await _score_candidates(
+        workers, placed, [_candidate(workers[1])], anchors=("prefill",)
+    )
+
+    assert scores[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_a_spanning_candidate_is_measured_from_all_its_machines():
+    """Scoring only the primary would call a candidate far from a group that
+    its other half is sitting next to."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-b", "zone-1"),
+        _worker(3, "rack-a", "zone-1"),
+        _worker(4, "rack-c", "zone-2"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    # Both are equally loose inside — primary in rack-b, one machine elsewhere
+    # — so the penalty cancels and only the closeness term can separate them.
+    reaching = _spanning_candidate(workers[1], [workers[2]])  # other half: rack-a
+    away = _spanning_candidate(workers[1], [workers[3]])  # other half: zone-2
+
+    reaching_score, away_score = await _score_candidates(
+        workers, placed, [reaching, away]
+    )
+
+    assert reaching_score > away_score

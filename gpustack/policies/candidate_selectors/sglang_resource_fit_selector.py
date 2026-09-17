@@ -999,8 +999,40 @@ class MemFractionStaticCalculator:
         Args:
             workers: List of workers used to determine GPU memory characteristics, the input workers should only contain same type GPUs.
         """
+        # 🔴 The same-type precondition above, enforced rather than trusted.
+        # Every branch below reads the fleet as one kind of machine: `_is_npu`
+        # answers `any(...)`, so a single Ascend worker in the list sends
+        # NVIDIA cards down the NPU thresholds, and `_get_min_gpu_sum` takes a
+        # minimum across the whole list, so the smallest card sizes the
+        # largest. Neither fails — together they return a plausible wrong
+        # fraction, and a wrong `mem_fraction_static` is an OOM at startup or
+        # VRAM left unused, discovered nowhere near here.
+        #
+        # Today's only caller groups by GPU type first. This is what keeps that
+        # true for the next one, and it degrades rather than raises: 0 is the
+        # value this field is initialised with and the one `_cal_effective_vram`
+        # reads as «no adjustment», so a violated precondition costs SGLang's
+        # own default instead of a scheduling pass.
+        gpu_types = {
+            gpu.type
+            for worker in workers
+            for gpu in ((worker.status and worker.status.gpu_devices) or [])
+        }
+        if len(gpu_types) > 1:
+            logger.warning(
+                "mem_fraction_static was asked for across more than one GPU "
+                "type (%s); leaving it unset rather than sizing every card by "
+                "one of them.",
+                ", ".join(sorted(str(t) for t in gpu_types)),
+            )
+            return 0
+
+        # Not dead despite the caller consulting `_param_mem_fraction_static`
+        # first: that gate is `> 0`, so an explicit `--mem-fraction-static=0`
+        # arrives here. Returning None then divided by None in
+        # `_cal_effective_vram`.
         if find_parameter(self._model.backend_parameters, ["mem-fraction-static"]):
-            return
+            return 0
 
         is_npu = self._is_npu(workers)
         gpu_mem_bytes = self._get_min_gpu_sum(workers)

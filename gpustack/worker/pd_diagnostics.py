@@ -185,12 +185,41 @@ _SIGNATURES: Tuple[Tuple[str, str, str], ...] = (
         "kv connector conflict",
         r"kv[-_]transfer[-_]config.*(specified|duplicate|already)|"
         r"multiple.*kv_connector",
+        # 🔴 This used to tell the user that disaggregation and an extended KV
+        # cache cannot coexist and that any combination had to be hand-written
+        # under pd mode 'custom'. Both halves stopped being true once
+        # `worker/kv_transfer.py` started folding the two descriptors into one
+        # MultiConnector, and the summary was then naming a supported
+        # combination as impossible — on a failure whose real cause it never
+        # mentioned. Measured the other way on 2026-08-27: a prefill logged
+        # `Composed 2 KV connectors into a MultiConnector for role 'prefill':
+        # LMCacheMPConnector then NixlConnector`, and vLLM went on to create
+        # that composite and register both children.
+        #
+        # The cause is therefore never "you asked for both". It is whatever
+        # got past the fold, and the three ways that happens are what the
+        # summary sends the operator to look for — in the order that tells
+        # them apart with one grep each.
         "More than one KV connector configuration reached the engine in a "
-        "flag that carries one. A disaggregated role cannot also enable an "
-        "extended KV cache, and its engine parameters must not carry a "
-        "hand-written --kv-transfer-config. The engine can compose connectors "
-        "(MultiConnector) — GPUStack does not assemble that for you, so a "
-        "combination has to be written by hand under pd mode 'custom'.",
+        "flag that carries one. A disaggregated role CAN also enable an "
+        "extended KV cache: the disaggregation connector and the cache's are "
+        "folded into a single MultiConnector, prefill asking the cache first "
+        "and decode asking its own prefill first, and that composite has been "
+        "measured being instantiated by the engine. So this is the fold "
+        "having been bypassed, and the worker's own log says which way. "
+        "Search it for 'Composed N KV connectors into a MultiConnector'. If "
+        "that line is missing, search for 'Leaving N --kv-transfer-config "
+        "arguments unmerged': the fold declines when one of the values is not "
+        "a JSON document — usually a descriptor edited by hand in this role's "
+        "engine parameters, still carrying quotes that only a shell would "
+        "have stripped — and it then leaves both flags in place on purpose, "
+        "so the engine reports a duplicate rather than one connector silently "
+        "going missing. If neither line is present, this member's command was "
+        "not assembled by the vLLM path, which is the only one that folds: "
+        "another engine, or a custom backend version, passes on every flag it "
+        "was handed. And if the composition line IS present, then one flag is "
+        "all the engine got and the duplication is inside it — read the "
+        "connectors listed in kv_connector_extra_config.",
     ),
 )
 

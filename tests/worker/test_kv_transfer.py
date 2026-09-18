@@ -74,14 +74,27 @@ def test_the_order_follows_origin_not_position():
     )
 
 
-def test_an_unknown_role_keeps_the_order_it_was_given():
+@pytest.mark.parametrize("role", [None, "router"])
+def test_a_role_with_no_stated_preference_keeps_the_order_it_was_given(role):
     """Inventing a priority for a role whose semantics are unknown is how a
-    wrong answer gets served confidently."""
+    wrong answer gets served confidently.
+
+    🔴 This asserted the reversed order until 2026-09-18, which made the case
+    unreachable: reversing for every role that is not prefill leaves no third
+    behaviour for the module comment to be describing. Only decode wants the
+    connector order flipped; a router or a role-less deployment gets what it
+    handed in.
+
+    The role-less case is the one that reaches a container. A local (LMCache)
+    extended KV cache emits its descriptor whatever the user's parameters say,
+    so a deployment that also hand-writes `--kv-transfer-config` composes two
+    of them with no role at all — and had them flipped.
+    """
     arguments = ["serve", *_flag(CACHE), *_flag(PD)]
 
-    result = compose_kv_transfer_config(arguments, None, cache_first=CACHE)
+    result = compose_kv_transfer_config(arguments, role, cache_first=CACHE)
 
-    assert _connectors(result) == ["NixlConnector", "LMCacheConnectorV1"]
+    assert _connectors(result) == ["LMCacheConnectorV1", "NixlConnector"]
 
 
 # --- the untouched cases have to stay untouched ---------------------------- #

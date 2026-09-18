@@ -585,6 +585,30 @@ class RoleSpec(BaseModel):
     model is a schema change only.
     """
 
+    lora_list: Optional[List[LoraListEntry]] = None
+    """Declared so it can be *refused*, which is the only thing admission does
+    with it today.
+
+    🔴 It is here because its absence was invisible. `RoleSpec` takes pydantic's
+    default `extra="ignore"` — the same leniency that lets an old row's
+    `cpu_only` be read straight past — so a deployment that put its adapters on
+    one role got a 200, a read-back with no `lora_list` anywhere, and not one
+    word about where they went. A field that exists and is rejected says what
+    happened; a field that does not exist says nothing.
+
+    Nothing consumes it: `validate_roles` refuses any role that sets it. Role
+    names would have to reach the engine through the group's router, and the
+    router's member table is indexed by served-model name — the same wall that
+    makes LoRA and disaggregation refuse each other outright (see
+    `_reject_lora_under_disaggregation`). Implementing per-role adapters before
+    that is settled would be building on it.
+
+    It is nonetheless a real override field rather than a role-own one, so the
+    projection carries it: the day the refusal lifts, `role_effective_model`
+    already hands each member its own list and there is no second mechanism to
+    add.
+    """
+
     dependencies: Optional[List[str]] = None
     """Roles that must be ready before this one starts. Must not cycle."""
     # 🔴 No `cpu_only`. It was a boolean standing in for a quantity: the
@@ -919,7 +943,69 @@ class DegradationReasonEnum(str, Enum):
     Set only for a version `version_in_range` positively reports as out of
     range. Unpinned, unparseable and unknown-to-us all leave it unset -- the
     same fail-open the cache check takes, and for the same reason: an exotic
-    version string must never be the thing that condemns a deployment."""
+    version string must never be the thing that condemns a deployment.
+
+    Two parseable shapes are let through as well, because sorting them below
+    the floor answers a question they were never asked: a local version
+    (`0.5.6+ourfix`) is by PEP 440's own definition an official release plus
+    whatever the packager put on top of it -- backporting the very fix the
+    floor wants is a common reason to cut one -- and a pre-release
+    (`0.5.7-rc1`, `0.5.6.dev0`) is cut from a branch rather than from a
+    release line the floor was ever measured against."""
+
+    PAIRING_UNVERIFIED = "pairing_unverified"
+    """A pairing factor whose two effective values GPUStack could not compare —
+    usually one role declaring it and the other going silent.
+
+    The factors prefill and decode must share — the context window, the tensor
+    parallelism, the dtypes, the block size, the KV cache layout — used to be
+    compared only when *both* roles wrote them down, and a group where one side
+    was silent passed the check by not being checked. That is the ordinary way
+    a group is misconfigured: edit prefill, leave decode alone.
+
+    🔴 **A marker and not a 400, because the silent side's value is genuinely
+    unknown here.** Substituting the engines' defaults was the obvious repair
+    and is wrong for every one of these: an unwritten `--tensor-parallel-size`
+    is the member's card count and not 1, since GPUStack injects it itself; an
+    unwritten `--dtype` is `auto`, which needs the checkpoint's config to
+    resolve and admission has no session to fetch one; `--block-size` and
+    `--kv-cache-layout` are settled by the platform and the attention backend,
+    `VLLM_KV_CACHE_LAYOUT` included, so any constant written down would drift
+    into a false alarm on a later vLLM. A pair this marker describes is very
+    often correct — what it reports is that nothing verified it, which is not
+    the same claim as "this is broken".
+
+    🔴 **An explicit `auto` is silence, not a third value.** `--dtype auto`
+    against `--dtype float16` lands here rather than being refused: on a float16
+    checkpoint the two are the same run, and telling them apart needs the config
+    file admission cannot open. Writing `auto` down does not turn a question
+    into an answer.
+
+    A divergence GPUStack *can* prove — two concrete values that differ — is
+    still refused at admission. Both sides silent is deliberately not marked:
+    two roles taking the same default from the same engine on the same model
+    agree whatever it resolves to."""
+
+    PAIRING_TP_MISPLACED = "pairing_tp_misplaced"
+    """The cards the members actually got break the recipe's tensor-parallel
+    direction.
+
+    The admission check can only read the spec, and the spec routinely does not
+    contain the number: a role that writes no `--tensor-parallel-size` and pins
+    no cards runs whatever the scheduler gives it. Placement is where that
+    stops being unknown — every member's `gpu_indexes` is written down, the
+    engines derive tp from exactly that for a single-worker member, and the
+    direction the recipe declares (`PDMode.pairing.tensor_parallel`) can
+    finally be applied to the deployment that exists rather than the one that
+    was described.
+
+    🔴 **Marked, never enforced.** By the time this is knowable the members are
+    placed and, usually, serving; failing them would take down a group to
+    report a shape it is already running. Under NIXL the shape does break —
+    a decode narrower than its prefill raises an `IndexError` inside decode on
+    first transfer — but that failure belongs to the engine and arrives with
+    its own message. This is the attribution: the reason that IndexError exists
+    is a placement, and the placement is written on the model."""
 
     PLACEMENT_DRIFTED = "placement_drifted"
     """Members are deployed somewhere other than where one created now would

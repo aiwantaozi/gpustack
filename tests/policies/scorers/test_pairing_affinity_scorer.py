@@ -90,6 +90,12 @@ async def test_one_more_sibling_outweighs_every_other_scale_up_scorer():
     affinity is worth more than the whole range the resource scorers can
     move a candidate. Normalising the score into a fixed band would break it
     silently, and only for large groups.
+
+    ⚠️ The env value is a floor, not the production weight: the scale-up chain
+    sizes this against every scorer actually on it, which is more than the two
+    summed here. `tests/scheduler/test_pairing_affinity_weight.py` owns that
+    part -- this one only pins that the scorer alone still clears the two
+    resource scorers it was originally written against.
     """
     import gpustack.envs as envs
 

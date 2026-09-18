@@ -304,11 +304,22 @@ SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_UP_LOCALITY_MAX_SCORE", 5)
 )
 # Per opposite-role sibling on a worker, when scaling one role of a PD group
-# out. Deliberately larger than every other scale-up scorer's maximum put
-# together (100 + 5): the rule is "most decodes wins, and capacity breaks the
-# tie", which only holds while one more sibling outweighs anything the
-# resource scorers can say. Set to 0 to scale a group out by resource fit
-# alone.
+# out. The rule is "most decodes wins, and capacity breaks the tie", which only
+# holds while one more sibling outweighs anything the rest of the chain can
+# say.
+#
+# 🔴 **A floor, not the weight actually used.** This used to be documented as
+# "larger than every other scale-up scorer's maximum put together (100 + 5)",
+# and that arithmetic went stale the moment `TopologyProximityScorer` joined
+# the chain: its ceiling is 150 per rung times 3 rungs on the built-in
+# zone/rack/host chain, so the rest of the chain reached 555 and outranked the
+# 200 here. `_pairing_affinity_max_score` now sums the ceilings of the scorers
+# actually on the chain and takes `max(this value, that sum + 1)`, so raising
+# this still raises the weight and adding the next scorer cannot repeat the
+# regression -- which writing a bigger number here would only postpone.
+#
+# Set to 0 to scale a group out by resource fit alone; 0 is read as an off
+# switch and is never raised to the floor.
 SCHEDULER_PAIRING_AFFINITY_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_PAIRING_AFFINITY_MAX_SCORE", 200)
 )

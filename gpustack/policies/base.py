@@ -135,6 +135,24 @@ class ModelInstanceScorer(ABC):
 
 
 class ScheduleCandidatesScorer(ABC):
+    @property
+    def score_ceiling(self) -> float:
+        """The most this scorer can add to a single candidate.
+
+        Not the same question as `ModelInstanceScorer.max_score`, which is a
+        weight `ModelInstanceScoreChain` normalises by. `CandidateScoreChain`
+        does not normalise -- it sums -- so a scorer that wants to outrank the
+        rest of its chain has to know what the rest of its chain can pay, and
+        that is what this answers. Used by the scale-up chain to size
+        `PairingAffinityScorer`; see `_pairing_affinity_max_score`.
+
+        The default reads `_max_score`, which is the ceiling for every scorer
+        whose score is `ratio * _max_score` with `ratio <= 1` -- all of them
+        today except `TopologyProximityScorer`, which multiplies by a layer
+        depth and overrides this.
+        """
+        return float(getattr(self, "_max_score", 0.0) or 0.0)
+
     @abstractmethod
     async def score(
         self, candidates: List[ModelInstanceScheduleCandidate]

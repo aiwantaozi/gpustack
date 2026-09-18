@@ -116,6 +116,7 @@ class WorkerStatusCollector:
         self._inject_unified_memory(status)
         self._inject_computed_filesystem_usage(status)
         self._inject_topology_facts(status)
+        self._inject_kv_ifname(status)
 
         # If disable_worker_metrics is set, set metrics_port to -1
         metrics_port = self._cfg.worker_metrics_port
@@ -144,6 +145,17 @@ class WorkerStatusCollector:
         """
         facts = facts_from_devices(status.gpu_devices or [])
         status.topology_facts = facts or None
+
+    def _inject_kv_ifname(self, status: WorkerStatus):
+        """The KV-transfer NIC this worker was told to use, if it was told one.
+
+        Forwarded verbatim rather than normalised. The field is a record of
+        what was configured, and a whitespace-only value -- which
+        `derive_net_device` deliberately steps over and derives anyway -- is a
+        mistake someone wants to see, not one to launder into the `None` that
+        here means "nobody set this".
+        """
+        status.kv_ifname = self._cfg.kv_ifname
 
     def _inject_unified_memory(self, status: WorkerStatus):
         is_unified_memory = False

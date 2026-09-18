@@ -49,6 +49,7 @@ from gpustack.schemas.models import (
 )
 from gpustack.scheduler import group_schedule
 from gpustack.scheduler.group_capacity import GroupCapacity
+from gpustack.scheduler.topology import NODE_LAYER
 from gpustack.scheduler.group_schedule import schedule_group
 from tests.fixtures.workers.fixtures import (
     linux_nvidia_22_H100_80gx8,
@@ -712,6 +713,55 @@ async def test_e_a_label_selector_matching_nothing_is_a_measured_zero(config):
     ), messages
     assert any(
         "Matched 3 workers by cluster selector." in message for message in messages[1:]
+    ), messages
+
+
+@pytest.mark.asyncio
+async def test_e_an_empty_cluster_is_refused_with_the_filters_own_account(config):
+    """The same rule as the test above, on the one path that had no role to ask
+    about.
+
+    A cluster with nothing in it reaches the solver as a domain with no
+    workers, and that refusal was built without a role — so the caller asked
+    `notes_for(None)`, which answers nothing by contract, and the operator got
+    "room for 0" with no statement of what was counted. The count is identical
+    for a fleet that was filtered away and one that was never joined, so the
+    filter line is the only thing that tells the two apart.
+    """
+    placed, messages = await _place(config, _pd_model(2, 2), [])
+
+    assert placed is None
+    assert messages[0] == (
+        "The group needs 4 placements and the cluster has room for 0."
+    )
+    assert any(
+        "Matched 0 workers by cluster selector." in message for message in messages[1:]
+    ), messages
+
+
+@pytest.mark.asyncio
+async def test_e_a_must_gather_with_no_domain_to_walk_names_the_filter_too(config):
+    """The other unattributed refusal: `must` at a layer whose every domain is
+    empty, so the walk never enters one and there is no best attempt to
+    describe.
+
+    The host rung is the case that survives an empty fleet — it is the one
+    scope that exists whatever the operator declared, which is why a `must` on
+    it is enforced rather than dropped as unknown, and with no worker there is
+    nothing at it to walk into. The sentence is the solver's own; what was
+    missing is the line underneath saying which fleet produced no domain.
+    """
+    model = _pd_model(
+        2,
+        2,
+        gather=GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer=NODE_LAYER),
+    )
+    placed, messages = await _place(config, model, [])
+
+    assert placed is None
+    assert messages[0] == "No topology domain has any capacity for this group."
+    assert any(
+        "Matched 0 workers by cluster selector." in message for message in messages[1:]
     ), messages
 
 

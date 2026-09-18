@@ -298,7 +298,7 @@ def test_an_undeclared_domain_is_not_a_gather_target():
 
 
 def test_the_domain_and_switch_keys_are_offered_as_candidates():
-    """§2: the built-in layers shrink to three, but the keys a fleet already
+    """§2: the built-in layers shrink to two, but the keys a fleet already
     publishes stay in the suggestion list so adding the layer yields values at
     once rather than after a relabelling campaign."""
     keys = {k.key for k in KNOWN_KEYS}

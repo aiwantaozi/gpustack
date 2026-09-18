@@ -1,12 +1,17 @@
-"""Router membership: the registry is the only way in under `--enable-igw`.
+"""Router membership: the registry is read, never assumed.
 
-Measured on a live 1P1D, and confirmed in upstream source for both routers:
-the igw branch builds the PD router with empty worker lists
-(`create_vllm_pd_router(&[], &[], ...)` with the upstream comment
-"Empty worker list - workers added later"; SGLang's `create_pd_router(None,
-None, ...)`), so the command-line peers are never passed and a request before
-registration gets 503. Registration is therefore a precondition of servability,
-not an optimisation.
+What a router already holds when this code first reaches it is
+version-dependent. Upstream's igw branch does build the PD router with empty
+worker lists (`create_vllm_pd_router(&[], &[], ...)` with the comment "Empty
+worker list - workers added later"; SGLang's `create_pd_router(None, None,
+...)`), and an earlier reading here took that to mean the command-line peers
+never arrive at all — refuted on 910B2 2026-09-01, where a 1P1D started with
+`--enable-igw --prefill ... --decode ...` reports both members in
+`GET /workers`: what had been seen was the startup transient.
+
+So the invariant these tests guard is not "the registry starts empty" but
+"the registry is read back, and the read-back is what decides servability" —
+which is the same code either way.
 """
 
 from types import SimpleNamespace
@@ -115,13 +120,20 @@ async def test_a_recipe_that_declares_the_api_without_launching_it_is_not_a_fail
     assert outcome.reason is None
 
 
-def test_a_persistent_failure_names_the_way_out():
-    """🔴 And the way out is an OPERATOR action, which is why it is stated
-    rather than performed: the controller cannot un-launch a flag on a running
-    process, and restarting the router repeats the same failed registration.
+def test_a_persistent_failure_says_where_to_look_without_naming_a_cause():
+    """🔴 The escalated message is USER-VISIBLE, so what it may claim matters.
 
     One failure is ordinary — a router that just came up, a member still being
-    probed — so escalating on the first would train people to ignore it.
+    probed — so escalating on the first would train people to ignore it. Five
+    in a row earns the right to send someone to the router itself.
+
+    🔴 And it must send them to evidence, not to a mechanism. The message used
+    to assert that members could only ever join through this API and that the
+    way out was to drop `--enable-igw`; that causality was refuted on 910B2
+    2026-09-01 (the command-line peers DO enter the registry there), and it
+    pointed at the recipe for a failure the recipe had not caused. The
+    negative assertions below are the regression: this wording must not come
+    back.
     """
     pd_membership.forget(7)
     for _ in range(pd_membership.PERSISTENT_FAILURE_PASSES - 1):
@@ -130,8 +142,14 @@ def test_a_persistent_failure_names_the_way_out():
 
     pd_membership.record(7, MembershipOutcome(ok=False, reason="not admitted"))
     escalated = pd_membership.outcome_for(7).reason
-    assert "--enable-igw" in escalated
-    assert "remove that flag" in escalated
+    # It still says what happened, for how long, and what to read next.
+    assert "not admitted" in escalated
+    assert str(pd_membership.PERSISTENT_FAILURE_PASSES) in escalated
+    assert "GET /workers" in escalated
+    # And it no longer explains the failure with a refuted mechanism.
+    assert "--enable-igw" not in escalated
+    assert "only join through this API" not in escalated
+    assert "remove that flag" not in escalated
 
     # A success clears the count, so a transient outage does not leave the
     # group wearing an escalated message it has grown out of.
@@ -196,12 +214,12 @@ def test_a_members_url_is_percent_encoded_in_the_removal_path():
 def test_only_an_unreadable_registry_counts_toward_a_restart():
     """🔴 Which failure a restart can fix, and which it only makes worse.
 
-    Under `--enable-igw` the command-line peers never enter the registry
-    (measured 2026-08-28: a router started with `--prefill` reports
-    `GET /workers` -> total 0), so restarting turns "some members registered"
-    into "none registered, answering 503". That price buys something only when
-    the router is not answering at all. A refused member means it is alive and
-    disagreeing -- a version or argument mismatch it would refuse again.
+    The shipped recipes run one router per group and it is the gateway's only
+    upstream, so recreating it interrupts the whole group until the
+    replacement is up and has probed its peers. That price buys something only
+    when the router is not answering at all. A refused member means it is
+    alive and disagreeing -- a version or argument mismatch that the
+    replacement would be handed and would refuse again.
     """
     model_id = 7788
     pd_membership.forget(model_id)

@@ -1,7 +1,7 @@
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -55,9 +55,9 @@ from gpustack.server.deps import (
 )
 from gpustack.schemas.models import (
     PD_MODE_BACKENDS,
+    ExtendedKVCacheConfig,
     LoraListEntry,
     PDModeEnum,
-    RoleSpec,
     Model,
     ModelCreate,
     ModelSpecBase,
@@ -90,7 +90,17 @@ from gpustack.server.lora_model_routes import (
     create_lora_model_routes,
     is_lora_list_stale,
 )
-from gpustack.utils.command import find_int_parameter, find_parameter
+from gpustack.server.pd_pairing import (
+    DIFFER,
+    PAIRING_MUST_MATCH,
+    compare_max_model_len,
+    compare_must_match,
+    effective_tensor_parallelism,
+    role_parameters,
+    tensor_parallel_rule,
+    violates_tensor_parallel_direction,
+)
+from gpustack.utils.command import find_last_parameter, find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
 from gpustack.routes.model_common import (
@@ -504,6 +514,23 @@ def validate_roles(  # noqa: C901
                     "role's footprint is derived from the model."
                 )
             )
+        # Refused rather than ignored, and for the same reason `resources` is:
+        # a value nothing reads is indistinguishable from one that was never
+        # sent. Until this field existed the role's adapters were dropped by
+        # `extra="ignore"` and the response was a 200 with no `lora_list` in
+        # it — the user's only clue that their configuration had not been
+        # stored was reading the record back and noticing an absence.
+        if role.lora_list:
+            raise BadRequestException(
+                message=(
+                    f"Role '{role.name}' cannot declare LoRA adapters: a "
+                    "multi-role deployment is reached through its router, and "
+                    "the router's member table is indexed by served-model "
+                    "name, so an adapter name attached to one role never "
+                    "resolves to that role. Declare lora_list on the model "
+                    "instead, or deploy the adapters as their own model."
+                )
+            )
         if role.resources is not None:
             if role.resources.cpu is not None and role.resources.cpu <= 0:
                 raise BadRequestException(
@@ -585,6 +612,7 @@ def validate_roles(  # noqa: C901
             message="A disaggregated model has at most one router."
         )
 
+    _reject_lora_under_disaggregation(field)
     _reject_cache_under_a_hand_written_mode(field, roles, disaggregation)
     _reject_a_policy_the_mode_cannot_apply(disaggregation)
     _reject_router_params_the_platform_owns(roles, disaggregation)
@@ -714,6 +742,55 @@ def _reject_a_policy_the_mode_cannot_apply(disaggregation) -> None:
     )
 
 
+def _reject_lora_under_disaggregation(field) -> None:
+    """LoRA adapters and disaggregation cannot be asked for together yet.
+
+    🔴 **The combination deploys and then refuses every request**, which is why
+    it is refused here instead of documented. Reproduced three times out of
+    three, with each hop instrumented: the group reaches `running` with all
+    three members, the adapter's route `<base>:<adapter>` is created and reports
+    a ready target, a chat against the base name answers 200 — and a chat
+    against the adapter name answers 503 `No available workers`. The same
+    adapter on the same worker against the same base model, deployed as a plain
+    single instance, answers 200. Both engines are innocent: prefill and decode
+    each list the adapter in their own `GET /v1/models` and each answer a direct
+    chat on it.
+
+    The wall is the router in front of the group. Its worker registry is indexed
+    by served-model name, and a member registers itself under `model_id:
+    "{{model_name}}"` — the base name, once. So the registry has no entry under
+    the adapter's name to hand the request to, and the honest reading of that is
+    that adapter names are not part of a group's addressing scheme at all.
+    Making them so is a change to the router's membership protocol, not a field
+    on this model.
+
+    Judged against the merged state, so neither direction of an update slips
+    past: adding adapters to a group that already disaggregates, and adding
+    disaggregation to a model that already carries adapters, are the same
+    combination arriving from opposite sides.
+
+    Admission-time only. A row that already holds both keeps reconciling — this
+    is never consulted outside create and update — because refusing to converge
+    a deployment that exists would take away the running base model too, and
+    the base model is the part that works.
+    """
+    if not field("lora_list"):
+        return
+
+    raise BadRequestException(
+        message=(
+            "A disaggregated deployment cannot serve LoRA adapters. A group is "
+            "addressed through its router, whose member table is indexed by "
+            "served-model name, and its members register under the base model's "
+            "name only — so a request naming an adapter reaches no member and "
+            "fails with 'No available workers', even though both engines have "
+            "the adapter loaded. Either remove the adapters from this "
+            "deployment and serve them from a non-disaggregated one, which is "
+            "unaffected, or remove the disaggregation."
+        )
+    )
+
+
 def _reject_cache_under_a_hand_written_mode(field, roles, disaggregation) -> None:
     """`custom` mode and an extended KV cache cannot be asked for together.
 
@@ -753,19 +830,10 @@ def _reject_cache_under_a_hand_written_mode(field, roles, disaggregation) -> Non
         )
 
 
-# Engine parameters that must agree between prefill and decode, with the
-# spellings each engine uses for them. The split below is not stylistic: the
-# first entry is the one the engines do NOT check, and the rest are ones they
-# do — checked here anyway so the report names the role rather than surfacing
-# as a geometry assertion inside a container.
-_PAIRING_MAX_LEN = ["max-model-len", "max_model_len", "context-length"]
-_PAIRING_TP = ["tensor-parallel-size", "tp", "tp-size"]
-_PAIRING_MUST_MATCH = {
-    "dtype": ["dtype"],
-    "KV cache dtype": ["kv-cache-dtype"],
-    "block size": ["block-size", "page-size"],
-    "KV cache layout": ["kv-cache-layout"],
-}
+# The tables the two sides are compared through live in `server.pd_pairing`,
+# because the placement-time check and the `pairing_unverified` marker read
+# exactly the same ones. Keeping a second copy here is how the underscore
+# spellings went missing from one of them.
 
 # The hybrid KV cache manager is a boolean pair rather than a value, so it
 # cannot go in the table above. Both spellings are argparse's, and both appear
@@ -798,17 +866,6 @@ def _hybrid_cache_manager_enabled(parameters: List[str]) -> bool:
     return enabled
 
 
-def _role_parameters(role: RoleSpec, model_parameters) -> List[str]:
-    """A role's effective engine parameters.
-
-    `None` inherits, an empty list does not — a role that deliberately clears
-    the model's parameters must not silently get them back.
-    """
-    if role.backend_parameters is None:
-        return list(model_parameters or [])
-    return list(role.backend_parameters)
-
-
 def _check_tensor_parallel_pairing(disaggregation, *, prefill_tp, decode_tp) -> None:
     """Apply the recipe's declared tensor-parallel direction.
 
@@ -821,14 +878,13 @@ def _check_tensor_parallel_pairing(disaggregation, *, prefill_tp, decode_tp) -> 
     before the rule became declarable.
     """
     mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
-    mode = get_pd_mode(mode_name)
-    rule = (
-        mode.pairing.tensor_parallel
-        if mode is not None
-        else PDTensorParallelPairingEnum.DECODE_GE_PREFILL
-    )
+    rule = tensor_parallel_rule(get_pd_mode(mode_name))
+    if not violates_tensor_parallel_direction(
+        rule, prefill_tp=prefill_tp, decode_tp=decode_tp
+    ):
+        return
 
-    if rule == PDTensorParallelPairingEnum.DECODE_GE_PREFILL and decode_tp < prefill_tp:
+    if rule == PDTensorParallelPairingEnum.DECODE_GE_PREFILL:
         raise BadRequestException(
             message=(
                 f"decode runs tensor parallelism {decode_tp}, below prefill's "
@@ -839,15 +895,14 @@ def _check_tensor_parallel_pairing(disaggregation, *, prefill_tp, decode_tp) -> 
                 f"least prefill's."
             )
         )
-    if rule == PDTensorParallelPairingEnum.PREFILL_GE_DECODE and prefill_tp < decode_tp:
-        raise BadRequestException(
-            message=(
-                f"prefill runs tensor parallelism {prefill_tp}, below decode's "
-                f"{decode_tp}. pd mode '{mode_name}' gathers each decode rank's "
-                f"KV from prefill ranks, which needs prefill's tensor "
-                f"parallelism to be at least decode's."
-            )
+    raise BadRequestException(
+        message=(
+            f"prefill runs tensor parallelism {prefill_tp}, below decode's "
+            f"{decode_tp}. pd mode '{mode_name}' gathers each decode rank's "
+            f"KV from prefill ranks, which needs prefill's tensor "
+            f"parallelism to be at least decode's."
         )
+    )
 
 
 def validate_role_pairing(  # noqa: C901
@@ -871,6 +926,19 @@ def validate_role_pairing(  # noqa: C901
     narrower than its prefill surfaces as an `IndexError` inside decode rather
     than as a configuration error, so the hard block is worth more than the
     assertion.
+
+    🔴 **Every rule here refuses only what it can prove.** The test is whether
+    both sides' effective values are determinable from the spec, not whether
+    both sides typed the parameter — `server.pd_pairing` holds that
+    distinction and says why substituting the engines' defaults instead would
+    have been wrong for every one of them. A factor one side left silent is
+    not decided here and not refused here; the deployment carries
+    `pairing_unverified` and says so.
+
+    That asymmetry is the point on this path in particular. `evaluate_model_input`
+    turns a refusal into the red compatibility error in the deploy form, so a
+    rule that guesses does not produce a 400 an operator can argue with — it
+    produces a form that refuses to submit a deployment which would have run.
 
     This is a pre-check, not a mirror of the engine's factor set — vLLM's own
     source says that set is "likely to evolve significantly over time", so the
@@ -897,27 +965,33 @@ def validate_role_pairing(  # noqa: C901
     if prefill is None or decode is None:
         return
 
-    prefill_params = _role_parameters(prefill, model_parameters)
-    decode_params = _role_parameters(decode, model_parameters)
+    prefill_params = role_parameters(prefill, model_parameters)
+    decode_params = role_parameters(decode, model_parameters)
 
-    prefill_len = find_int_parameter(prefill_params, _PAIRING_MAX_LEN)
-    decode_len = find_int_parameter(decode_params, _PAIRING_MAX_LEN)
-    if prefill_len is not None and decode_len is not None:
-        if prefill_len != decode_len:
-            raise BadRequestException(
-                message=(
-                    f"prefill and decode declare different context lengths "
-                    f"({prefill_len} vs {decode_len}). No engine checks this: "
-                    f"the pair handshakes, transfers KV and answers short "
-                    f"prompts, and a prompt above "
-                    f"{min(prefill_len, decode_len)} tokens fails at decode "
-                    f"after prefill has already computed it. Give both roles "
-                    f"the same context length."
-                )
+    verdict, prefill_len, decode_len = compare_max_model_len(
+        prefill_params, decode_params
+    )
+    if verdict == DIFFER:
+        raise BadRequestException(
+            message=(
+                f"prefill and decode declare different context lengths "
+                f"({prefill_len} vs {decode_len}). No engine checks this: "
+                f"the pair handshakes, transfers KV and answers short "
+                f"prompts, and a prompt above "
+                f"{min(prefill_len, decode_len)} tokens fails at decode "
+                f"after prefill has already computed it. Give both roles "
+                f"the same context length."
             )
+        )
 
-    prefill_tp = find_int_parameter(prefill_params, _PAIRING_TP)
-    decode_tp = find_int_parameter(decode_params, _PAIRING_TP)
+    # Effective, not declared. A role that writes no tp is not a role with an
+    # unknown one when it pins its own cards: the backend injects the card
+    # count for a single-worker member, so a decode pinned to one card beside a
+    # prefill at TP2 is a real inversion that nothing used to look at. A role
+    # that pins nothing stays unknown and is reported as unverified rather than
+    # held to a 1 it was never going to run.
+    prefill_tp = effective_tensor_parallelism(prefill, prefill_params)
+    decode_tp = effective_tensor_parallelism(decode, decode_params)
     if prefill_tp is not None and decode_tp is not None:
         _check_tensor_parallel_pairing(
             field("disaggregation"), prefill_tp=prefill_tp, decode_tp=decode_tp
@@ -936,22 +1010,19 @@ def validate_role_pairing(  # noqa: C901
             )
         )
 
-    for label, names in _PAIRING_MUST_MATCH.items():
-        prefill_value = find_parameter(prefill_params, names)
-        decode_value = find_parameter(decode_params, names)
-        if (
-            prefill_value is not None
-            and decode_value is not None
-            and prefill_value != decode_value
-        ):
-            raise BadRequestException(
-                message=(
-                    f"prefill and decode declare different {label} "
-                    f"('{prefill_value}' vs '{decode_value}'). The connector "
-                    f"rejects the pair on contact, so the group would never "
-                    f"serve; the roles must agree."
-                )
+    for label, names in PAIRING_MUST_MATCH.items():
+        if compare_must_match(label, names, prefill_params, decode_params) != DIFFER:
+            continue
+        prefill_value = find_last_parameter(prefill_params, names)
+        decode_value = find_last_parameter(decode_params, names)
+        raise BadRequestException(
+            message=(
+                f"prefill and decode declare different {label} "
+                f"('{prefill_value}' vs '{decode_value}'). The connector "
+                f"rejects the pair on contact, so the group would never "
+                f"serve; the roles must agree."
             )
+        )
 
 
 async def validate_model_in(
@@ -1651,14 +1722,132 @@ async def assert_cluster_belongs_to_org(
         )
 
 
+class _CacheDeclaration(NamedTuple):
+    """One extended-KV-cache configuration this deployment will actually run.
+
+    A role-bearing deployment has more than one, because `extended_kv_cache`,
+    `backend` and `backend_version` are all per-role overrides and the
+    injection resolver reads them through the role's projection
+    (`resolve_instance_cache_config`). Judging the Model's values alone would
+    check a configuration no member runs.
+    """
+
+    role: Optional[str]
+    ext: "ExtendedKVCacheConfig"
+    backend: Optional[str]
+    backend_version: Optional[str]
+
+    @property
+    def where(self) -> str:
+        """The clause that says which member a refusal is about, empty at the
+        model level so a role-less deployment's messages are unchanged."""
+        return f" on role '{self.role}'" if self.role else ""
+
+
+def _cache_declarations(model_in) -> List[_CacheDeclaration]:
+    """Every distinct cache configuration `model_in` would deploy.
+
+    The inherit-when-None merge is spelled out rather than taken from
+    `role_effective_model`, following the rest of this module: validation runs
+    on a `ModelCreate` / `ModelUpdate` / `ModelSpec`, and building a
+    `RoleEffectiveModel` out of a request body to read three fields off it is a
+    conversion the projection was not written for.
+
+    Deduplicated on the three fields that decide the answer, so a group whose
+    roles all inherit the Model's cache on the Model's engine is checked exactly
+    once and cannot start reporting a refusal against a role name for a value
+    the user wrote at the model level.
+    """
+    model_ext = getattr(model_in, "extended_kv_cache", None)
+    model_backend = getattr(model_in, "backend", None)
+    model_version = getattr(model_in, "backend_version", None)
+
+    declarations = [
+        (
+            _CacheDeclaration(None, model_ext, model_backend, model_version)
+            if model_ext
+            else None
+        )
+    ]
+    for role in getattr(model_in, "roles", None) or []:
+        ext = (
+            role.extended_kv_cache if role.extended_kv_cache is not None else model_ext
+        )
+        if not ext:
+            continue
+        declarations.append(
+            _CacheDeclaration(
+                role.name,
+                ext,
+                role.backend or model_backend,
+                role.backend_version or model_version,
+            )
+        )
+
+    seen = set()
+    out: List[_CacheDeclaration] = []
+    for declaration in declarations:
+        if declaration is None:
+            continue
+        key = (
+            declaration.ext.model_dump_json(),
+            declaration.backend,
+            declaration.backend_version,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(declaration)
+    return out
+
+
+def _reject_a_split_cache_pool(declarations: List[_CacheDeclaration]) -> None:
+    """Two roles of one deployment may not attach to two different cache
+    services.
+
+    🔴 The question this answers is whether `extended_kv_cache` is a per-member
+    setting or a property of the deployment, and for the *identity of the
+    service* it is the latter. A shared cache is one pool that the members
+    write into and read out of; naming two makes it two pools, prefill stores a
+    prefix into one and decode looks for it in the other, and nothing anywhere
+    reports a miss — the requests all succeed, at the hit rate the feature
+    exists to raise. That is the failure mode this module refuses on principle.
+
+    Deliberately narrower than symmetry. Whether one side may take a cache while
+    the other takes none is a *different* question, it is being settled against
+    the connector's compatibility hash rather than against intent, and the
+    answer there does not depend on this one: this rule needs two roles that are
+    both shared-enabled and cannot fire on a one-sided configuration at all.
+    """
+    services = {
+        declaration.ext.cache_service_id
+        for declaration in declarations
+        if declaration.role and declaration.ext.is_shared()
+    }
+    if len(services) < 2:
+        return
+
+    raise BadRequestException(
+        message=(
+            f"The roles of this deployment name different cache services "
+            f"({', '.join(str(service) for service in sorted(services))}). A "
+            f"shared KV cache is one pool the whole deployment reads and "
+            f"writes; two services are two pools, so a prefix stored by one "
+            f"role is never found by the other and the only symptom is a cache "
+            f"that never hits. Point every role at the same cache service, or "
+            f"leave the roles' extended_kv_cache unset so they inherit the "
+            f"model's."
+        )
+    )
+
+
 async def validate_shared_kv_cache(
     session: AsyncSession,
     model_in: Union[ModelCreate, ModelUpdate],
     owner_principal_id: int,
     effective_cluster_id: Optional[int],
 ) -> None:
-    """Validate the extended-KV-cache configuration against its target
-    cache service.
+    """Validate every extended-KV-cache configuration this deployment declares.
 
     "shared" mode attaches the model's inference engine to a CacheService
     row, so the service must exist, belong to the model's Org (a
@@ -1668,23 +1857,49 @@ async def validate_shared_kv_cache(
     config for the model's backend. "local" mode uses no service, so a
     stray cache_service_id is rejected as a mis-configuration rather than
     silently ignored.
+
+    🔴 **Every rule below used to apply to the Model's value only**, and
+    `extended_kv_cache` is a per-role override — so writing the identical
+    configuration under `roles[].extended_kv_cache` was accepted with a 200 in
+    every case this function exists to refuse: a service id that names nothing,
+    'local' carrying a service id, 'shared' carrying none, a service in another
+    cluster, another tenant's service, a provider that cannot configure the
+    backend, an engine version under the provider's floor. Not a deliberate
+    exemption: the one role-aware check in this area,
+    `_reject_cache_under_a_hand_written_mode`, does refuse a role-level
+    `enabled` — a role's cache was always meant to be seen here.
     """
-    ext = model_in.extended_kv_cache
+    declarations = _cache_declarations(model_in)
+    _reject_a_split_cache_pool(declarations)
+    for declaration in declarations:
+        await _validate_one_cache_declaration(
+            session, declaration, owner_principal_id, effective_cluster_id
+        )
+
+
+async def _validate_one_cache_declaration(
+    session: AsyncSession,
+    declaration: _CacheDeclaration,
+    owner_principal_id: int,
+    effective_cluster_id: Optional[int],
+) -> None:
+    ext = declaration.ext
+    where = declaration.where
     if not ext or not ext.enabled:
         return
 
     if ext.is_local():
         if ext.cache_service_id:
             raise BadRequestException(
-                message="cache_service_id is only valid when mode is 'shared'"
+                message=f"cache_service_id is only valid when mode is 'shared'{where}"
             )
         return
 
     if not ext.cache_service_id:
         raise BadRequestException(
             message=(
-                "cache_service_id is required when extended KV cache "
-                "mode is 'shared'"
+                f"cache_service_id is required when extended KV cache "
+                f"mode is 'shared'{where}"
             )
         )
 
@@ -1694,23 +1909,26 @@ async def validate_shared_kv_cache(
         or cache_service.deleted_at is not None
         or cache_service.owner_principal_id != owner_principal_id
     ):
-        raise NotFoundException(message="Cache service not found")
+        raise NotFoundException(message=f"Cache service not found{where}")
 
     if (
         effective_cluster_id is not None
         and cache_service.cluster_id != effective_cluster_id
     ):
         raise BadRequestException(
-            message="The cache service must be in the same cluster as the model."
+            message=(
+                f"The cache service must be in the same cluster as the "
+                f"model{where}."
+            )
         )
 
     provider = get_cache_provider(cache_service.provider_name)
-    backend = model_in.backend or BackendEnum.VLLM.value
+    backend = declaration.backend or BackendEnum.VLLM.value
     if provider is None or provider.integration_for(backend) is None:
         raise BadRequestException(
             message=(
                 f"Cache service provider '{cache_service.provider_name}' is "
-                f"not compatible with backend '{backend}'."
+                f"not compatible with backend '{backend}'{where}."
             )
         )
 
@@ -1741,7 +1959,7 @@ async def validate_shared_kv_cache(
             message=(
                 f"Cache service provider '{cache_service.provider_name}' "
                 f"has no '{backend}' integration for the cluster's "
-                f"accelerators ({', '.join(sorted(frameworks))})."
+                f"accelerators ({', '.join(sorted(frameworks))}){where}."
             )
         )
 
@@ -1751,7 +1969,7 @@ async def validate_shared_kv_cache(
     # falls outside every candidate integration's range; unparseable
     # versions fail open, and an unpinned version is resolved at deploy
     # time (the injection resolver re-checks it there).
-    engine_version = model_in.backend_version
+    engine_version = declaration.backend_version
     if engine_version:
         candidates = (
             [provider.integration_for(backend, framework) for framework in frameworks]
@@ -1767,7 +1985,7 @@ async def validate_shared_kv_cache(
                 message=(
                     f"Backend version {engine_version} is outside the "
                     f"cache provider's supported '{backend}' range "
-                    f"({ranges})."
+                    f"({ranges}){where}."
                 )
             )
 

@@ -31,6 +31,27 @@ class PDModeUnresolvedCode(str, Enum):
     """Several recipes fit and the catalog marks none of them preferred."""
 
 
+class PDModeIneligibleCode(str, Enum):
+    """Why one catalog entry cannot be picked here, as something a UI can
+    translate.
+
+    Same reasoning as `PDModeUnresolvedCode`: `ineligible_reason` is English
+    prose assembled on the server, so a client that renders it verbatim puts
+    an English sentence inside an otherwise localized form. The code plus
+    `ineligible_params` is the same statement in a shape the client looks up
+    in its own catalog; the prose stays as the fallback for an older client
+    and as the readable form in logs.
+    """
+
+    BACKEND_MISMATCH = "backend_mismatch"
+    """The recipe targets other engines than the one selected. Mixing engines
+    across roles needs pd mode `custom`."""
+
+    VENDOR_MISMATCH = "vendor_mismatch"
+    """The recipe targets accelerators this cluster (or the chosen partition)
+    does not report."""
+
+
 class PDModeEligibility(BaseModel):
     """One catalog entry's verdict for one engine × accelerator combination.
 
@@ -46,7 +67,15 @@ class PDModeEligibility(BaseModel):
     """The derived answer. At most one entry carries it."""
 
     ineligible_reason: Optional[str] = None
-    """Why this entry cannot be picked here. None when eligible."""
+    """Why this entry cannot be picked here, in English prose. None when
+    eligible. Kept for logs and for a client older than the code below."""
+
+    ineligible_code: Optional[PDModeIneligibleCode] = None
+    """The same statement as a key the client can translate."""
+
+    ineligible_params: Optional[Dict[str, str]] = None
+    """Pre-joined substitutions for that key, so the client never has to know
+    how a list of engines or vendors should read."""
 
 
 class PDModeResolution(BaseModel):

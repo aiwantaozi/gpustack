@@ -29,7 +29,7 @@ from gpustack.server.controllers import _gather_blocked_scale_out, _gather_unmet
 from tests.utils.topology_layers import layer_dict, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/zone"
+ZONE = "topology.gpustack.ai/zone"
 
 
 def _worker(id_, labels):
@@ -80,25 +80,25 @@ async def test_members_split_across_racks_are_degraded():
     """The whole point: the deployment went out, and this is the only record
     that it went out looser than asked."""
     workers = [
-        _worker(1, {ROOM: "H", RACK: "R1"}),
-        _worker(2, {ROOM: "H", RACK: "R2"}),
+        _worker(1, {ZONE: "H", RACK: "R1"}),
+        _worker(2, {ZONE: "H", RACK: "R2"}),
     ]
     assert await _check(PREFER_RACK, workers, [_instance(1), _instance(2)]) is True
 
 
 @pytest.mark.asyncio
 async def test_a_tighter_placement_than_asked_for_is_not_degraded():
-    """Asked for same-room, got same-rack. Tighter is never a miss — and this
+    """Asked for same-zone, got same-rack. Tighter is never a miss — and this
     is the direction the comparison is easiest to write backwards, since
     "looser" means *earlier* in a root-to-leaf order."""
-    prefer_room = GatherSpec(
+    prefer_zone = GatherSpec(
         strategy=GatherStrategyEnum.PREFER_GATHER, layer=lid("zone")
     )
     workers = [
-        _worker(1, {ROOM: "H", RACK: "R1"}),
-        _worker(2, {ROOM: "H", RACK: "R1"}),
+        _worker(1, {ZONE: "H", RACK: "R1"}),
+        _worker(2, {ZONE: "H", RACK: "R1"}),
     ]
-    assert await _check(prefer_room, workers, [_instance(1), _instance(2)]) is False
+    assert await _check(prefer_zone, workers, [_instance(1), _instance(2)]) is False
 
 
 @pytest.mark.asyncio
@@ -117,8 +117,8 @@ async def test_must_gather_reports_a_miss_it_should_never_have():
     be false, and a true here is an invariant that broke, not a report."""
     must = GatherSpec(strategy=GatherStrategyEnum.MUST_GATHER, layer=lid("rack"))
     workers = [
-        _worker(1, {ROOM: "H", RACK: "R1"}),
-        _worker(2, {ROOM: "H", RACK: "R2"}),
+        _worker(1, {ZONE: "H", RACK: "R1"}),
+        _worker(2, {ZONE: "H", RACK: "R2"}),
     ]
     assert await _check(must, workers, [_instance(1), _instance(2)]) is True
 
@@ -164,16 +164,16 @@ async def test_a_custom_rung_is_compared_like_any_other():
     topology = {"layers": [layer_dict("Pod", ["dc/pod"], parent="zone")]}
     prefer_pod = GatherSpec(strategy=GatherStrategyEnum.PREFER_GATHER, layer=lid("Pod"))
     same = [
-        _worker(1, {ROOM: "H", "dc/pod": "P1"}),
-        _worker(2, {ROOM: "H", "dc/pod": "P1"}),
+        _worker(1, {ZONE: "H", "dc/pod": "P1"}),
+        _worker(2, {ZONE: "H", "dc/pod": "P1"}),
     ]
     assert (
         await _check(prefer_pod, same, [_instance(1), _instance(2)], topology) is False
     )
 
     split = [
-        _worker(1, {ROOM: "H", "dc/pod": "P1"}),
-        _worker(2, {ROOM: "H", "dc/pod": "P2"}),
+        _worker(1, {ZONE: "H", "dc/pod": "P1"}),
+        _worker(2, {ZONE: "H", "dc/pod": "P2"}),
     ]
     assert (
         await _check(prefer_pod, split, [_instance(1), _instance(2)], topology) is True
@@ -188,9 +188,9 @@ async def test_the_router_does_not_count_towards_the_target():
     because the *proxy* landed elsewhere — a placement nothing constrained
     and which would be made again on the next reschedule."""
     workers = [
-        _worker(1, {ROOM: "H", RACK: "R1"}),
-        _worker(2, {ROOM: "H", RACK: "R1"}),
-        _worker(3, {ROOM: "H", RACK: "R9"}),
+        _worker(1, {ZONE: "H", RACK: "R1"}),
+        _worker(2, {ZONE: "H", RACK: "R1"}),
+        _worker(3, {ZONE: "H", RACK: "R9"}),
     ]
     group = [
         _instance(1, role="prefill"),

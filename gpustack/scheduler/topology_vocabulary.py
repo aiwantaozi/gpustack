@@ -81,7 +81,7 @@ class VocabularyField:
 
 
 # Root-to-leaf. The order is the one thing this module refuses to let a
-# cluster change: a tree whose rows sit inside racks is not a tree anyone
+# cluster change: a tree whose zones sit inside racks is not a tree anyone
 # recognises, and a fixed order is what lets two clusters mean the same thing
 # by "rack".
 #

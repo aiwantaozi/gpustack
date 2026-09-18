@@ -30,6 +30,7 @@ from gpustack.schemas.pd_modes import PDMode
 from gpustack.server.pd_mode_catalog import get_pd_modes
 from gpustack.schemas.pd_mode_resolution import (
     PDModeEligibility,
+    PDModeIneligibleCode,
     PDModeResolution,
     PDModeUnresolvedCode,
 )
@@ -237,19 +238,42 @@ def _resolution(
             not wanted or not effective_vendors or bool(wanted & effective_vendors)
         )
 
+        # The prose and the code say the same thing, and both are sent: the
+        # code is what a localized client renders, the prose is what an older
+        # one falls back to and what a log reads. Assembling the params here
+        # rather than shipping raw lists keeps "how a list of engines reads"
+        # in one place instead of in every client.
         reason = None
+        code = None
+        params = None
         if not backend_ok:
+            targets = " / ".join(entry.backends)
             reason = (
-                f"Requires {' / '.join(entry.backends)}; the selected engine "
+                f"Requires {targets}; the selected engine "
                 f"is {backend}. Mixing engines across roles needs pd mode "
                 f"'custom'."
             )
+            code = PDModeIneligibleCode.BACKEND_MISMATCH
+            # `backend` may be None when the caller has not picked one yet;
+            # the half-sentence that replaces it is the client's to word, so
+            # an empty string is sent rather than a server-side "this engine".
+            params = {"targets": targets, "backend": backend or ""}
         elif not vendor_ok:
+            required = " / ".join(sorted(wanted))
+            present = ", ".join(sorted(effective_vendors))
             reason = (
-                f"Requires {' / '.join(sorted(wanted))} accelerators; "
+                f"Requires {required} accelerators; "
                 f"{'the chosen partition has' if resolved_vendor else 'this cluster reports'} "
-                f"{', '.join(sorted(effective_vendors))}."
+                f"{present}."
             )
+            code = PDModeIneligibleCode.VENDOR_MISMATCH
+            params = {
+                "runtime": required,
+                "vendors": present,
+                # Which of the two sentences to use. A partition was chosen
+                # explicitly; without one the statement is about the cluster.
+                "scope": "partition" if resolved_vendor else "cluster",
+            }
 
         options.append(
             PDModeEligibility(
@@ -257,6 +281,8 @@ def _resolution(
                 eligible=backend_ok and vendor_ok,
                 recommended=entry.name == mode,
                 ineligible_reason=reason,
+                ineligible_code=code,
+                ineligible_params=params,
             )
         )
 

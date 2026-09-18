@@ -301,6 +301,25 @@ class WorkerStatus(SystemInfo):
     hand-filled label always wins over a discovered fact.
     """
 
+    kv_ifname: Optional[str] = None
+    """
+    What this worker was TOLD its KV-transfer NIC is -- `--kv-ifname`, verbatim,
+    and `None` when the operator set nothing.
+
+    🔴 Reported so the derivation can be told from the override. The rendered
+    `HCCL_SOCKET_IFNAME` on a running member equals `Worker.ifname` in both the
+    case the derivation is meant to handle (a control-plane recipe takes the
+    management NIC) and the case it exists to remove (an operator hand-filled
+    the same name because a multi-NIC host refused to guess). With neither the
+    input nor the rendered env readable from the server, those two are the same
+    observation, and "the platform now derives it" was unverifiable in e2e.
+    Null here with a non-null `ifname` there means derived; non-null means the
+    operator is still typing it in.
+
+    A worker-local setting, and deliberately not promoted to a cluster-wide
+    one: see `Config.kv_ifname` for why a NIC name must not be broadcast.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     @classmethod

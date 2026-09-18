@@ -626,6 +626,40 @@ class InferenceServer(ABC):
         _refuse_unrendered_router(rendered, instance)
         return rendered
 
+    def _net_device_plane(self):
+        """Which plane this deployment's `{{net_device}}` rides, read off the
+        recipe.
+
+        The judgement is the catalog's (`PDMode.net_device_plane`), not this
+        layer's: `{{net_device}}` lands on `UCX_NET_DEVICES` in one recipe and
+        on `HCCL_SOCKET_IFNAME` in another, and only the recipe knows which.
+        Deciding it here by mode name would be an if-else the next Ascend-family
+        recipe silently falls off.
+
+        Every failure to answer degrades to `data`, the stricter plane: an
+        unreadable catalog then costs an operator one `kv_ifname` on a
+        multi-NIC host, where the reverse default would put KV bytes on the
+        management NIC without saying so.
+        """
+        from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
+
+        try:
+            from gpustack.server.pd_mode_catalog import get_pd_mode
+
+            model = self._model_spec or getattr(self, "_model", None)
+            disaggregation = getattr(model, "disaggregation", None)
+            mode_name = getattr(disaggregation, "mode", None)
+            mode_name = getattr(mode_name, "value", mode_name)
+            mode = get_pd_mode(str(mode_name)) if mode_name else None
+            if mode is not None:
+                return mode.net_device_plane
+        except Exception as e:
+            logger.warning(
+                f"Failed to read the PD recipe's network-device plane ({e}); "
+                "treating it as the data plane."
+            )
+        return PDNetDevicePlaneEnum.DATA
+
     def _pd_template_variables(self) -> Dict[str, object]:
         """The two placeholders only this layer can resolve: the KV-plane NIC
         and the runner image.
@@ -645,7 +679,9 @@ class InferenceServer(ABC):
             # unaffected by whether this module resolves.
             from gpustack.worker.net_device import derive_net_device
 
-            net_device = derive_net_device(self._worker, self._config)
+            net_device = derive_net_device(
+                self._worker, self._config, self._net_device_plane()
+            )
         except Exception as e:
             logger.warning(f"Failed to derive the KV-plane network device: {e}")
         if net_device:

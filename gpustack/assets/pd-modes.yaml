@@ -24,7 +24,15 @@
 #
 # Template placeholders:
 #   {{worker_ip}}            the worker's routable management IP
-#   {{net_device}}           the KV-plane NIC name derived for the worker
+#   {{net_device}}           the NIC name derived for the worker. Which plane
+#                            it rides is the recipe's to declare
+#                            (`net_device_plane: data | control`), because the
+#                            same placeholder feeds UCX_NET_DEVICES in one
+#                            recipe and HCCL_SOCKET_IFNAME in another. `data`
+#                            (the default) refuses to guess on a multi-NIC host
+#                            and asks for kv_ifname; `control` takes the
+#                            worker's own management NIC, which is the NIC
+#                            holding the handshake IP by definition.
 #   {{port}}                 the member's own HTTP API port
 #   {{ports.<name>}}         base of a named port band
 #   {{ports.<name>.count}}   width of a named port band
@@ -963,6 +971,23 @@ modes:
       # wider than its prefill has not been measured on this connector, so
       # the rule stays one-directional rather than `any` until it is.
       tensor_parallel: prefill_ge_decode
+    # 🔑 {{net_device}} lands on HCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME /
+    # TP_SOCKET_IFNAME here, not on UCX_NET_DEVICES: these are handshake
+    # sockets, and the KV bytes never touch them — CANN moves them over the
+    # cards' own RoCE ports, where measurement put 99.94% of the traffic,
+    # invisible to the host stack. So the NIC is not a choice at all: HCCL_IF_IP
+    # is the worker's registration IP, HCCL requires it to sit on the interface
+    # HCCL_SOCKET_IFNAME names, and Worker.ifname is by definition the NIC
+    # carrying worker->server traffic.
+    #
+    # Declared because the default (`data`) refuses to derive anything on a
+    # multi-NIC host, and every real Ascend node is one — 910B2 shows six
+    # candidates, so the default made kv_ifname mandatory for a value the
+    # platform already holds. Worse, typing it invents a failure: two of those
+    # six are 25G ports physically on the RDMA card and read as the expert
+    # answer, while the right one is the management bond1, and a NIC that does
+    # not hold HCCL_IF_IP fails deeper than a wrong card does.
+    net_device_plane: control
     roles:
       prefill:
         ports:

@@ -47,6 +47,28 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
     selector found it can hold the member, so this reorders workers that all
     fit. Being far away is a latency cost; the refusal for a floor that must be
     honoured is `GatherFloorFilter`, and it is a separate decision on purpose.
+
+    🔴 **The one thing here that is NOT a score: internal spread.** How far a
+    candidate is from the group and how far it is from *itself* are not
+    comparable quantities -- the first carries the KV transfer, once per
+    request; the second carries the tensor-parallel all-reduce, once per layer
+    per token -- so no amount of the first may buy a worse second. That is a
+    strict priority, and `narrow_to_tightest_internal_spread` is what expresses
+    it: the caller drops the looser candidates *before* anything is scored.
+
+    It used to be expressed as a number instead, a penalty one rung larger than
+    the closeness term could ever reach. That holds inside this scorer and
+    stopped holding on the chain, because the chain SUMS: once
+    `PairingAffinityScorer` was sized to outrank the rest of the chain (and it
+    is unbounded by design -- `max_score` per opposite sibling), two siblings
+    outweighed the penalty and bought a split member. No finite constant can
+    dominate an unbounded one; a bigger number only moves the threshold. See
+    bugs.md B8.
+
+    The penalty stays in `score` anyway, and is not duplication: it is what a
+    caller that skips the narrowing still gets. Once the narrowing has run,
+    every surviving candidate has the same internal spread, so the term is a
+    constant added to all of them and cannot reorder anything.
     """
 
     def __init__(
@@ -65,6 +87,98 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
         # out of the gang -- but it is scored against the anchors like anyone.
         self._anchors = set(anchors)
         self._max_score = max_score
+
+    @property
+    def score_ceiling(self) -> float:
+        """`max_score` times the tightest rung, not `max_score`.
+
+        🔴 The one scorer on the chain whose `_max_score` is a per-rung step
+        rather than a total: `score` pays `max_score * near`, and `near` is the
+        depth of the tightest layer a candidate shares with a placed member --
+        3 on the built-in zone/rack/host chain, more under a declared one. So
+        the default 150 buys up to 450, which is what made the 200 written down
+        for `PairingAffinityScorer` too small. Read off `_depths` rather than
+        assumed for the same reason `score` does: the chain is the operator's.
+
+        The `apart` term only ever subtracts, so it cannot raise this.
+        """
+        if self._max_score <= 0 or self._view is None:
+            return 0.0
+        return self._max_score * max(self._depths().values(), default=0)
+
+    def narrow_to_tightest_internal_spread(
+        self, candidates: List[ModelInstanceScheduleCandidate]
+    ) -> List[ModelInstanceScheduleCandidate]:
+        """Keep only the candidates that are tightest inside themselves.
+
+        The first key of the ordering, applied by removal rather than by score
+        -- see the class note for why it cannot be a number. Returns the list
+        unchanged whenever the question does not arise, which is almost always:
+        no topology, no group, the scorer switched off, or -- the common case --
+        every candidate sitting on one machine, since a single machine has no
+        pair to be apart and they all tie at the tightest rung.
+
+        **Never empties the set, so it cannot make a scale-out unschedulable.**
+        The bucket kept is the best one that exists: when a role is wider than
+        any single machine every candidate spans, they tie, and this is a no-op.
+        That is the difference between "prefer not to split" and "refuse to
+        split", and only the first is wanted here -- refusing would turn a
+        deployment that runs today into one that does not schedule.
+
+        A candidate whose machines are not in the tree is kept regardless. Its
+        position is unknown, and unknown is not the same as loose; dropping it
+        would be a judgement made from missing data.
+        """
+        if (
+            len(candidates) < 2
+            or self._max_score <= 0
+            or not self._group_id
+            or self._view is None
+        ):
+            return candidates
+
+        depth = self._depths()
+        if not depth:
+            return candidates
+
+        leaves = {
+            worker_id: node
+            for node in _leaves(self._view.root)
+            for worker_id in node.descendant_worker_ids()
+        }
+
+        located: List[tuple] = []
+        unlocatable: List[ModelInstanceScheduleCandidate] = []
+        for candidate in candidates:
+            span = [
+                leaves[worker_id]
+                for worker_id in _candidate_workers(candidate)
+                if worker_id in leaves
+            ]
+            if not span:
+                unlocatable.append(candidate)
+                continue
+            located.append((_internal_depth(span, depth), candidate))
+
+        if not located:
+            return candidates
+
+        tightest = max(internal for internal, _ in located)
+        kept = [candidate for internal, candidate in located if internal == tightest]
+        dropped = len(located) - len(kept)
+        if dropped:
+            # Logged at INFO because it is the one place a candidate leaves the
+            # running for a reason no score can be inspected for afterwards.
+            logger.info(
+                "Dropped %d candidate(s) of group %s that would split the "
+                "member more widely than necessary; %d remain at the tightest "
+                "internal layer (depth %d).",
+                dropped,
+                self._group_id,
+                len(kept) + len(unlocatable),
+                tightest,
+            )
+        return kept + unlocatable
 
     async def score(
         self, candidates: List[ModelInstanceScheduleCandidate]
@@ -121,9 +235,15 @@ class TopologyProximityScorer(ScheduleCandidatesScorer):
         # for -- scores exactly what it scored before: zero for a worker whose
         # position is unknown, and the closeness term alone otherwise. `depth`
         # is bounded by the declared rungs, so a multiplier one past the
-        # tightest makes any penalty outweigh any closeness gain, which is what
-        # "lexicographic" means here. `PairingAffinityScorer` spells the same
-        # trick the same way, and for the same reason.
+        # tightest makes any penalty outweigh any closeness gain.
+        #
+        # 🔴 That last sentence is true of THIS scorer and false of the chain,
+        # which is what `narrow_to_tightest_internal_spread` exists to fix: the
+        # chain sums, and `PairingAffinityScorer` pays an unbounded
+        # `max_score` per opposite sibling, so two of them outweighed this
+        # penalty and bought a split member (bugs.md B8). Where the caller
+        # narrows first this term is a constant across the survivors and
+        # decides nothing; it is kept for the caller that does not.
         tightest = max(depth.values(), default=0)
 
         for candidate in candidates:

@@ -85,7 +85,7 @@ class KnownKeyPublic(BaseModel):
 
 class VocabularyPublic(BaseModel):
     fields: List[VocabularyFieldPublic]
-    """The built-in fields, root-to-leaf: room, row, rack."""
+    """The built-in fields, root-to-leaf: zone, rack."""
     known_keys: List[KnownKeyPublic]
     """Label keys some vendor or tool is known to write, with the built-in rung
     each is nearest to. The accelerator-domain and switch keys live here rather

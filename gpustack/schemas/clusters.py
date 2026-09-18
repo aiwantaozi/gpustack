@@ -346,7 +346,7 @@ class TopologyLayer(BaseModel):
 class ClusterTopology(BaseModel):
     """How far apart this cluster's workers are, for the group scheduler.
 
-    **One chain, root to leaf.** The built-in rungs are room, row, rack and the
+    **One chain, root to leaf.** The built-in rungs are zone, rack and the
     host; anything else the fabric has — an NVLink/HCCS/UB domain, a blade, a
     cage — is a custom layer the operator inserts where it belongs.
 
@@ -378,7 +378,7 @@ class ClusterTopology(BaseModel):
         default_factory=list,
         description=(
             "Key overrides for vocabulary fields and custom layers, as a "
-            "parent chain. Empty means the vocabulary as-is (room, row, rack)."
+            "parent chain. Empty means the vocabulary as-is (zone, rack)."
         ),
     )
     # 🔴 No `default_gather_strategy` / `default_gather_layer`.

@@ -59,6 +59,12 @@ class PairingAffinityScorer(ScheduleCandidatesScorer):
         group_id: Optional[str],
         role: Optional[str],
         model_instances: Sequence[ModelInstance],
+        # 🔴 A fallback, not the production weight. The scale-up chain sizes
+        # this against what the rest of that chain can pay
+        # (`_pairing_affinity_max_score`), because no constant survives the
+        # next scorer being added -- 200 was chosen against 100 + 5 and was
+        # already beaten by `TopologyProximityScorer`'s 450. Kept at the old
+        # value so a caller that builds this scorer alone behaves as it did.
         max_score: float = 200.0,
     ):
         self._group_id = group_id

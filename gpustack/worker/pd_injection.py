@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from gpustack.schemas.models import role_effective_model
 from gpustack.schemas.pd_modes import PDKVLeaseTargetEnum, PDMode, PDModeRole
 from gpustack.server.pd_mode_catalog import get_pd_mode
+from gpustack.server.pd_pairing import selector_cards_per_replica
 from gpustack.utils.command import find_int_parameter, flatten_to_argv
 from gpustack.utils.template import render, render_values
 
@@ -246,8 +247,11 @@ def _refuse_unrendered(injection: "PDInjection", where: str) -> None:
     does not. `HCCL_SOCKET_IFNAME={{net_device}}` reaches HCCL as the literal
     name of an interface that does not exist, and what comes back is a
     transport that quietly never connects. Measured on 910B2, where the host
-    has six candidate NICs and `derive_net_device` correctly refuses to guess
-    between them — the refusal was right and its consequence was invisible.
+    has six candidate NICs and `derive_net_device` refused to guess between
+    them — the refusal was defensible and its consequence was invisible. (That
+    recipe's `{{net_device}}` is a control-plane socket and is derived from
+    `Worker.ifname` now, so it no longer arrives here that way; every other
+    route to an underivable NIC still does.)
 
     So the check moves to where both halves are already in hand and neither
     has left the process yet. Raising rather than warning, for the reason
@@ -388,22 +392,57 @@ def _cross_role_variables(model, instance=None) -> Dict[str, object]:
     not: prefill's connector config carries decode's parallelism and vice
     versa. Each role is resolved through its own projection, so a role that
     overrides nothing reads the Model-level value rather than the running
-    role's."""
+    role's.
+
+    🔴 `instance` is the running member and belongs to exactly one of these
+    roles. Handing it to all of them made the *other* side's implicit tensor
+    parallelism the running member's card count: a four-card prefill rendering
+    `{{roles.decode.tensor_parallel_size}}` as 4 while decode runs on one card
+    writes a number into the Mooncake descriptor that decode's engine then
+    contradicts — the handshake failure `_implicit_parallelism` exists to
+    avoid, produced by `_implicit_parallelism` itself.
+
+    The peer's own member is not available to correct it with, and not by
+    oversight: the injection is rendered on the worker as this member starts,
+    and prefill routinely starts before decode has been placed at all, so its
+    `gpu_indexes` may not exist yet. What the *spec* can still say is said —
+    `pd_pairing.selector_cards_per_replica` reads a peer that pinned its own
+    cards, which is the shape where the two sides provably differ. A peer that
+    pinned nothing falls back to the running member's count, deliberately: with
+    no per-role pin both roles are sized by the same auto-selection of the same
+    model on the same engine, and refusing to render there would break the
+    silent 1P1D that `_implicit_parallelism` was written for.
+    """
     context: Dict[str, object] = {}
+    running_role = getattr(instance, "role", None)
     for role in getattr(model, "roles", None) or []:
         name = getattr(role, "name", None)
         if not name:
             continue
         projected = role_effective_model(model, name)
-        for field, value in _role_fields(projected, name, instance).items():
+        cards = (
+            None
+            if name == running_role
+            else selector_cards_per_replica(role)  # peer, read off its own pin
+        )
+        fields = _role_fields(projected, name, instance, pinned_cards=cards)
+        for field, value in fields.items():
             context[f"roles.{name}.{field}"] = value
     return context
 
 
 def _role_fields(
-    effective, role_name: Optional[str], instance=None
+    effective,
+    role_name: Optional[str],
+    instance=None,
+    *,
+    pinned_cards: Optional[int] = None,
 ) -> Dict[str, object]:
-    """One role's referenceable fields, read off its effective Model."""
+    """One role's referenceable fields, read off its effective Model.
+
+    `pinned_cards` overrides what the running member's own cards would say, for
+    the cross-role case where the role being described is not the one starting.
+    """
     fields: Dict[str, object] = {}
     role = None
     for candidate in getattr(effective, "roles", None) or []:
@@ -426,12 +465,18 @@ def _role_fields(
         if value is not None:
             fields[field] = value
 
-    fields.update(_implicit_parallelism(fields, instance, role_name))
+    fields.update(
+        _implicit_parallelism(fields, instance, role_name, pinned_cards=pinned_cards)
+    )
     return fields
 
 
 def _implicit_parallelism(
-    declared: Dict[str, object], instance, role_name: Optional[str]
+    declared: Dict[str, object],
+    instance,
+    role_name: Optional[str],
+    *,
+    pinned_cards: Optional[int] = None,
 ) -> Dict[str, object]:
     """The parallelism a single-worker member has whether or not it says so.
 
@@ -447,6 +492,11 @@ def _implicit_parallelism(
     every deployment failed until the user wrote out parameters that only
     restated what the engine was going to do anyway.
 
+    `pinned_cards` is how a role *other* than the running one gets its own
+    answer: `instance` is the member that is starting, and its card count is
+    only this role's when this role is the one starting. See
+    `_cross_role_variables` for why a peer that pinned nothing still borrows it.
+
     Deliberately silent for a member spanning workers. There the shape decides
     dp and dpl, that decision happens further down the vLLM path, and guessing
     here would put a number in a Mooncake descriptor that the engine then
@@ -458,7 +508,7 @@ def _implicit_parallelism(
 
     out: Dict[str, object] = {}
     if "tensor_parallel_size" not in declared:
-        cards = len(getattr(instance, "gpu_indexes", None) or [])
+        cards = pinned_cards or len(getattr(instance, "gpu_indexes", None) or [])
         if cards:
             out["tensor_parallel_size"] = cards
     if "data_parallel_size" not in declared:

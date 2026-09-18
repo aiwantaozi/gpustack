@@ -95,8 +95,8 @@ class TopologyView:
         """Workers with no value at this layer, across every bucket.
 
         The tree has one unclassified bucket *per parent* — the workers with a
-        room but no rack sit under their room, the ones with neither sit under
-        the room-level bucket — so the answer is the union, not the first hit.
+        zone but no rack sit under their zone, the ones with neither sit under
+        the zone-level bucket — so the answer is the union, not the first hit.
         """
         out: List[int] = []
         for node in self.nodes(layer_id):

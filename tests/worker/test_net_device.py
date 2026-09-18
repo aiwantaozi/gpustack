@@ -5,6 +5,7 @@ from collections import namedtuple
 import pytest
 
 from gpustack.config.config import Config
+from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
 from gpustack.schemas.workers import (
     GPUDeviceStatus,
     GPUNetworkInfo,
@@ -232,6 +233,92 @@ def test_management_nic_outside_the_candidate_set_warns_but_still_resolves(
     with caplog.at_level(logging.WARNING):
         assert derive_net_device(_worker(ifname="docker0"), config()) == "docker0"
     assert "not among the candidate KV interfaces" in caplog.text
+
+
+#
+# The control plane: a recipe whose {{net_device}} carries handshake sockets.
+#
+
+
+def test_control_plane_derives_on_a_multi_nic_host_instead_of_refusing(
+    config, nics, caplog
+):
+    """The 910B2 case. Six candidate NICs, and the refusal made `kv_ifname`
+    mandatory for a value the platform already holds: `HCCL_IF_IP` is the
+    worker's registration IP and HCCL requires it to sit on the interface
+    `HCCL_SOCKET_IFNAME` names, which is what `Worker.ifname` is."""
+    nics(["bond0", "bond1", "enp189s0f0", "enp189s0f1", "eno1", "eno2"])
+    with caplog.at_level(logging.ERROR):
+        assert (
+            derive_net_device(
+                _worker(ifname="bond1"), config(), PDNetDevicePlaneEnum.CONTROL
+            )
+            == "bond1"
+        )
+    assert "Refusing to derive" not in caplog.text
+
+
+def test_the_data_plane_still_refuses_on_the_same_host(config, nics, caplog):
+    """The regression that matters. Relaxing the control plane must not relax
+    NIXL's: there the management NIC is usually the wrong fabric, and the
+    symptom is `NIXL_ERR_BACKEND` at the peer — a whole handshake away from the
+    machine that was misconfigured, and far dearer than typing one value."""
+    nics(["bond0", "bond1", "enp189s0f0", "enp189s0f1", "eno1", "eno2"])
+    with caplog.at_level(logging.ERROR):
+        assert derive_net_device(_worker(ifname="bond1"), config()) is None
+    assert "Refusing to derive" in caplog.text
+
+
+def test_the_data_plane_is_what_an_undeclared_caller_gets(config, nics):
+    """`plane` defaults to the stricter side, so a caller that has not been
+    taught about planes keeps today's behaviour byte for byte."""
+    nics(["eno1", "ib0"])
+    assert derive_net_device(_worker(ifname="eno1"), config()) is None
+
+
+def test_kv_ifname_still_wins_on_the_control_plane(config, nics):
+    """The escape hatch is per-worker and no plane may bypass it: a machine
+    whose handshake really does belong on another NIC must stay expressible."""
+    nics(["bond1", "eno1"])
+    assert (
+        derive_net_device(
+            _worker(ifname="bond1"),
+            config(kv_ifname="eno1"),
+            PDNetDevicePlaneEnum.CONTROL,
+        )
+        == "eno1"
+    )
+
+
+def test_control_plane_still_invents_nothing_without_a_worker_ifname(config, caplog):
+    """Relaxing the gate must not relax the principle behind it. No source, no
+    value — the placeholder survives into the launch, where HCCL fails with the
+    literal `{{net_device}}` in its message rather than binding a wrong NIC."""
+    with caplog.at_level(logging.WARNING):
+        assert (
+            derive_net_device(
+                _worker(ifname=""), config(), PDNetDevicePlaneEnum.CONTROL
+            )
+            is None
+        )
+    assert "kv_ifname" in caplog.text
+
+
+def test_control_plane_does_not_second_guess_the_worker_ifname(config, monkeypatch):
+    """The host's NIC list answers a different question, so it is not consulted
+    at all here — not even to warn. An interface the prefix list calls virtual
+    is still the route this worker's own handshake has to take."""
+
+    def _boom():
+        raise AssertionError("the control plane must not enumerate host NICs")
+
+    monkeypatch.setattr(net_device, "candidate_kv_interfaces", _boom)
+    assert (
+        derive_net_device(
+            _worker(ifname="docker0"), config(), PDNetDevicePlaneEnum.CONTROL
+        )
+        == "docker0"
+    )
 
 
 #

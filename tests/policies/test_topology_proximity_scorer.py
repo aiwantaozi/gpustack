@@ -288,3 +288,137 @@ async def test_a_spanning_candidate_is_measured_from_all_its_machines():
     )
 
     assert reaching_score > away_score
+
+
+# --- internal spread is removed from the running, not scored down ------------ #
+#
+# 🔴 B8. The penalty above is lexicographic *within this scorer* and stopped
+# being so on the chain, which SUMS: `PairingAffinityScorer` is unbounded by
+# design (`max_score` per opposite sibling), so two siblings outweighed the
+# penalty and bought a member split across machines. No finite constant
+# dominates an unbounded one, so the first key moved out of the arithmetic.
+
+
+def _narrow(workers, placed, candidates, anchors=("prefill",), max_score=150.0):
+    scorer = TopologyProximityScorer(
+        "g1", placed, _view(workers), anchors, max_score=max_score
+    )
+    return scorer.narrow_to_tightest_internal_spread(candidates)
+
+
+def test_a_candidate_that_would_split_the_member_is_dropped_outright():
+    """🔴 The invariant B8 is about, and it has to hold by removal: while this
+    was a penalty, any large enough bonus elsewhere on the chain could pay for
+    it. A dropped candidate cannot be bought back."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-b", "zone-1"),
+        _worker(3, "rack-c", "zone-2"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    whole = _candidate(workers[0])
+    split = _spanning_candidate(workers[1], [workers[2]])
+
+    assert _narrow(workers, placed, [split, whole]) == [whole]
+
+
+def test_every_candidate_splitting_equally_is_a_no_op():
+    """The shape that must NOT be narrowed: a role wider than any one machine
+    has no un-split candidate to prefer. Dropping here would turn «prefer not
+    to split» into «refuse to split» and fail a deployment that runs today."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-a", "zone-1"),
+        _worker(3, "rack-b", "zone-1"),
+        _worker(4, "rack-b", "zone-1"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    near = _spanning_candidate(workers[1], [workers[0]])
+    far = _spanning_candidate(workers[2], [workers[3]])
+
+    assert _narrow(workers, placed, [near, far]) == [near, far]
+
+
+def test_the_tightest_bucket_is_kept_whole_not_reduced_to_one():
+    """Narrowing answers the first key only. Everything that ties on it stays
+    in, for the scorers to order — otherwise this would quietly become the
+    placement decision."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-a", "zone-1"),
+        _worker(3, "rack-b", "zone-1"),
+        _worker(4, "rack-c", "zone-2"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    whole_near = _candidate(workers[1])
+    whole_far = _candidate(workers[3])
+    split = _spanning_candidate(workers[2], [workers[3]])
+
+    kept = _narrow(workers, placed, [whole_near, split, whole_far])
+
+    assert kept == [whole_near, whole_far]
+
+
+def test_a_candidate_off_the_tree_is_kept_because_unknown_is_not_loose():
+    """Its position is missing, not bad. Dropping it would be a judgement made
+    from absent data — the same rule `derive_net_device` follows when it
+    refuses to guess rather than inventing a value."""
+    workers = [_worker(1, "rack-a", "zone-1"), _worker(2, "rack-a", "zone-1")]
+    placed = [_instance(9, "prefill", worker_id=1)]
+
+    whole = _candidate(workers[1])
+    off_tree = _candidate(_worker(99, "rack-z", "zone-9"))  # not in the view
+
+    kept = _narrow(workers, placed, [whole, off_tree])
+
+    assert kept == [whole, off_tree]
+
+
+def test_narrowing_is_off_wherever_the_scorer_is():
+    """Same switches, same reasons: a cluster that declares no topology and a
+    weight of 0 both mean «this notion does not apply here», and neither may
+    start removing candidates."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-b", "zone-1"),
+        _worker(3, "rack-c", "zone-2"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+    candidates = [_spanning_candidate(workers[1], [workers[2]]), _candidate(workers[0])]
+
+    assert _narrow(workers, placed, candidates, max_score=0) == candidates
+
+    no_topology = TopologyProximityScorer(
+        "g1", placed, None, ("prefill",), max_score=150.0
+    )
+    assert no_topology.narrow_to_tightest_internal_spread(candidates) == candidates
+
+    no_group = TopologyProximityScorer(
+        None, placed, _view(workers), ("prefill",), max_score=150.0
+    )
+    assert no_group.narrow_to_tightest_internal_spread(candidates) == candidates
+
+
+@pytest.mark.asyncio
+async def test_the_penalty_cannot_reorder_what_the_narrowing_left():
+    """Why keeping the penalty is not duplication: after narrowing it is the
+    same constant on every survivor, so it decides nothing — while still being
+    what a caller that skips the narrowing gets."""
+    workers = [
+        _worker(1, "rack-a", "zone-1"),
+        _worker(2, "rack-a", "zone-1"),
+        _worker(3, "rack-b", "zone-1"),
+        _worker(4, "rack-b", "zone-1"),
+    ]
+    placed = [_instance(9, "prefill", worker_id=1)]
+    near = _spanning_candidate(workers[1], [workers[0]])
+    far = _spanning_candidate(workers[2], [workers[3]])
+
+    kept = _narrow(workers, placed, [near, far])
+    scores = await _score_candidates(workers, placed, kept)
+
+    # Both paid the same penalty, so the closeness term alone separates them.
+    assert scores[0] > scores[1]

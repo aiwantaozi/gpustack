@@ -406,15 +406,22 @@ class PDMembershipAPI(BaseModel):
     Reading a missing API as a bug would make the fallback path look like a
     failure.
 
-    ⚠️ **Declaring it is not the same as it working.** The vLLM-side API is
-    read from upstream source, not measured: `POST /workers` carries
-    `worker_type`, but the single-router path drops that field before it
-    reaches the PD router, which then returns a hardcoded "requires specific
-    add_prefill_server or add_decode_server methods". `--enable-igw` routes it
-    through the manager that does dispatch on `worker_type`. That is what
-    `requires_args` records, and it is still unverified on hardware (see
-    open-questions F12) — so a consumer should treat a failed call as "fall
-    back to restart", never as "the group is broken".
+    ⚠️ **Declaring it is not the same as it working**, which is why
+    `requires_args` exists. `POST /workers` carries `worker_type`, but the
+    single-router path drops that field before it reaches the PD router, which
+    then returns a hardcoded "requires specific add_prefill_server or
+    add_decode_server methods"; `--enable-igw` routes the call through the
+    manager that dispatches on `worker_type`.
+
+    ✅ **Measured on hardware 2026-08-28 (F12), and the flag is in the shipped
+    recipes.** A real 1P1D under `--enable-igw`: two-hop orchestration
+    unchanged, `POST /workers` with `worker_type` enters the registry and takes
+    traffic, `vllm_router_pd_*` names and labels identical, and `DELETE`
+    removes a member in 18ms with a request in flight. An earlier version of
+    this note called it unverified; it was, until that run. A consumer should
+    still treat a failed call as "fall back to restart" rather than "the group
+    is broken" — that is a property of a single-replica router, not of an
+    unproven flag.
 
     ⭐ **An empty `requires_args` is a finding of its own, not an omission.**
     The gateway that fork descends from needs no such flag: its command-line
@@ -770,6 +777,38 @@ class PDPairing(BaseModel):
     before this field existed; a recipe whose connector differs declares so."""
 
 
+class PDNetDevicePlaneEnum(str, Enum):
+    """What the NIC `{{net_device}}` names actually carries in this recipe.
+
+    🔑 The placeholder is one name injected into variables of two different
+    natures, and the right answer differs by *kind*, not by degree:
+
+    - **data** — `UCX_NET_DEVICES` (both NIXL recipes). This NIC moves the KV
+      bytes. The management NIC is usually the wrong fabric, and picking it
+      silently fails at the far end of the handshake with `NIXL_ERR_BACKEND`,
+      so a multi-NIC host must refuse to guess and ask for `kv_ifname`.
+    - **control** — `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` /
+      `TP_SOCKET_IFNAME` (`vllm-ascend-mooncake`). These carry the handshake
+      sockets only; the data plane rides the cards' own RoCE ports, which the
+      host stack never sees. The answer is not a guess at all: `HCCL_IF_IP` is
+      the worker's registration IP, HCCL requires it to sit on the NIC named by
+      `HCCL_SOCKET_IFNAME`, and `Worker.ifname` is *by definition* the NIC that
+      carries worker->server traffic. Refusing to derive it there costs an
+      operator a mandatory manual value AND adds a failure mode — a hand-typed
+      NIC that does not hold `HCCL_IF_IP` is harder to diagnose than a wrong
+      card. Measured on 910B2: six candidate NICs, two of them 25G ports
+      physically on the RDMA card that look like the knowledgeable choice,
+      while the right answer is the management `bond1`.
+
+    Declared per recipe rather than branched on the mode name in code: the next
+    Ascend-family recipe would be missed by an if-else and silently inherit the
+    refusal.
+    """
+
+    DATA = "data"
+    CONTROL = "control"
+
+
 class PDMode(BaseModel):
     """One disaggregation recipe: engine, KV connector and router.
 
@@ -877,6 +916,15 @@ class PDMode(BaseModel):
     pairing: PDPairing = PDPairing()
     """Connector-specific cross-role constraints, read by admission. Absent
     means the NIXL defaults — see ``PDPairing``."""
+
+    net_device_plane: PDNetDevicePlaneEnum = PDNetDevicePlaneEnum.DATA
+    """Which plane this recipe's ``{{net_device}}`` rides — see
+    ``PDNetDevicePlaneEnum``.
+
+    The default is ``data`` because that is the stricter of the two: a recipe
+    that forgets to declare its plane keeps the multi-NIC refusal, which costs
+    an operator one ``kv_ifname``. The reverse default would put KV bytes on
+    the management NIC of every unclassified recipe."""
 
     def role(self, name: str) -> Optional[PDModeRole]:
         return self.roles.get(name)

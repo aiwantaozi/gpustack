@@ -24,12 +24,14 @@ from gpustack.api.exceptions import BadRequestException
 from gpustack.routes.models import validate_role_pairing
 from gpustack.schemas.models import (
     DisaggregationSpec,
+    GPUSelector,
     Model,
     ModelCreate,
     PDModeEnum,
     RoleSpec,
     SourceEnum,
 )
+from gpustack.server.pd_pairing import undecidable_factors
 
 
 @contextmanager
@@ -247,7 +249,12 @@ def test_one_role_overriding_is_compared_against_the_inherited_value():
 def test_an_empty_override_does_not_inherit():
     """A role that deliberately clears the model's parameters must not get
     them back — so nothing is compared, rather than the model's value being
-    compared against itself."""
+    compared against itself.
+
+    Still not a refusal, and now not silent either: clearing the parameters is
+    one side falling silent, so the factors the model declared become
+    undecidable and the deployment says so. See
+    `test_clearing_the_parameters_is_a_side_falling_silent` below."""
     validate_role_pairing(
         _model_in(
             _roles(prefill_params=[]),
@@ -363,3 +370,332 @@ def test_the_last_spelling_wins_as_argparse_reads_it():
             ],
         )
     )
+
+
+# --- one side silent -------------------------------------------------------- #
+#
+# Every rule above used to compare only when BOTH roles wrote the parameter
+# down, which meant the ordinary way a group is misconfigured — edit prefill,
+# leave decode alone — passed by not being checked. The repair is not to
+# substitute the engines' defaults: an unwritten tp is the member's card count
+# and not 1, an unwritten dtype is `auto` and needs the checkpoint to resolve,
+# and block size and KV cache layout belong to the platform and the attention
+# backend. So the test became "are both effective values determinable", and
+# what is not determinable is reported instead of refused.
+
+
+def _selector(*gpu_ids):
+    return GPUSelector(gpu_ids=list(gpu_ids))
+
+
+def _silent_side_roles(prefill=None, decode=None):
+    return [
+        prefill or RoleSpec(name="prefill", replicas=1),
+        decode or RoleSpec(name="decode", replicas=1),
+        RoleSpec(name="router", replicas=1),
+    ]
+
+
+def test_a_decode_pinned_to_one_card_is_narrower_than_a_prefill_at_tp2():
+    """The shape the old check let straight through. decode writes no tp, so
+    nothing was compared — but it pins a single card, GPUStack injects the card
+    count for a single-worker member, and a decode that runs TP1 under a
+    prefill at TP2 is exactly the inversion NIXL reports as an IndexError."""
+    with rejects("decode runs tensor parallelism 1, below prefill's 2"):
+        validate_role_pairing(
+            _model_in(
+                _silent_side_roles(
+                    prefill=RoleSpec(
+                        name="prefill",
+                        replicas=1,
+                        backend_parameters=["--tensor-parallel-size=2"],
+                    ),
+                    decode=RoleSpec(
+                        name="decode",
+                        replicas=1,
+                        gpu_selector=_selector("w1:npu:0"),
+                    ),
+                )
+            )
+        )
+
+
+def test_a_decode_that_pins_nothing_is_reported_rather_than_refused():
+    """The same prefill against a decode that says nothing at all. Its cards
+    are the scheduler's to choose, so its tensor parallelism is not knowable
+    from the spec — and holding it to 1 would refuse the two-card decode that
+    would have paired perfectly. Accepted, and marked."""
+    model_in = _model_in(
+        _silent_side_roles(
+            prefill=RoleSpec(
+                name="prefill",
+                replicas=1,
+                backend_parameters=["--tensor-parallel-size=2"],
+            ),
+        )
+    )
+    validate_role_pairing(model_in)
+    assert "tensor parallelism" in undecidable_factors(
+        model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+    )
+
+
+def test_a_pin_spread_over_two_workers_says_nothing_about_tp():
+    """A member spanning workers has its world size split into tp and pp
+    further down the vLLM path, so the pinned count is not the tensor
+    parallelism and cannot refuse anything."""
+    model_in = _model_in(
+        _silent_side_roles(
+            prefill=RoleSpec(
+                name="prefill",
+                replicas=1,
+                backend_parameters=["--tensor-parallel-size=4"],
+            ),
+            decode=RoleSpec(
+                name="decode",
+                replicas=1,
+                gpu_selector=_selector("w1:npu:0", "w2:npu:0"),
+            ),
+        )
+    )
+    validate_role_pairing(model_in)
+
+
+def test_a_role_that_writes_dp_but_not_tp_is_not_read_as_its_card_count():
+    """Writing any parallelism flag turns GPUStack's injection off wholesale,
+    so a decode with `--data-parallel-size 2` on two pinned cards runs the
+    engine's own tp default rather than 2. Which default that is belongs to the
+    engine, so nothing here refuses."""
+    model_in = _model_in(
+        _silent_side_roles(
+            prefill=RoleSpec(
+                name="prefill",
+                replicas=1,
+                backend_parameters=["--tensor-parallel-size=4"],
+            ),
+            decode=RoleSpec(
+                name="decode",
+                replicas=1,
+                backend_parameters=["--data-parallel-size=2"],
+                gpu_selector=_selector("w1:npu:0", "w1:npu:1"),
+            ),
+        )
+    )
+    validate_role_pairing(model_in)
+
+
+def test_an_explicit_auto_and_a_silent_side_are_the_same_declaration():
+    """`auto` is what the silent side runs, so writing it on one role is not a
+    divergence from the other role writing nothing."""
+    validate_role_pairing(
+        _model_in(_roles(prefill_params=["--dtype=auto"])),
+    )
+    validate_role_pairing(
+        _model_in(_roles(prefill_params=["--kv-cache-dtype", "auto"])),
+    )
+
+
+def test_auto_against_a_concrete_dtype_is_reported_rather_than_refused():
+    """🔴 Writing `auto` down does not turn a question into an answer. `auto` is
+    the checkpoint's dtype, not a third one, so on a float16 checkpoint these
+    two are the same run — and telling them apart needs a config file admission
+    cannot open. This used to be a 400 purely because the two strings differ,
+    which is a guess dressed as a verdict."""
+    for prefill, decode in (
+        (["--dtype=auto"], ["--dtype=float16"]),
+        (["--dtype=float16"], ["--dtype=auto"]),
+        (["--kv-cache-dtype=auto"], ["--kv-cache-dtype=fp8"]),
+    ):
+        model_in = _model_in(_roles(prefill_params=prefill, decode_params=decode))
+        validate_role_pairing(model_in)
+        assert undecidable_factors(
+            model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+        )
+
+
+def test_two_concrete_values_that_differ_are_still_refused():
+    """The line the downgrade above does not cross: with no `auto` on either
+    side the spec settles it by itself, and nothing has to be opened to know
+    the two roles run different dtypes."""
+    with rejects("dtype"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--dtype=float16"],
+                    decode_params=["--dtype=bfloat16"],
+                )
+            )
+        )
+
+
+def test_a_concrete_dtype_against_silence_is_reported_rather_than_refused():
+    """Silence is `auto`, so this is the same undecidable pair as the explicit
+    one above, reached without anyone typing the word."""
+    model_in = _model_in(_roles(prefill_params=["--dtype=float16"]))
+    validate_role_pairing(model_in)
+    assert "dtype" in undecidable_factors(
+        model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+    )
+
+
+def test_the_underscore_spelling_is_the_same_flag():
+    """vLLM's FlexibleArgumentParser takes `--kv_cache_dtype` as readily as
+    `--kv-cache-dtype`. A table listing only one of them let a prefill on fp8
+    pair with a decode on fp8_e5m2 without ever comparing them."""
+    with rejects("KV cache dtype"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--kv-cache-dtype=fp8"],
+                    decode_params=["--kv_cache_dtype=fp8_e5m2"],
+                )
+            )
+        )
+
+
+def test_the_underscore_spelling_of_the_context_window_is_too():
+    with rejects("context lengths"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--max_model_len=8192"],
+                    decode_params=["--max-model-len=4096"],
+                )
+            )
+        )
+
+
+def test_the_underscore_spelling_of_tp_is_too():
+    with rejects("decode runs tensor parallelism 4, below prefill's 8"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--tp_size=8"],
+                    decode_params=["--tensor_parallel_size=4"],
+                )
+            )
+        )
+
+
+def test_a_flag_written_twice_is_compared_as_argparse_reads_it():
+    """Last wins. A prefill carrying `--dtype bfloat16 --dtype float16` runs
+    float16, so comparing the first value would clear a pair that diverges —
+    and the same read in reverse would refuse one that does not."""
+    with rejects("dtype"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--dtype=bfloat16", "--dtype=float16"],
+                    decode_params=["--dtype=bfloat16"],
+                )
+            )
+        )
+    validate_role_pairing(
+        _model_in(
+            _roles(
+                prefill_params=["--dtype=float16", "--dtype=bfloat16"],
+                decode_params=["--dtype=bfloat16"],
+            )
+        )
+    )
+
+
+def test_a_context_window_written_twice_is_read_the_same_way():
+    with rejects("context lengths"):
+        validate_role_pairing(
+            _model_in(
+                _roles(
+                    prefill_params=["--max-model-len=4096", "--max-model-len=8192"],
+                    decode_params=["--max-model-len=4096"],
+                )
+            )
+        )
+
+
+def test_clearing_the_parameters_is_a_side_falling_silent():
+    """🔴 The decision `test_an_empty_override_does_not_inherit` left open. An
+    empty override is not "no opinion" — the role runs the engine's defaults
+    while its sibling runs the model's 8192, which is the same hole this
+    section exists to close. Still not a 400, because the defaults are not
+    resolvable here; reported instead."""
+    model_in = _model_in(
+        _roles(prefill_params=[]),
+        backend_parameters=["--max-model-len=8192"],
+    )
+    validate_role_pairing(model_in)
+    assert "context length" in undecidable_factors(
+        model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+    )
+
+
+def test_two_silent_roles_are_not_reported():
+    """Both sides take the same default from the same engine on the same
+    model, so whatever it resolves to, it resolves to it twice. Marking this
+    would put the badge on the ordinary way a group is deployed."""
+    model_in = _model_in(_roles())
+    validate_role_pairing(model_in)
+    assert (
+        undecidable_factors(
+            model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+        )
+        == []
+    )
+
+
+def test_a_model_level_value_both_roles_inherit_is_not_reported():
+    model_in = _model_in(_roles(), backend_parameters=["--dtype=float16"])
+    validate_role_pairing(model_in)
+    assert (
+        undecidable_factors(
+            model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+        )
+        == []
+    )
+
+
+def test_a_multi_replica_pin_is_not_divided_by_its_replica_count():
+    """🔴 `_set_gpu_count` reads a role's selector whole — the division by
+    `replicas` belongs to `set_model_gpus_per_replica`, which runs on the Model
+    and deliberately never reaches a role's projection. Reproducing that
+    arithmetic here would have read this decode as TP1 and refused a pair that
+    runs."""
+    model_in = _model_in(
+        _silent_side_roles(
+            prefill=RoleSpec(
+                name="prefill",
+                replicas=1,
+                backend_parameters=["--tensor-parallel-size=2"],
+            ),
+            decode=RoleSpec(
+                name="decode",
+                replicas=2,
+                gpu_selector=_selector("w1:npu:0", "w1:npu:1"),
+            ),
+        )
+    )
+    validate_role_pairing(model_in)
+    assert "tensor parallelism" in undecidable_factors(
+        model_in.roles[0], model_in.roles[1], model_in.backend_parameters
+    )
+
+
+def test_an_explicit_gpus_per_replica_is_the_authority():
+    """The field `_set_gpu_count` reads first, so when it is set the pin is
+    unambiguous however many replicas the role runs."""
+    decode = RoleSpec(name="decode", replicas=2)
+    decode.gpu_selector = GPUSelector(
+        gpu_ids=["w1:npu:0", "w1:npu:1"], gpus_per_replica=1
+    )
+    with rejects("decode runs tensor parallelism 1, below prefill's 2"):
+        validate_role_pairing(
+            _model_in(
+                _silent_side_roles(
+                    prefill=RoleSpec(
+                        name="prefill",
+                        replicas=1,
+                        backend_parameters=["--tensor-parallel-size=2"],
+                    ),
+                    decode=decode,
+                )
+            )
+        )

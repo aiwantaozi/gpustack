@@ -1,5 +1,8 @@
 from gpustack.schemas.models import BackendEnum, PDModeEnum
-from gpustack.schemas.pd_mode_resolution import PDModeUnresolvedCode
+from gpustack.schemas.pd_mode_resolution import (
+    PDModeIneligibleCode,
+    PDModeUnresolvedCode,
+)
 from gpustack.server.pd_mode_resolver import resolve_pd_mode
 
 VLLM = BackendEnum.VLLM.value
@@ -199,3 +202,64 @@ def test_an_engine_the_request_omits_is_left_for_the_client_to_word():
     resolution = resolve_pd_mode(None, {"amd"})
     assert resolution.unresolved_code == PDModeUnresolvedCode.NO_BUILT_IN_RECIPE
     assert resolution.unresolved_params["backend"] == ""
+
+
+# --- the verdict a client can translate ------------------------------------ #
+
+
+def _options(resolution):
+    return {o.name: o for o in resolution.options}
+
+
+def test_an_engine_mismatch_carries_a_code_and_joined_params():
+    """The prose is English and assembled here, so a client that renders it
+    verbatim puts an English sentence inside a localized form. The code plus
+    params is the same statement in a shape the client can look up."""
+    resolution = resolve_pd_mode(backend="SGLang", cluster_vendors={"nvidia"})
+
+    entry = _options(resolution)["vllm-nixl"]
+
+    assert entry.eligible is False
+    assert entry.ineligible_code == PDModeIneligibleCode.BACKEND_MISMATCH
+    # Pre-joined: how a list of engines reads belongs here, not in every client.
+    assert entry.ineligible_params["targets"] == "vLLM"
+    assert entry.ineligible_params["backend"] == "SGLang"
+    # The prose stays, for a client older than the code and for logs.
+    assert "Requires vLLM" in entry.ineligible_reason
+
+
+def test_an_accelerator_mismatch_says_which_side_the_statement_is_about():
+    """`scope` is the half-sentence the client has to choose between, and it
+    is not cosmetic: on a single-vendor cluster the vendor is derived, so the
+    sentence is about the partition that was settled on. It only speaks about
+    the cluster while no partition has been settled."""
+    settled = _options(resolve_pd_mode(backend="vLLM", cluster_vendors={"ascend"}))[
+        "vllm-nixl"
+    ]
+
+    assert settled.ineligible_code == PDModeIneligibleCode.VENDOR_MISMATCH
+    assert settled.ineligible_params["runtime"] == "nvidia"
+    assert settled.ineligible_params["vendors"] == "ascend"
+    assert settled.ineligible_params["scope"] == "partition"
+
+    # No partition can host this engine at all, so nothing was settled on and
+    # the statement goes back to being about the cluster as a whole.
+    unsettled = _options(
+        resolve_pd_mode(backend="SGLang", cluster_vendors={"ascend", "amd"})
+    )["sglang-mooncake"]
+
+    assert unsettled.ineligible_params["scope"] == "cluster"
+    assert unsettled.ineligible_params["vendors"] == "amd, ascend"
+
+
+def test_an_eligible_entry_carries_neither():
+    """None rather than an empty string: a client tests the code, and an empty
+    one would render an empty note instead of no note."""
+    entry = _options(resolve_pd_mode(backend="vLLM", cluster_vendors={"nvidia"}))[
+        "vllm-nixl"
+    ]
+
+    assert entry.eligible is True
+    assert entry.ineligible_code is None
+    assert entry.ineligible_params is None
+    assert entry.ineligible_reason is None

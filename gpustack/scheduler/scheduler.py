@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import queue
-from typing import List, Tuple, Optional
+from typing import List, Sequence, Tuple, Optional
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm import selectinload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -641,11 +641,45 @@ def build_candidate_selector(
     return CustomBackendResourceFitSelector(config, model, model_instances)
 
 
+def _pairing_affinity_max_score(
+    configured: float, rest: Sequence[ScheduleCandidatesScorer]
+) -> float:
+    """What one opposite-role sibling has to be worth, on THIS chain.
+
+    🔴 **Derived, because no constant stays true.** `CandidateScoreChain` sums,
+    and `PairingAffinityScorer` deliberately pays a full `max_score` per
+    sibling rather than normalising (see its own note), so "affinity first,
+    capacity and topology only among equals" holds exactly while one sibling
+    outweighs everything the rest of the chain can add. The configured 200 was
+    chosen when the rest was `PlacementScorer` (100) plus the file-locality
+    tiebreaker (5); `TopologyProximityScorer` then joined with a ceiling of
+    150 x 3 = 450 on the built-in zone/rack/host chain, and 100 + 5 + 450 = 555
+    quietly outranked it -- a scale-out went to the empty host in the group's
+    own rack instead of to the host already holding two decodes. Writing a
+    bigger number down would only postpone the next replay of that.
+
+    Summed over `rest` -- the scorers actually appended, not the ones that
+    could exist. `ModelFileLocalityScorer` is skipped when its weight is 0 and
+    `TopologyProximityScorer` when the cluster declares no topology, and a
+    chain that short should not have its affinity weight inflated on account of
+    scorers that are not on it.
+
+    The configured value is a floor, so raising
+    `GPUSTACK_SCHEDULER_PAIRING_AFFINITY_MAX_SCORE` still raises it. 0 is not a
+    floor but the documented off switch -- the scorer returns candidates
+    untouched at `max_score <= 0` -- so it is handed back unchanged.
+    """
+    if configured <= 0:
+        return configured
+    return max(configured, sum(scorer.score_ceiling for scorer in rest) + 1)
+
+
 def _group_scorer(
     group_id: Optional[str],
     role: Optional[str],
     cpu_only: bool,
     model_instances: List[ModelInstance],
+    rest: Sequence[ScheduleCandidatesScorer] = (),
 ) -> Optional[ScheduleCandidatesScorer]:
     """The one extra scorer a group member gets, or None for everything else.
 
@@ -666,6 +700,10 @@ def _group_scorer(
       once — so a prefill or decode arriving alone means the group is already
       running and this is one more replica of one role. The solver cannot help
       with that, because it may not move what is already placed.
+
+    `rest` is the chain this scorer is about to join, and only the pairing
+    branch reads it -- the two branches being exclusive is also why the group
+    locality weight never enters the sum that sizes pairing.
     """
     if not group_id:
         return None
@@ -679,7 +717,9 @@ def _group_scorer(
         group_id,
         role,
         model_instances,
-        max_score=envs.SCHEDULER_PAIRING_AFFINITY_MAX_SCORE,
+        max_score=_pairing_affinity_max_score(
+            envs.SCHEDULER_PAIRING_AFFINITY_MAX_SCORE, rest
+        ),
     )
 
 
@@ -868,6 +908,22 @@ async def find_candidate(
     # Select candidates.
     candidates = await candidates_selector.select_candidates(workers)
 
+    if proximity is not None:
+        # 🔴 Before scoring, and by removal rather than by weight: "do not split
+        # this member across machines more than it has to be" is the FIRST key
+        # of the ordering, and a summing chain cannot hold two strict
+        # priorities. `PairingAffinityScorer` already claims the other one and
+        # is unbounded (`max_score` per opposite sibling), so two siblings
+        # outweighed the split penalty and bought a member spread over two
+        # machines -- trading an all-reduce that runs once per layer per token
+        # for a KV transfer that runs once per request (bugs.md B8).
+        #
+        # A no-op unless the question actually arises: no topology, no group,
+        # or -- the ordinary case -- every candidate on a single machine, where
+        # they all tie at the tightest rung. It never empties the set, so a
+        # role wider than any one machine still schedules exactly as before.
+        candidates = proximity.narrow_to_tightest_internal_spread(candidates)
+
     # Score candidates.
     candidate_scorers = [
         PlacementScorer(model, model_instances),
@@ -881,9 +937,6 @@ async def find_candidate(
                 max_score=locality_max_score,
             )
         )
-    group_scorer = _group_scorer(group_id, role, cpu_only, model_instances)
-    if group_scorer is not None:
-        candidate_scorers.append(group_scorer)
     if proximity is not None:
         # Beside the group scorer rather than instead of it: that one answers
         # "which host has the most of the opposite role" -- the odds a
@@ -892,6 +945,16 @@ async def find_candidate(
         # prefers the host holding the single decode over the one holding two
         # prefills, which no notion of distance would produce.
         candidate_scorers.append(proximity)
+    # Last, and that is not cosmetic: `_group_scorer` sizes pairing affinity
+    # against the ceilings of the scorers already on the chain, so every other
+    # scorer has to be appended by now. The chain resets `candidate.score`
+    # between scorers and sums the results, so the position itself changes no
+    # score.
+    group_scorer = _group_scorer(
+        group_id, role, cpu_only, model_instances, candidate_scorers
+    )
+    if group_scorer is not None:
+        candidate_scorers.append(group_scorer)
     candidates = await CandidateScoreChain(candidate_scorers).score(candidates)
 
     # Pick the highest score candidate.

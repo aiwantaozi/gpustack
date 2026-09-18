@@ -51,11 +51,25 @@ MULTI_CONNECTOR = "MultiConnector"
 # The child connectors keep their own roles, which is what the engine acts on.
 _COMPOSITE_ROLE = "kv_both"
 
-# Which side of the pair asks the cache first. Anything else — a router, a
-# role-less deployment that somehow reached here — keeps the order the
-# arguments arrived in, because inventing a priority for a role whose
-# semantics are unknown is how a wrong answer gets served confidently.
+# Which side of the pair asks the cache first, and which asks the PD connector
+# first. Both are named, rather than one of them being "everything else": a
+# role in neither set — a router, a role-less deployment — keeps the order the
+# arguments arrived in, because inventing a priority for a role whose semantics
+# are unknown is how a wrong answer gets served confidently.
+#
+# 🔴 The second set used to be spelled `role not in _CACHE_FIRST_ROLES`, which
+# reversed for every role that is not prefill and so left that third case with
+# no behaviour of its own. It reads identically on a P/D pair and is wrong off
+# it. The case it actually reached is not the router — a managed one is
+# projected onto the custom backend before the server class is chosen
+# (`pd_router.apply_managed_router`), so it never gets as far as vLLM's argv —
+# but a role-less deployment: the *local* LMCache branch emits its descriptor
+# with no check for a hand-written `--kv-transfer-config` (the shared-cache
+# branch stands down instead, `server/cache_services.py`), so those two arrive
+# together with role None and were composed in the opposite order to the one
+# this comment promised.
 _CACHE_FIRST_ROLES = frozenset({"prefill"})
+_PD_FIRST_ROLES = frozenset({"decode"})
 
 
 def _parse(value: str, *, where: str) -> Optional[Dict[str, Any]]:
@@ -102,12 +116,22 @@ def compose_descriptors(
 ) -> Dict[str, Any]:
     """Fold several connector descriptors into one `MultiConnector`.
 
-    `descriptors` arrives cache-first; a role that wants the opposite gets it
-    reversed here, so the caller never has to know the rule.
+    `descriptors` arrives cache-first; the role that wants the opposite gets it
+    reversed here, so the caller never has to know the rule. A role with no
+    stated preference keeps the order it arrived in.
     """
     ordered = list(descriptors)
-    if role not in _CACHE_FIRST_ROLES:
+    if role in _PD_FIRST_ROLES:
         ordered.reverse()
+    elif role not in _CACHE_FIRST_ROLES:
+        # Named rather than silent: the order this comes out in is then the
+        # order two unrelated producers happened to be assembled in, and the
+        # only way to see that from a launch log is to be told.
+        logger.debug(
+            "Role '%s' states no connector preference; keeping the order the "
+            "arguments arrived in.",
+            role,
+        )
     return {
         "kv_connector": MULTI_CONNECTOR,
         "kv_role": _COMPOSITE_ROLE,

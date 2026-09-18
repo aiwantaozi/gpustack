@@ -68,8 +68,71 @@ def test_an_unparseable_version_fails_open():
     """The same failure mode the cache provider's range takes, and for the same
     reason: a private version string on a self-built image must never be the
     thing that condemns a deployment. `version_in_range` answers None here, and
-    only a positive `False` counts."""
+    only a positive `False` counts.
+
+    The last three are real strings off real images, kept here so the pass the
+    local-version and pre-release carve-outs added does not quietly become the
+    only way an exotic string survives — these never reach that predicate at
+    all, and must keep not reaching it."""
     assert _engine_version_below_recipe_floor(_model(SGLANG, "not-a-version")) is False
+    assert (
+        _engine_version_below_recipe_floor(
+            _model(SGLANG, "0.23.0-ascend-router-custom")
+        )
+        is False
+    )
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "latest")) is False
+    assert (
+        _engine_version_below_recipe_floor(_model(SGLANG, "0.8.0-2.8-cu128")) is False
+    )
+
+
+def test_a_local_version_under_the_floor_is_left_alone():
+    """🔴 The self-built image the docstring promises not to condemn, in the
+    form that parses.
+
+    `0.5.6+ourfix` sorts under 0.5.7 and used to be marked for it, but `+local`
+    means in PEP 440's own vocabulary "the official 0.5.6 with something of mine
+    on top" — and backporting the very fix `>=0.5.7` asks for is the usual
+    reason to cut one. Passing it is the platform saying it cannot tell, not
+    that the build is sound."""
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "0.5.6+ourfix")) is False
+
+
+def test_a_pre_release_of_the_floor_itself_is_left_alone():
+    """`0.5.7-rc1` parses to `0.5.7rc1`, which PEP 440 sorts *before* 0.5.7 — so
+    the rc of the very release the floor names was being reported as under it.
+    Whoever is running an rc is running the code 0.5.7 became, and the version
+    string cannot say which commits made it in."""
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "0.5.7-rc1")) is False
+
+
+def test_a_dev_release_is_a_pre_release_and_is_left_alone_too():
+    """`packaging` reports `is_prerelease` True for `0.5.6.dev0`, and that is
+    the right answer here and not an accident of the library: a `.dev` build is
+    cut off a branch rather than off a release, which is the same thing the
+    floor cannot see into."""
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "0.5.6.dev0")) is False
+
+
+def test_a_plain_release_under_the_floor_is_still_reported():
+    """🔴 The line that must not move. Nothing about `0.5.5` or `0.5.6` claims
+    to be anything but the release it names, so the floor ranks them and the
+    answer is the one it was built to give."""
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "0.5.5")) is True
+    assert _engine_version_below_recipe_floor(_model(SGLANG, "0.5.6")) is True
+
+
+def test_a_role_on_a_local_version_does_not_drag_a_clean_group_down():
+    """Per role on the way in, so per role on the way out as well: the decode
+    carrying a private build is the member the check would otherwise mark the
+    whole group for."""
+    roles = [
+        RoleSpec(name="prefill"),
+        RoleSpec(name="decode", backend_version="0.5.6+ourfix"),
+    ]
+    model = _model(SGLANG, backend_version="0.6.0", roles=roles)
+    assert _engine_version_below_recipe_floor(model) is False
 
 
 def test_a_nonexistent_but_parseable_version_is_above_the_floor():

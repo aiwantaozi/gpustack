@@ -9,8 +9,10 @@ from gpustack.schemas.pd_modes import (
     PDKVLease,
     PDMode,
     PDModeCatalog,
+    PDNetDevicePlaneEnum,
     PDTransferMetrics,
     PDRouterProtocolEnum,
+    iter_placeholders,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ def parse_pd_mode_catalog(raw: Any) -> PDModeCatalog:
     _assert_expired_metric_agrees(modes)
     _assert_gpu_filters_declared(modes)
     _assert_router_invocation_is_classified(modes)
+    _assert_net_device_plane_is_read_somewhere(modes)
     return PDModeCatalog(
         kv_leases=leases, kv_transfer_metrics=transfer_metrics, modes=modes
     )
@@ -248,6 +251,38 @@ def _assert_router_invocation_is_classified(modes: List[PDMode]) -> None:
                 f"'{mode.name}': router declares no connection_args — the "
                 f"flags a deployment may not override are read from there, so "
                 f"an empty list silently permits all of them"
+            )
+    if problems:
+        raise PDModeCatalogError("; ".join(problems))
+
+
+def _assert_net_device_plane_is_read_somewhere(modes: List[PDMode]) -> None:
+    """A recipe that declares `net_device_plane: control` must reference
+    `{{net_device}}`.
+
+    The field only ever changes the value of that one placeholder, so declaring
+    it on a recipe that never injects the placeholder is a statement that does
+    nothing — and the shape it would be written in by mistake is the expensive
+    one: somebody relaxing the multi-NIC refusal for `sglang-mooncake`, whose
+    NIC is the engine's own business (`--disaggregation-ib-device`), would see
+    no effect and go looking for the reason in code.
+
+    Only the non-default direction is checked. `data` is what a recipe gets for
+    saying nothing, so requiring it to be *used* would refuse every recipe that
+    legitimately leaves the NIC to the engine.
+    """
+    problems = []
+    for mode in modes:
+        if mode.net_device_plane is not PDNetDevicePlaneEnum.CONTROL:
+            continue
+        referenced = any(
+            occurrence == "{{net_device}}" for occurrence in iter_placeholders(mode)
+        )
+        if not referenced:
+            problems.append(
+                f"'{mode.name}' declares net_device_plane "
+                f"'{mode.net_device_plane.value}' but injects no "
+                "{{net_device}} anywhere, so the declaration changes nothing"
             )
     if problems:
         raise PDModeCatalogError("; ".join(problems))

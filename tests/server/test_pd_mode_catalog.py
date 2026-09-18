@@ -7,6 +7,7 @@ from gpustack.schemas.pd_modes import (
     PDMembershipAPI,
     PDTransferMetrics,
     PDMode,
+    PDNetDevicePlaneEnum,
     PDPeerStyleEnum,
     PDPortScopeEnum,
     PDRouter,
@@ -1086,3 +1087,68 @@ def test_a_membership_body_may_only_name_a_band_the_mode_allocates():
 
     # And the shipped spelling still validates, so this is not vacuous.
     assert PDMode.model_validate(shipped.model_dump(mode="json")).name == shipped.name
+
+
+# ---------------------------------------------------------------------------
+# Which plane {{net_device}} rides is the recipe's to declare.
+# ---------------------------------------------------------------------------
+
+
+def test_the_net_device_plane_differs_between_the_recipes_that_inject_it():
+    """One placeholder, two natures — which is the whole reason it is declared.
+
+    Ascend's three `*_SOCKET_IFNAME` carry handshake sockets while the KV bytes
+    ride the cards' RoCE ports, so the worker's own management NIC is the right
+    answer and the multi-NIC refusal only costs an operator a value the platform
+    already holds. NIXL's `UCX_NET_DEVICES` is the data plane on the same kind
+    of host, where the management NIC is usually the wrong fabric.
+    """
+    ascend = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+    assert ascend.net_device_plane == PDNetDevicePlaneEnum.CONTROL
+
+    for name in (PDModeEnum.VLLM_NIXL.value, PDModeEnum.SGLANG_NIXL.value):
+        mode = get_pd_mode(name)
+        assert mode.net_device_plane == PDNetDevicePlaneEnum.DATA, name
+
+
+def test_a_recipe_that_says_nothing_keeps_the_stricter_plane():
+    """The default has to be `data`: forgetting to classify a recipe then costs
+    one `kv_ifname`, where the reverse default would silently put KV bytes on
+    the management NIC of every unclassified recipe."""
+    assert PDMode(name="x").net_device_plane == PDNetDevicePlaneEnum.DATA
+    # And the shipped recipes that leave the NIC to the engine are unaffected.
+    assert (
+        get_pd_mode(PDModeEnum.SGLANG_MOONCAKE.value).net_device_plane
+        == PDNetDevicePlaneEnum.DATA
+    )
+
+
+def test_declaring_the_control_plane_where_no_net_device_is_injected_fails():
+    """The field changes exactly one placeholder's value, so declaring it on a
+    recipe that never injects `{{net_device}}` is a statement that does nothing
+    — and the mistake it would come from is the expensive one: relaxing the
+    refusal for `sglang-mooncake`, whose NIC is the engine's own business, would
+    have no effect and send somebody looking for the reason in code."""
+    document = _document(
+        [
+            {
+                "name": PDModeEnum.SGLANG_MOONCAKE.value,
+                "backends": list(PD_MODE_BACKENDS[PDModeEnum.SGLANG_MOONCAKE.value]),
+                "net_device_plane": "control",
+            }
+        ]
+    )
+
+    with pytest.raises(PDModeCatalogError, match="changes nothing"):
+        parse_pd_mode_catalog(document)
+
+
+def test_the_plane_round_trips_through_serialization():
+    """The endpoint serves `model_dump()` back, and re-validating our own output
+    has to be a no-op."""
+    shipped = get_pd_mode(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+    dumped = shipped.model_dump(mode="json")
+    assert dumped["net_device_plane"] == "control"
+    assert (
+        PDMode.model_validate(dumped).net_device_plane == PDNetDevicePlaneEnum.CONTROL
+    )

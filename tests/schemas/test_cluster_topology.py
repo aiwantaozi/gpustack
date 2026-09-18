@@ -4,7 +4,7 @@ from gpustack.schemas.clusters import ClusterTopology, ClusterUpdate
 from tests.utils.topology_layers import layer_dict, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/zone"
+ZONE = "topology.gpustack.ai/zone"
 DOMAIN = "topology.gpustack.ai/accelerator-domain"
 
 
@@ -24,7 +24,7 @@ def test_layers_round_trip_through_their_camel_case_aliases():
     c = cluster(
         {
             "layers": [
-                layer_dict("Hall", [ROOM]),
+                layer_dict("Hall", [ZONE]),
                 layer_dict("Cabinet", [RACK], parent="Hall"),
             ],
         }

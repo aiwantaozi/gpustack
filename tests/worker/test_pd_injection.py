@@ -189,10 +189,15 @@ def test_an_unallocated_port_band_stops_the_launch(caplog):
 
 def test_an_underivable_net_device_stops_the_launch(caplog):
     """Measured on 910B2: the host has six candidate NICs, `derive_net_device`
-    correctly refuses to guess between them, and `HCCL_SOCKET_IFNAME` reached
-    HCCL as the literal string `{{net_device}}` — the name of an interface that
-    does not exist. Nothing failed loudly; the transport simply never
-    connected.
+    refused to guess between them, and `HCCL_SOCKET_IFNAME` reached HCCL as the
+    literal string `{{net_device}}` — the name of an interface that does not
+    exist. Nothing failed loudly; the transport simply never connected.
+
+    📌 That recipe no longer reaches this path by way of the refusal: its
+    `{{net_device}}` is a control-plane socket, so it takes `Worker.ifname`
+    (`net_device_plane: control`). The refusal itself is unchanged for the NIXL
+    recipes, and the failure below is what any unresolvable NIC still costs —
+    which is why it stops the launch rather than being rendered as `all`.
 
     The message has to name the escape hatch, because the operator's next
     question is where to put the answer."""
@@ -635,8 +640,10 @@ def test_an_unrendered_env_var_stops_the_launch():
     transport that quietly never connects.
 
     Measured on 910B2, where the host has six candidate NICs and
-    `derive_net_device` correctly refuses to guess between them. The refusal
-    was right; its consequence was invisible."""
+    `derive_net_device` refused to guess between them. The refusal was
+    defensible; its consequence was invisible — and on this recipe it is not
+    even needed, since the variable it lands on carries a handshake socket
+    rather than the KV bytes (`net_device_plane: control`)."""
     from gpustack.worker.pd_injection import PDInjection, _refuse_unrendered
 
     injection = PDInjection(
@@ -798,3 +805,91 @@ def test_the_mount_reaches_the_container_read_only():
     assert [(m.path, m.mode) for m in mounts] == [
         ("/etc/hccn.conf", ContainerMountModeEnum.ROX)
     ]
+
+
+# --- whose cards are whose ------------------------------------------------- #
+
+
+def test_a_peer_that_pins_its_own_cards_is_not_read_off_the_running_member():
+    """🔴 `{{roles.decode.tensor_parallel_size}}` used to render the *prefill*
+    member's card count, because the running instance was handed to every
+    role's field resolution. A four-card prefill therefore wrote 4 into
+    Mooncake's descriptor for a decode pinned to one card — a number decode's
+    engine contradicts the moment it derives its own, which is the handshake
+    failure the implicit rule exists to avoid.
+
+    A peer that pinned its own cards can be answered from the spec, and is."""
+    from gpustack.schemas.models import GPUSelector
+
+    model = _model(
+        mode=PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        roles=[
+            RoleSpec(name="prefill", replicas=1),
+            RoleSpec(
+                name="decode",
+                replicas=1,
+                gpu_selector=GPUSelector(gpu_ids=["w1:npu:4"]),
+            ),
+        ],
+    )
+    instance = _instance(
+        named_ports={"kv_port": PortBand(base=41100, count=4)},
+        gpu_indexes=[0, 1, 2, 3],
+    )
+
+    descriptor = _connector(render_pd_injection(model, instance, _variables()))
+    extra = descriptor["kv_connector_extra_config"]
+
+    assert extra["prefill"]["tp_size"] == 4
+    assert extra["decode"]["tp_size"] == 1
+
+
+def test_two_silent_roles_still_render_from_the_member_that_is_starting():
+    """The deliberate limit of the fix above. The peer's own member cannot be
+    consulted here — prefill routinely starts before decode has been placed, so
+    its `gpu_indexes` may not exist yet — and refusing to render would break
+    the silent 1P1D the implicit rule was written for. With no per-role pin
+    both roles are sized by the same auto-selection of the same model, so the
+    running member's count is the honest answer rather than a guess."""
+    model = _model(mode=PDModeEnum.VLLM_ASCEND_MOONCAKE)
+    instance = _instance(
+        named_ports={"kv_port": PortBand(base=41100, count=2)},
+        gpu_indexes=[0, 1],
+    )
+
+    extra = _connector(render_pd_injection(model, instance, _variables()))[
+        "kv_connector_extra_config"
+    ]
+    assert extra["prefill"]["tp_size"] == 2
+    assert extra["decode"]["tp_size"] == 2
+
+
+def test_a_peers_declared_parallelism_still_wins_over_its_pin():
+    """The pin only answers for a role that wrote nothing. A decode that
+    declares TP2 on four pinned cards is a decode at TP2, and the descriptor
+    has to carry what the engine will run."""
+    from gpustack.schemas.models import GPUSelector
+
+    model = _model(
+        mode=PDModeEnum.VLLM_ASCEND_MOONCAKE,
+        roles=[
+            RoleSpec(name="prefill", replicas=1),
+            RoleSpec(
+                name="decode",
+                replicas=1,
+                backend_parameters=["--tensor-parallel-size", "2"],
+                gpu_selector=GPUSelector(
+                    gpu_ids=["w1:npu:4", "w1:npu:5", "w1:npu:6", "w1:npu:7"]
+                ),
+            ),
+        ],
+    )
+    instance = _instance(
+        named_ports={"kv_port": PortBand(base=41100, count=4)},
+        gpu_indexes=[0, 1, 2, 3],
+    )
+
+    extra = _connector(render_pd_injection(model, instance, _variables()))[
+        "kv_connector_extra_config"
+    ]
+    assert extra["decode"]["tp_size"] == 2

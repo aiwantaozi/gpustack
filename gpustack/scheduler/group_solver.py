@@ -273,6 +273,15 @@ async def solve_group_placement(
         return GroupInfeasible(
             reason="No topology domain has any capacity for this group.",
             needed=total,
+            # Carried for the same reason every other refusal carries it: the
+            # caller asks the capacity function what this role's filters said,
+            # and `notes_for(None)` answers nothing at all. Reached when a
+            # `must` layer has no domain to walk — a cluster with no workers
+            # left in it — which is precisely when the filter lines ("Matched
+            # 0/3 workers by label selector") are the only account of why. The
+            # hungriest role is the one the sizing pass above already swept, so
+            # it is both the meaningful answer and the only one with notes.
+            role=ordered_roles[0].role,
         )
     return _describe(best, enforced, attendants)
 
@@ -421,7 +430,17 @@ async def _fit_in_domain(
     total = sum(r.replicas for r in roles)
     if not worker_ids:
         return GroupInfeasible(
-            reason="empty domain", layer=layer, best_domain=domain.name, needed=total
+            reason="empty domain",
+            layer=layer,
+            best_domain=domain.name,
+            needed=total,
+            # A domain with no workers is the one refusal whose count explains
+            # nothing -- "room for 0" is true of an empty cluster however the
+            # fleet got that way. The role is what lets the caller attach the
+            # filters' own lines, which do say. First in the order the caller
+            # sorted them: the hungriest role, the same one the sizing pass
+            # swept, so its filter chain has already run.
+            role=roles[0].role if roles else None,
         )
 
     placement = GroupPlacement(layer=layer, domain=domain.name)

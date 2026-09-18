@@ -19,7 +19,7 @@ from gpustack.scheduler.topology import NODE_LAYER, UNCLASSIFIED
 from tests.utils.topology_layers import layer_dict, layer_obj, lid
 
 RACK = "topology.gpustack.ai/rack"
-ROOM = "topology.gpustack.ai/zone"
+ZONE = "topology.gpustack.ai/zone"
 CLIQUE = "nvidia.com/gpu.clique"
 DOMAIN = "topology.gpustack.ai/accelerator-domain"
 # The leaf-switch rung, as a fleet running Topograph publishes it — the one
@@ -221,7 +221,7 @@ async def test_a_discovered_domain_makes_the_declared_domain_rung_active():
 
 @pytest.mark.asyncio
 async def test_an_undeclared_domain_is_not_a_layer_at_all():
-    """🔴 §2: the built-in list is room/row/rack and nothing else. A fleet whose
+    """🔴 §2: the built-in list is zone/rack and nothing else. A fleet whose
     runtime publishes a clique gets no layer for it until someone says so —
     which is the cost the redesign accepts in exchange for the domain being
     placeable anywhere on the chain."""
@@ -319,11 +319,11 @@ async def test_unfilled_workers_are_deduplicated_across_layers():
     """One worker missing two values is one worker to go and fill in."""
     workers = [
         _worker(1, "w1"),
-        _worker(2, "w2", {ROOM: "hall-1"}),
+        _worker(2, "w2", {ZONE: "hall-1"}),
         _worker(3, "w3", {RACK: "R1"}),
     ]
     result = await _get(workers)
-    # w1 is unfilled at room *and* at rack; w2 only at rack; w3 only at room.
+    # w1 is unfilled at zone *and* at rack; w2 only at rack; w3 only at zone.
     assert result.unclassified_workers == 3
 
 
@@ -494,7 +494,7 @@ async def test_workers_carry_their_labels_and_a_domain_tier_counts_like_any_rung
 
 @pytest.mark.asyncio
 async def test_the_vocabulary_ships_with_the_view_root_to_leaf():
-    """§5: three built-in fields, no chain marker on any of them."""
+    """§5: two built-in fields, no chain marker on any of them."""
     result = await _get([_worker(1, "w1")])
     assert [f.id for f in result.vocabulary.fields] == [
         lid("zone"),

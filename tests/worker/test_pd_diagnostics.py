@@ -104,12 +104,36 @@ def test_an_unrendered_placeholder_is_named():
 
 
 def test_two_kv_transfer_configs_are_recognised():
-    """The engine accepts exactly one, and the pre-checks refuse the
-    combination — this catches the case that got past them."""
+    """The engine accepts exactly one, and GPUStack folds the two it knows
+    about into a MultiConnector — so two arriving here means the fold was
+    bypassed, and the summary has to name each way that happens rather than
+    stopping at the first.
+
+    🔴 This asserted the phrase "extended KV cache" until 2026-09-18, locking
+    in a summary that told the user disaggregation and a shared cache cannot
+    coexist. They can; the assertion outlived the limitation.
+    """
     found = diagnose("ERROR --kv-transfer-config already specified")
 
     assert found.signature == "kv connector conflict"
-    assert "extended KV cache" in found.summary
+    assert "MultiConnector" in found.summary
+    # The two log lines that tell the causes apart, quoted closely enough to
+    # be grep-able, and the third case where one flag is all the engine got.
+    assert "Composed N KV connectors into a MultiConnector" in found.summary
+    assert "Leaving N --kv-transfer-config arguments unmerged" in found.summary
+    assert "kv_connector_extra_config" in found.summary
+
+
+def test_the_kv_connector_conflict_does_not_call_the_combination_impossible():
+    """The regression this entry carried: a supported combination described as
+    one the user has to give up. `worker/kv_transfer.py` composes the two, and
+    a prefill was measured running the composite — so no phrasing that refuses
+    the pair may come back into the text the operator reads."""
+    found = diagnose("ERROR --kv-transfer-config already specified")
+
+    assert "cannot also enable" not in found.summary
+    assert "does not assemble" not in found.summary
+    assert "CAN also enable an extended KV cache" in found.summary
 
 
 # --- attributing a port to its band ---------------------------------------- #

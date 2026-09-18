@@ -6,6 +6,7 @@ from typing import List, Optional
 import psutil
 
 from gpustack.config.config import Config
+from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
 from gpustack.schemas.workers import Worker
 
 logger = logging.getLogger(__name__)
@@ -130,11 +131,29 @@ def _multi_nic_refusal(worker_name: str, worker_ifname: str, candidates: List[st
     )
 
 
-def derive_net_device(worker: Worker, config: Config) -> Optional[str]:
-    """The value of ``{{net_device}}``: the NIC carrying the KV plane.
+def derive_net_device(
+    worker: Worker,
+    config: Config,
+    plane: PDNetDevicePlaneEnum = PDNetDevicePlaneEnum.DATA,
+) -> Optional[str]:
+    """The value of ``{{net_device}}``: the NIC this recipe's ``plane`` rides.
 
     Priority: ``config.kv_ifname`` (per-worker escape hatch) -> ``Worker.ifname``
     *if this host has only one plausible KV NIC* -> ``None``.
+
+    **``plane`` decides whether that middle gate applies at all**, and it is
+    passed in from the recipe (``PDMode.net_device_plane``) rather than decided
+    here, because one placeholder is injected into variables of two natures —
+    see ``PDNetDevicePlaneEnum``. On ``CONTROL`` the host's NIC list is not
+    consulted: the value wanted there is the NIC holding the worker's
+    registration IP, which is what ``Worker.ifname`` *is*, so there is nothing
+    to guess between and a refusal would only make the operator retype a fact
+    the platform already knows — or mistype it, which on Ascend puts
+    ``HCCL_IF_IP`` on a NIC that does not hold it.
+
+    ``kv_ifname`` still wins on both planes. It is the per-worker escape hatch,
+    and a plane that could bypass it would make setting it a no-op exactly
+    where an operator went to the trouble of answering.
 
     Do NOT invent a value when this returns ``None``. The renderer leaves an
     unresolved placeholder as-is and logs a WARNING, which is diagnosable;
@@ -145,13 +164,13 @@ def derive_net_device(worker: Worker, config: Config) -> Optional[str]:
     ``NIXL_ERR_BACKEND`` -- a wrong value instead of a clean failure, at the
     far end of the handshake rather than at the point of the misconfiguration.
 
-    **The multi-NIC refusal.** ``Worker.ifname`` is the management-plane NIC. On
-    a single-NIC host that is the right answer; on a multi-NIC host, or when the
-    KV traffic is meant to ride a dedicated fabric, it is not, and only the
-    operator knows which. So the host's own NIC list is enumerated here and used
-    purely as a gate: more than one candidate means the fallback is a guess, and
-    a guess is refused with an ERROR naming the candidates rather than silently
-    resolved to the management plane.
+    **The multi-NIC refusal (data plane only).** ``Worker.ifname`` is the
+    management-plane NIC. On a single-NIC host that is the right answer; on a
+    multi-NIC host, or when the KV traffic is meant to ride a dedicated fabric,
+    it is not, and only the operator knows which. So the host's own NIC list is
+    enumerated here and used purely as a gate: more than one candidate means the
+    fallback is a guess, and a guess is refused with an ERROR naming the
+    candidates rather than silently resolved to the management plane.
 
     The enumeration never *supplies* a value, only withholds one. Picking "the
     single candidate" over ``Worker.ifname`` would swap a measured fact -- the
@@ -196,24 +215,33 @@ def derive_net_device(worker: Worker, config: Config) -> Optional[str]:
     worker_name = getattr(worker, "name", None) or "<unknown>"
     worker_ifname = (getattr(worker, "ifname", None) or "").strip()
 
-    try:
-        candidates = candidate_kv_interfaces()
-    except Exception as e:
-        # A failed enumeration must not be able to withhold a value on its own:
-        # the gate exists to stop a guess, and treating "I could not look" as
-        # "there are too many" would break hosts that work today.
-        logger.warning(
-            "Failed to enumerate the network interfaces of worker %s (%s); "
-            "falling back to the management-plane NIC without the multi-NIC "
-            "check.",
-            worker_name,
-            e,
-        )
-        candidates = []
+    # The control plane asks a question the host's NIC list cannot answer and
+    # does not need to: the NIC wanted there is the one carrying the worker's
+    # registration IP, and nothing in an enumeration identifies that. So the
+    # gate below is skipped entirely rather than widened -- an empty candidate
+    # set also keeps the "looks virtual" warning silent, which on this plane
+    # would be wrong twice over: a worker genuinely reaching the server through
+    # such an interface is describing the route its own handshake must take.
+    candidates: List[str] = []
+    if plane is not PDNetDevicePlaneEnum.CONTROL:
+        try:
+            candidates = candidate_kv_interfaces()
+        except Exception as e:
+            # A failed enumeration must not be able to withhold a value on its
+            # own: the gate exists to stop a guess, and treating "I could not
+            # look" as "there are too many" would break hosts that work today.
+            logger.warning(
+                "Failed to enumerate the network interfaces of worker %s (%s); "
+                "falling back to the management-plane NIC without the multi-NIC "
+                "check.",
+                worker_name,
+                e,
+            )
+            candidates = []
 
-    if len(candidates) > 1:
-        _multi_nic_refusal(worker_name, worker_ifname, candidates)
-        return None
+        if len(candidates) > 1:
+            _multi_nic_refusal(worker_name, worker_ifname, candidates)
+            return None
 
     if worker_ifname:
         if candidates and worker_ifname not in candidates:

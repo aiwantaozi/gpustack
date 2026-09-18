@@ -90,7 +90,17 @@ from gpustack.schemas.cache_services import (
     CacheServiceModeEnum,
     CacheServiceStateEnum,
 )
+from gpustack.schemas.pd_modes import PDTensorParallelPairingEnum
 from gpustack.server.cache_provider_catalog import get_cache_provider
+from gpustack.server.pd_pairing import (
+    PAIRING_ANY_PARALLELISM,
+    PAIRING_TP,
+    role_parameters,
+    tensor_parallel_rule,
+    undecidable_factors,
+    violates_tensor_parallel_direction,
+)
+from gpustack.utils.command import find_last_int_parameter, find_last_parameter
 from gpustack.server import pd_membership
 from gpustack.server.pd_membership import outcome_for as membership_outcome_for
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
@@ -1471,8 +1481,22 @@ async def _build_instance_create(
     builds, deliberately: a role's overrides are applied by the read-path
     projection (`role_effective_model`), never written here, so that one
     intent keeps one source of truth.
+
+    The exception is a column whose value is a *decision made once, at
+    creation*, and which the read path therefore cannot revisit — `backend`,
+    which picks the image, and `draft_model_source`, which picks the weights to
+    download. Those are resolved against the role-effective model here because
+    there is nowhere later to do it.
     """
     name_prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+    # Everything decided from a per-role override is decided from this, not from
+    # `model`. The two used to sit on adjacent lines disagreeing: `backend` was
+    # projected and `draft_model_source` was not, so a group that configured a
+    # draft model on decode alone was admitted, started, and ran decode with the
+    # engine argument naming the draft model and no draft weights on the
+    # machine. MTP hid it — its head travels inside the main weights — which is
+    # why an eagle3 or an external draft model was the first to notice.
+    effective = role_effective_model(model, role.name)
     return ModelInstanceCreate(
         name=f"{model.name}-{role.name}-{name_prefix}",
         model_id=model.id,
@@ -1487,11 +1511,11 @@ async def _build_instance_create(
         cluster_id=model.cluster_id,
         owner_principal_id=model.owner_principal_id,
         namespace=namespace,
-        draft_model_source=await get_draft_model_source(session, model),
+        draft_model_source=await get_draft_model_source(session, effective),
         # The backend is a per-role override, so it is resolved against the
         # role-effective model rather than the Model — a `custom` group may
         # legitimately mix engines.
-        backend=get_backend(role_effective_model(model, role.name)),
+        backend=get_backend(effective),
         backend_version=role.backend_version or model.backend_version,
         role=role.name,
         group_id=group_id,
@@ -1516,7 +1540,15 @@ async def _release_and_delete(
         return []
     names = await ModelInstanceService(session).batch_delete(instances)
     if names:
-        logger.debug(f"Deleted model instances: {names}")
+        # INFO because this is the other half of the `Formed group` line. A
+        # group that loses every member re-forms from scratch, and the solver
+        # is free to answer somewhere else -- so a group can move machines
+        # with nothing on the model row to show for it. Neither `stale` nor a
+        # degradation can carry that: one follows the spec digest, which did
+        # not change, and the other reads current state, which looks correct
+        # once the rebuild lands. The two log lines are the whole account
+        # there is, and they are only an account if both are visible.
+        logger.info(f"Deleted model instances: {names}")
     return names
 
 
@@ -1605,7 +1637,13 @@ async def _sync_replicas_per_role(
                 )
         if pending:
             await ModelInstanceService(session).batch_create(pending)
-            logger.debug(
+            # INFO rather than debug: a group forming is how a group also
+            # re-forms. Nothing on the model row records that its members were
+            # torn down and rebuilt elsewhere — not `stale`, which follows the
+            # spec digest, and not a degradation, which reads current state —
+            # so when an operator asks why a running group moved machines,
+            # this line is the only first-hand evidence there is.
+            logger.info(
                 f"Formed group {group_id} for model {model.name} "
                 f"with {len(pending)} members"
             )
@@ -1778,10 +1816,16 @@ async def _reap_drained(
 async def cancel_drain(session: AsyncSession, instance: ModelInstance):
     """Put a draining member back into rotation.
 
-    The rollback half, and it is one field: the next membership reconcile sees
-    an ordinary RUNNING member and re-registers its address. Nothing has to be
-    restarted because nothing was stopped — which is the property that makes a
-    wrong scale-down recoverable rather than merely regrettable.
+    One field: the next membership reconcile sees an ordinary RUNNING member and
+    re-registers its address. Nothing has to be restarted because nothing was
+    stopped — which is what would make a wrong scale-down recoverable rather
+    than merely regrettable, *if* anything called this.
+
+    🔴 **GPUStack ships no rollback, and this is not one.** There is no rollback
+    feature anywhere in the product — not for a scale-down, not automatic, not
+    manual — and this function does not add one: it is the mechanism a rollback
+    would be built on, with no trigger attached. Read it as "the state is
+    reversible in principle", never as "the operator can reverse it".
 
     🔴 No automatic trigger yet, and deliberately not one invented here. The
     obvious one — "roll back if the group's TTFT degrades during the window" —
@@ -1789,6 +1833,25 @@ async def cancel_drain(session: AsyncSession, instance: ModelInstance):
     ordinary load variance and undo correct scale-downs. What exists is the
     mechanism and the audit trail; the judgement stays with the operator until
     there are measurements to set it from.
+
+    🔴 **No caller in production code, and that is the shipped decision — not a
+    route someone forgot to wire.** Nothing but the tests reaches this: there is
+    no API endpoint, no UI, no controller path. The window is 60s by default,
+    which is not long enough for a human to notice a mis-scale, find the member
+    and press something; and the instance list does not surface
+    `draining_since`, so such a button would be pressed blind.
+
+    ⚠️ **Putting `replicas` back is not a rollback either**, and calling it one
+    was the error this note used to make. It does recover the *ratio*: the
+    anti-flap arithmetic in `_scale_down_role` will not pick a second victim,
+    and the pass that reaps the drained member creates the replacement in the
+    same reconcile. But it does not recover the member — that one is still
+    deleted on schedule and the replacement is a cold start, which for a PD role
+    means loading weights again. Re-scaling up is the only thing an operator can
+    do; it is not undo.
+
+    Keep this callable: when a data-backed threshold exists, the trigger
+    attaches here.
     """
     instance.draining_since = None
     await instance.update(session)
@@ -2808,11 +2871,49 @@ def _engine_version_below_recipe_floor(model: Model) -> bool:
     Same fail-open as that check, and for the same reason: only a version
     `version_in_range` positively reports as OUT of range counts. None,
     unparseable and unpinned all leave the marker unset -- an exotic version
-    string must never be the thing that condemns a deployment.
+    string must never be the thing that condemns a deployment. A local version
+    or a pre-release is let through on top of that, for the reason
+    `_is_self_described_build` gives.
     """
+    from packaging.version import Version
+
     from gpustack.schemas.models import role_takes_no_accelerator
     from gpustack.server.pd_mode_catalog import get_pd_mode
     from gpustack.utils.version import version_in_range
+
+    def _is_self_described_build(pinned_version: str) -> bool:
+        """Whether the number describes a build of the user's own, which the
+        recipe's floor has no standing to rank.
+
+        🔴 The self-built image this check promises not to condemn only gets
+        that promise kept when its version fails to parse at all
+        (`0.23.0-ascend-router-custom`, `latest`). Two forms that do parse are
+        the same situation and were being marked anyway, and both say in PEP
+        440's own vocabulary that the version is not the release it sorts next
+        to: `+ourfix` means the official 0.5.6 with something of the packager's
+        applied on top, and `0.5.7rc1` means a build handed out before 0.5.7
+        exists. Either one may already carry the fix `>=0.5.7` is asking for --
+        backporting it is exactly why someone cuts a `+local` -- and nothing in
+        the string can say whether it does.
+
+        So passing them is the platform admitting it cannot tell, not declaring
+        them sound. The marker's claim is "below the declared floor", and a
+        number that is not describing the floor's release line was never
+        measured against it to begin with.
+
+        `.dev0` lands here too, as a pre-release: packaging counts dev releases
+        among them, and a build cut off someone's branch is the same
+        unanswerable question an rc is.
+        """
+        try:
+            parsed = Version(pinned_version)
+        except Exception:
+            # Unparseable already failed open a line below, so nothing that
+            # cannot be parsed reaches this predicate. Swallowed regardless,
+            # because this must never be the thing that turns a version string
+            # the check has always tolerated into a raise mid-reconcile.
+            return False
+        return parsed.local is not None or parsed.is_prerelease
 
     disaggregation = getattr(model, "disaggregation", None)
     if disaggregation is None:
@@ -2857,8 +2958,122 @@ def _engine_version_below_recipe_floor(model: Model) -> bool:
 
     return any(
         version_in_range(version, mode.backend_versions) is False
+        and not _is_self_described_build(version)
         for version in pinned
         if version
+    )
+
+
+def _pd_pairing_roles(model: Model) -> Tuple[Optional[RoleSpec], Optional[RoleSpec]]:
+    """This deployment's prefill and decode, or two Nones for anything that is
+    not a disaggregated group carrying both."""
+    if getattr(model, "disaggregation", None) is None:
+        return None, None
+    roles = getattr(model, "roles", None) or []
+    prefill = next((r for r in roles if r.name == RoleNameEnum.PREFILL.value), None)
+    decode = next((r for r in roles if r.name == RoleNameEnum.DECODE.value), None)
+    return prefill, decode
+
+
+def _pairing_unverified(model: Model) -> bool:
+    """Whether a pairing factor was declared on one role and left silent on the
+    other, so admission could not judge it.
+
+    Placement has nothing to do with this one: like
+    `_engine_version_below_recipe_floor` it is a property of the spec and is
+    true from the moment the group is created. What it buys is an honest answer
+    to a question the user believes was already settled -- the pairing
+    pre-check refuses mismatched context windows and tensor parallelisms, so a
+    group that was accepted reads as a group that was checked, and until now a
+    single silent role was enough to make that untrue.
+
+    🔴 Not "the pair is wrong". `server.pd_pairing` spells out why the silent
+    side's value cannot be resolved here for any of these factors, and most
+    deployments this marks are correct. The claim is only that nothing verified
+    them.
+    """
+    prefill, decode = _pd_pairing_roles(model)
+    if prefill is None or decode is None:
+        return False
+    return bool(
+        undecidable_factors(prefill, decode, getattr(model, "backend_parameters", None))
+    )
+
+
+def _placed_tensor_parallelism(
+    model: Model, role: RoleSpec, instances: Sequence[ModelInstance]
+) -> List[int]:
+    """The tensor parallelism each placed member of this role actually runs.
+
+    A declared `--tensor-parallel-size` is the answer for every member of the
+    role. Absent one, a single-worker member runs the cards it was given --
+    that is `get_auto_parallelism_arguments` in both backends, not a guess --
+    which is precisely the number the spec could not supply at admission.
+
+    Two shapes contribute nothing rather than a number: a member spanning
+    workers, where `cal_distributed_parallelism_arguments` splits the world
+    size into tp and pp further down, and a role that writes dp or pp without
+    tp, which suppresses the injection entirely and falls back to the engine's
+    own default.
+    """
+    parameters = role_parameters(role, getattr(model, "backend_parameters", None))
+    declared = find_last_int_parameter(parameters, PAIRING_TP)
+    if declared is None and find_last_parameter(parameters, PAIRING_ANY_PARALLELISM):
+        return []
+
+    widths: List[int] = []
+    for instance in instances:
+        if instance.role != role.name or instance.worker_id is None:
+            continue
+        if declared is not None:
+            widths.append(declared)
+            continue
+        servers = getattr(instance, "distributed_servers", None)
+        if servers is not None and getattr(servers, "subordinate_workers", None):
+            continue
+        cards = len(getattr(instance, "gpu_indexes", None) or [])
+        if cards:
+            widths.append(cards)
+    return widths
+
+
+def _pairing_tp_misplaced(model: Model, instances: Sequence[ModelInstance]) -> bool:
+    """Whether the cards the members actually got break the recipe's
+    tensor-parallel direction.
+
+    The admission check reads the spec, and for this one factor the spec is
+    routinely silent: a role that writes no parallelism and pins no cards runs
+    whatever the scheduler hands it. That is the gap this closes -- the same
+    rule, applied where the number finally exists.
+
+    Compared at the extremes rather than pairwise, because the router pairs at
+    random: a group is only as good as its narrowest decode against its widest
+    prefill, and one member of each is enough for a transfer to land on the
+    shape the connector cannot serve.
+    """
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    prefill, decode = _pd_pairing_roles(model)
+    if prefill is None or decode is None:
+        return False
+
+    disaggregation = model.disaggregation
+    mode_name = getattr(disaggregation.mode, "value", None) or str(disaggregation.mode)
+    rule = tensor_parallel_rule(get_pd_mode(mode_name))
+    if rule == PDTensorParallelPairingEnum.ANY:
+        return False
+
+    prefill_widths = _placed_tensor_parallelism(model, prefill, instances)
+    decode_widths = _placed_tensor_parallelism(model, decode, instances)
+    if not prefill_widths or not decode_widths:
+        return False
+
+    if rule == PDTensorParallelPairingEnum.DECODE_GE_PREFILL:
+        return violates_tensor_parallel_direction(
+            rule, prefill_tp=max(prefill_widths), decode_tp=min(decode_widths)
+        )
+    return violates_tensor_parallel_direction(
+        rule, prefill_tp=min(prefill_widths), decode_tp=max(decode_widths)
     )
 
 
@@ -2956,6 +3171,24 @@ async def _degradation_reasons(
         # from the router's registry and goes on taking traffic, which reads as
         # a routing bug and not as a version pin.
         reasons.append(DegradationReasonEnum.ENGINE_VERSION_BELOW_RECIPE_FLOOR.value)
+
+    if _pairing_unverified(model):
+        # Spec-only, like the floor above: true from the moment the group is
+        # created. It reports an absence rather than a fault -- one role
+        # declared a pairing factor, the other went silent, and the silent
+        # side's default is not resolvable without the checkpoint or the
+        # placement. Worth saying because the pre-check refuses the mismatches
+        # it CAN see, so acceptance reads as verification.
+        reasons.append(DegradationReasonEnum.PAIRING_UNVERIFIED.value)
+
+    if _pairing_tp_misplaced(model, instances):
+        # The other half of the same gap, and the half that can be answered:
+        # once the members are placed their cards are the tensor parallelism,
+        # so the direction the recipe declares finally applies to a deployment
+        # rather than to a description. Marked and not enforced -- these
+        # members are already running, and taking them down to report their
+        # shape would cost more than the report is worth.
+        reasons.append(DegradationReasonEnum.PAIRING_TP_MISPLACED.value)
 
     if await _no_atomic_admission(session, model):
         # A property of the configuration, so it is true from the moment the
@@ -3363,28 +3596,27 @@ async def sync_model_status(session: AsyncSession, model: Model) -> bool:
             for role in model.roles
         }
 
-    # 🔴 Reconcile BEFORE deriving the state, because under `--enable-igw` the
-    # router's registry is the only way members get in: the CLI peers are
-    # never passed (upstream builds the igw PD router with empty worker
-    # lists), so a router process that is up with an empty registry answers
-    # 503. Deriving RUNNING first and registering after would publish an
-    # upstream that cannot serve — the window is structural, not a failure.
+    # 🔴 Reconcile BEFORE deriving the state. A router process that is up is
+    # not the same as a router that can serve: what its registry already holds
+    # is version-dependent and has to be read rather than assumed (see fact 2
+    # in `pd_membership`), and a member this group adds through the API takes
+    # traffic only once the router's own read-back reports it. Deriving RUNNING
+    # first and registering after would publish an upstream that cannot serve.
     #
-    # A no-op for every group whose recipe does not carry the flag, which is
-    # all of them today: `reconcile` returns ok immediately when
+    # A no-op for any group whose recipe does not launch what its membership
+    # API needs: `reconcile` returns ok immediately when
     # `membership_api_usable` is false.
     await _reconcile_router_membership(session, model, instances)
 
     # 🔴 The one failure a restart can fix, and only after it has persisted.
     #
-    # Under `--enable-igw` the command-line peers never enter the registry
-    # (measured 2026-08-28: a router started with `--prefill` reports
-    # `GET /workers` -> `total: 0`), so a restart costs a real outage — the new
-    # process answers 503 until registration completes. That price is worth
+    # The shipped recipes run ONE router per group and it is the gateway's only
+    # upstream, so recreating it interrupts the whole group until the
+    # replacement is up and has finished probing its peers. That price is worth
     # paying only when the router is not answering at all, which is what
     # `unreadable` means; a router that refuses a member is alive and
-    # disagreeing, and would refuse the same thing again from an empty
-    # registry.
+    # disagreeing, and the replacement would be handed the same members to
+    # refuse again.
     #
     # 🔴 And only when the deployment asked to be repaired at all.
     # `restart_on_error` is the deployment's answer to "recover by yourself or

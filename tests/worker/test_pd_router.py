@@ -440,6 +440,7 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
     from types import SimpleNamespace
 
     from gpustack.schemas.models import BackendEnum
+    from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
     from gpustack.worker.backends.base import InferenceServer
 
     asked = {}
@@ -461,6 +462,7 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
         _model=SimpleNamespace(backend=BackendEnum.CUSTOM.value),
         _resolve_image=_resolve_image,
         _engine_inference_backend=lambda _spec: engine_row,
+        _net_device_plane=lambda: PDNetDevicePlaneEnum.DATA,
     )
 
     variables = InferenceServer._pd_template_variables(fake)
@@ -475,6 +477,58 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
         "the row this server was handed is the router's own — which is None"
     )
     assert variables["runner_image"] == "gpustack/runner:cuda12.9-vllm0.17.1"
+
+
+# --- which plane the derived NIC rides -------------------------------------- #
+
+
+def test_the_net_device_plane_comes_from_the_deployments_recipe():
+    """The judgement is the catalog's, and this is the seam that carries it.
+
+    `{{net_device}}` lands on `UCX_NET_DEVICES` in one recipe and on
+    `HCCL_SOCKET_IFNAME` in another, which is why the value is derived
+    differently for the two — and why deciding it here by mode name would be an
+    if-else the next Ascend-family recipe falls off.
+    """
+    from types import SimpleNamespace
+
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
+    from gpustack.worker.backends.base import InferenceServer
+
+    def _plane_for(mode):
+        fake = SimpleNamespace(
+            _model_spec=SimpleNamespace(disaggregation=SimpleNamespace(mode=mode)),
+            _model=None,
+        )
+        return InferenceServer._net_device_plane(fake)
+
+    assert _plane_for(PDModeEnum.VLLM_ASCEND_MOONCAKE) == PDNetDevicePlaneEnum.CONTROL
+    assert _plane_for(PDModeEnum.VLLM_NIXL) == PDNetDevicePlaneEnum.DATA
+    # The enum's own value, not just the member: the spec carries whichever
+    # `disaggregation.mode` was deserialized into.
+    assert (
+        _plane_for(PDModeEnum.VLLM_ASCEND_MOONCAKE.value)
+        == PDNetDevicePlaneEnum.CONTROL
+    )
+
+
+def test_an_unanswerable_plane_degrades_to_the_stricter_one():
+    """A mode the catalog cannot answer for must not relax the multi-NIC
+    refusal: `data` then costs an operator one `kv_ifname`, where the other
+    direction would put KV bytes on the management NIC without saying so."""
+    from types import SimpleNamespace
+
+    from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
+    from gpustack.worker.backends.base import InferenceServer
+
+    for model in (
+        None,
+        SimpleNamespace(disaggregation=None),
+        SimpleNamespace(disaggregation=SimpleNamespace(mode="no-such-recipe")),
+    ):
+        fake = SimpleNamespace(_model_spec=None, _model=model)
+        assert InferenceServer._net_device_plane(fake) == PDNetDevicePlaneEnum.DATA
 
 
 def test_get_model_does_not_materialise_the_router():

@@ -10,30 +10,42 @@ the PD router sees it. Confirmed in upstream source: the non-igw branch builds
 the router through `create_router()`, which reads `prefill_urls`/`decode_urls`
 off the command line.
 
-**2. With `--enable-igw` the command line stops working.** 🔴 This is the fact
-that shapes the module. The igw branch builds the PD router with hard-coded
-empty worker lists — vLLM's `create_vllm_pd_router(&[], &[], ...)` with the
-upstream comment `// Empty worker list - workers added later`, and SGLang's
-`create_pd_router(None, None, ...)`. The CLI peers are *never passed*, so a
-request before registration gets 503 `"No available workers"`.
+**2. What the registry already holds is version-dependent, so it is READ and
+never assumed.** 🔴 This is the fact that shapes the module, and it replaces
+its own opposite. An earlier note here asserted that under `--enable-igw` the
+command-line peers never reach the registry at all — the igw branch does build
+the PD router with hard-coded empty worker lists (vLLM's
+`create_vllm_pd_router(&[], &[], ...)` with the upstream comment
+`// Empty worker list - workers added later`, SGLang's
+`create_pd_router(None, None, ...)`) — so every router start was believed to
+pass through a structural window answering 503 `"No available workers"`.
 
-⇒ Registration is not an optimisation on top of a working group. Under igw it
-is the only way members get in, and every router start passes through a window
-where the process is up and serves nothing. That window is structural, not a
-failure mode — which is why the group must not be reported servable until this
-module says the registry matches.
+🔄 Corrected 2026-09-01 on 910B2, against the `vllm-router` shipped with vLLM
+0.20.2: the CLI peers **do** enter the registry under igw. A 1P1D started with
+`--enable-igw --prefill ... --decode ...` reports both members in
+`GET /workers` with the right `worker_type`, answers `/v1/models` 200, and
+serves a two-hop request. What the earlier reading caught as `total: 0` was
+the startup transient, before the router had finished probing its peers.
+Whether the older behaviour holds on some other build is unverified — hence
+version-dependent, and hence read rather than assumed either way.
 
-⚠️ **The fallback is an operator action, not something this module can take.**
-Going back to command-line peers means removing `--enable-igw` from the mode's
-router command — the controller cannot un-launch a flag on a running process,
-and restarting the router just repeats the same registration against the same
-endpoint. So a persistent failure is *stated* with the way out named, and the
-group stays PARTIAL rather than claiming to serve.
+⇒ So this module assumes nothing about who is already in: it reads the
+registry, adds only what is missing, removes only what is stale, and reads
+back. That diff is correct whether a member arrived from the command line or
+from this API. It is also why a group is not reported servable until the
+read-back agrees — a registry that is merely late looks exactly like one that
+is empty, and only the read tells them apart.
 
-**3. Neither fact generalises to every router, and this module must not assume
-they do.** 🔄 Both were measured on the vLLM fork. Measured 2026-09-16 against
-the gateway they were forked from (`sglang_router` wheels 0.2.2 and 0.3.2,
-`--pd-disaggregation`, no `--enable-igw`):
+⚠️ **A persistent failure is stated, not repaired.** Nothing here can change
+how the router was launched, and restarting it re-runs the same call against
+the same endpoint. So a failure that outlives `PERSISTENT_FAILURE_PASSES` says
+what did not happen and where to look, and the group stays PARTIAL rather than
+claiming to serve.
+
+**3. Fact 1 does not generalise to every router either, and this module must
+not assume it does.** 🔄 It was measured on the vLLM fork. Measured 2026-09-16
+against the gateway that fork descends from (`sglang_router` wheels 0.2.2 and
+0.3.2, `--pd-disaggregation`, no `--enable-igw`):
 
 - the command-line peers **do** enter the registry — `GET /workers` reports
   them with the right `worker_type` and the prefill's `bootstrap_port`;
@@ -104,12 +116,10 @@ class MembershipOutcome:
         # 🔴 Separate from `ok` because only one kind of failure is worth
         # restarting the router over. A refused `POST` means the router is
         # alive and disagrees -- a version or argument mismatch that a restart
-        # repeats rather than fixes, and under `--enable-igw` a restart turns
-        # "some members registered" into "none", because the command-line
-        # peers no longer enter the registry (measured 2026-08-28: a router
-        # started with `--prefill` reports `GET /workers` -> `total: 0`).
-        # A registry that cannot be READ is the other thing: the process
-        # itself is not answering, and restarting is the only move left.
+        # repeats rather than fixes, from a registry that at best comes back
+        # the way it went out. A registry that cannot be READ is the other
+        # thing: the process itself is not answering, and restarting is the
+        # only move left.
         self.unreadable = unreadable
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -736,13 +746,16 @@ PERSISTENT_FAILURE_PASSES = 5
 # How many consecutive passes the registry must be unreadable before the
 # router is restarted.
 #
-# Not one. Under `--enable-igw` a restart is expensive in a way it is not on
-# the command-line path: the new process comes up with an empty registry and
-# answers 503 until registration completes (measured), so a single dropped
-# request would trade a blip for a real outage. Five passes of a reconcile
-# that runs on every model pass is long enough that a router which is merely
-# busy has answered, and short enough that a wedged one is not left serving
-# nothing for minutes.
+# Not one. The shipped recipes run ONE router per group and it is the gateway's
+# only upstream, so restarting it is a full-group interruption for as long as
+# the replacement takes to come up and finish probing its peers -- a window
+# that exists on every build, whichever way that build populates its registry
+# (see fact 2 at the top of this module: that is read, not assumed). A single
+# dropped request must not buy that.
+#
+# Five passes of a reconcile that runs on every model pass is long enough that
+# a router which was merely busy, or still coming up, has answered, and short
+# enough that a wedged one is not left serving nothing for minutes.
 RESTART_AFTER_UNREADABLE_PASSES = 5
 
 # How many times a group's router may be restarted over an unreadable
@@ -753,26 +766,35 @@ RESTART_AFTER_UNREADABLE_PASSES = 5
 # the other thing "unreadable" means. Measured on a `tunnel`-mode worker,
 # where the server cannot dial the router at all: the streak refilled after
 # every restart, so the group churned one router per five passes
-# indefinitely, each restart costing a real outage (the new process answers
-# 503 until registration completes) and none of them able to help.
+# indefinitely, each restart costing a real interruption (one router, the
+# gateway's only upstream) and none of them able to help.
 #
 # Two, not one: the first covers the wedged process this path exists for,
 # the second covers losing that race against a router that was still coming
 # up. A third has nothing left to prove.
 RESTART_ATTEMPT_LIMIT = 2
 
-"""Consecutive failed reconciles before the message names the way out.
+"""Consecutive failed reconciles before the message says where to look.
 
-🔴 The escape hatch is an OPERATOR action, not something this code can take.
-The router's command is rendered from `pd-modes.yaml`, so "drop `--enable-igw`
-and go back to command-line peers" means editing the recipe — the controller
-cannot un-launch a flag on a running process, and restarting the router only
-repeats the same failed registration against the same unreachable endpoint.
+🔴 What changes at this point is not the outcome — it was already False — but
+what the message is allowed to claim. One failure is ordinary and says nothing
+about a cause: a router that has just come up, a member still being probed.
+Five in a row is a router that is not going to admit its members on its own,
+and only then is it honest to send whoever is watching to the router itself.
 
-So the fallback is stated rather than performed. Five passes because a single
-failure is ordinary (a router that has just come up, a member still probing)
-and looping on that wording would train people to ignore it; five in a row is
-a router that is not going to admit its members on its own."""
+🔴 The escalation names evidence, not a mechanism. What the registry holds is
+version-dependent (fact 2 at the top of this module), and the two causes that
+survive five passes — a router that disagrees with the call, and a router this
+server cannot reach — are told apart by the router's own `GET /workers` and
+its log, not by anything this code can infer. An earlier version of this
+message asserted instead that members could only ever join through this API;
+that reading was refuted on 910B2 2026-09-01, and stating a cause we cannot
+observe sent people to fix the wrong thing.
+
+🔴 And it is stated, not performed. The router's command is rendered from
+`pd-modes.yaml`, so any change to how it was launched is an operator action —
+this code cannot un-launch a flag on a running process, and restarting the
+router only repeats the same call against the same endpoint."""
 
 
 def record(model_id: int, outcome: MembershipOutcome) -> None:
@@ -799,11 +821,14 @@ def record(model_id: int, outcome: MembershipOutcome) -> None:
             outcome = MembershipOutcome(
                 ok=False,
                 reason=(
-                    f"{outcome.reason} (unchanged for {count} passes; the "
-                    "router is running with --enable-igw, where members can "
-                    "only join through this API — remove that flag from the "
-                    "mode's router command and restart the group to fall back "
-                    "to command-line peers)"
+                    f"{outcome.reason} (unchanged for {count} passes, so the "
+                    "member management API is failing consistently rather "
+                    "than transiently. Read the router's own member list — "
+                    "`GET /workers` on the router's address — and the "
+                    "router's log: which members it already holds, and what "
+                    "it answered for the ones it would not take, is what "
+                    "tells a router that disagrees with the call apart from "
+                    "a router this server cannot reach)"
                 ),
                 registered=outcome.registered,
             )
@@ -830,14 +855,15 @@ def should_restart_router(model_id: int) -> bool:
     Two conditions, and the second is what keeps this from looping.
 
     `RESTART_AFTER_UNREADABLE_PASSES` in a row, and only for the unreadable
-    case: a router that refuses a member is answering, and restarting it
-    repeats the refusal from an empty registry instead of a partial one.
+    case: a router that refuses a member is answering, and a restart hands it
+    the same members to refuse again — a version or argument mismatch survives
+    the new process.
 
     🔴 And `RESTART_ATTEMPT_LIMIT` restarts not yet spent. A restart repairs a
     wedged process; it cannot repair a network the server cannot cross, and
     "unreadable" covers both. Without this the streak simply refills after
     each restart and the group churns a router every five passes forever —
-    each one a real outage, none of them able to help. Measured on a
+    each one a real interruption, none of them able to help. Measured on a
     `tunnel`-mode worker before the proxy path existed.
     """
     if _unreadable.get(model_id, 0) < RESTART_AFTER_UNREADABLE_PASSES:

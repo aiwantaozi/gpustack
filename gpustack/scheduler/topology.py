@@ -5,7 +5,7 @@ workers*. Everything else here exists to build that tree out of the only source
 of truth a worker has for where it physically sits — its labels.
 
 **One chain, root to leaf, and the operator says what is on it.** The built-in
-rungs are room → row → rack, and anything else an operator's fabric has — an
+rungs are zone → rack, and anything else an operator's fabric has — an
 NVLink/HCCS domain, a blade, a cage — is a custom layer they insert wherever it
 belongs. ``order_layers``, ``build_topology``, ``common_layer``,
 ``nodes_at_layer`` and ``unclassified_at`` each run once, over that one chain.

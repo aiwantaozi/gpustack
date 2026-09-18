@@ -791,6 +791,31 @@ class InferenceServer(ABC):
 
         return env
 
+    def _set_cache_env(self, env: Dict[str, str], variable: str, subdirectory: str):
+        """
+        Point a backend's cache-root variable at a persistent directory under
+        gpustack's data dir so compiled kernel caches survive container restarts.
+
+        The inference container only sees that directory under a mirrored
+        deployment, where gpustack-runtime replicates the worker's data-dir mount
+        onto the container. Without it the backend writes into the container's own
+        filesystem and recompiles on every start.
+        """
+        if variable in env:
+            return
+        if not self._config or not self._config.cache_dir:
+            return
+        cache_dir = os.path.join(self._config.cache_dir, subdirectory)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError as e:
+            logger.warning(
+                f"Failed to create cache dir {cache_dir}: {e}. "
+                f"{variable} will not be set and caches will not be persisted."
+            )
+            return
+        env[variable] = cache_dir
+
     @lru_cache
     def _get_selected_gpu_devices(self) -> GPUDevicesStatus:
         """
@@ -1250,7 +1275,8 @@ class InferenceServer(ABC):
 
     def _cache_injection_files(self) -> dict[str, str]:
         """Connector config files (container path -> contents) the serving
-        script writes before the engine starts (e.g. Mooncake's
+        script writes before the engine starts — for a connector that reads
+        its settings from a path an env var points at (e.g. Mooncake's
         MOONCAKE_CONFIG_PATH JSON).
 
         Two declarations land here — the shared cache service's injection and

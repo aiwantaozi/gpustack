@@ -14,6 +14,11 @@ DB_TRACE_SQL_SUBSTR = os.getenv("GPUSTACK_DB_TRACE_SQL_SUBSTR", "")
 DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 30))
 DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 20))
 DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
+# Bound how long a pooled connection may be reused so a node that a database
+# failover demoted cannot be talked to forever. SQLAlchemy's default is -1,
+# meaning a connection is never recycled; 1800 matches the prevailing default
+# for pooled connection lifetime (HikariCP's maxLifetime). 0 disables it.
+DB_POOL_RECYCLE = int(os.getenv("GPUSTACK_DB_POOL_RECYCLE", 1800))
 # Backstop against leaked/long-held sessions accumulating as Postgres
 # "idle in transaction" connections and exhausting the pool (#5678). Only
 # fires while a transaction is open and idle -- an actively-running query,
@@ -387,6 +392,23 @@ GATEWAY_PORT_CHECK_RETRY_COUNT = int(
 GATEWAY_MIRROR_INGRESS_NAME = os.getenv(
     "GPUSTACK_GATEWAY_MIRROR_INGRESS_NAME", "gpustack"
 )
+
+# TLS protocol version floor and ceiling for the gateway's HTTPS listeners,
+# stamped onto every Ingress gpustack manages (the mirror Ingress and every
+# generated LLM route). Both empty by default, which leaves Higress on its own
+# defaults -- a minimum of TLS 1.0, which is what a security scan flags, but
+# also what existing deployments already run, so raising it stays opt-in.
+#
+# Accepted spellings are Higress' own: TLSv1.0 / TLSv1.1 / TLSv1.2 / TLSv1.3.
+# Anything else is rejected at startup rather than passed through, because
+# Higress fails *open* on a value it cannot parse -- see
+# ``gateway_tls_annotations``.
+GATEWAY_TLS_MIN_PROTOCOL_VERSION = os.getenv(
+    "GPUSTACK_GATEWAY_TLS_MIN_PROTOCOL_VERSION", ""
+).strip()
+GATEWAY_TLS_MAX_PROTOCOL_VERSION = os.getenv(
+    "GPUSTACK_GATEWAY_TLS_MAX_PROTOCOL_VERSION", ""
+).strip()
 
 # Heuristics for partial-stream usage estimation.
 # Used by metrics_collector when a gateway report arrives with completed=false

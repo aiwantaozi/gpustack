@@ -10,12 +10,12 @@ GPUStack manages multiple Kubernetes clusters and provides a unified interface f
 
 !!! note "Upgrading from GPUStack 2.2?"
 
-    GPUStack 2.3 ships GPUStack Operator v0.8.5, which converges the in-place upgrade itself: the worker Deployment is replaced rather than overlapped (`Recreate`), the worker gets a 900s startup budget, and the worker adopts the legacy per-application Helm releases left behind by v0.5.x.
+    GPUStack 2.3 ships the latest GPUStack Operator, which converges the in-place upgrade itself: the worker Deployment is replaced rather than overlapped (`Recreate`), the worker gets a 900s startup budget, and the worker adopts the legacy per-application Helm releases left behind by v0.5.x.
 
     After the upgraded worker is healthy, remove the orphaned v0.5.x scheduling objects with the operator's cleanup script:
 
     ```bash
-    curl -sSLO https://raw.githubusercontent.com/gpustack/gpustack-operator/v0.8.5/docs/migration/cleanup-v0.5-orphans.sh
+    curl -sSLO https://raw.githubusercontent.com/gpustack/gpustack-operator/main/docs/migration/cleanup-v0.5-orphans.sh
     bash cleanup-v0.5-orphans.sh --dry-run   # preview, changes nothing
     bash cleanup-v0.5-orphans.sh             # delete the orphans
     ```
@@ -127,7 +127,7 @@ For an accelerator type, the `Configuration` panel offers up to three allocation
 
 ![Screenshot: selecting a logical slice by VRAM and compute ratio](../assets/gpuservice/instances/type-select-sliced.png)
 
-- **By Profile** — a physical partition of a MIG-enabled device: pick a `Partition Profile` (for example `1g.10gb` on an H100). The operator materializes the MIG instance for you. This tab appears only when a node in the cluster has MIG enabled; enabling MIG is a per-node administrator operation, see [GPU Service Instance Types](gpuservice-instance-types.md#physical-partitioning-with-nvidia-mig).
+- **By Profile** — a physical partition of a MIG-enabled device: pick a `Partition Profile` (for example `1g.10gb` on an H100). The operator materializes the MIG instance for you. This tab appears only when a node in the cluster has MIG enabled; enabling MIG is a per-node administrator operation, see [GPU Service Instance Types](gpuservice-instance-types.md#physical-partitioning-mig).
 
 ![Screenshot: selecting a physical partition by MIG profile](../assets/gpuservice/instances/type-select-partitioned.png)
 
@@ -161,7 +161,7 @@ After creation, you return to the `GPU Service` > `GPU Instances` page, where al
 
 ![Screenshot: GPU Instances list](../assets/gpuservice/instances/list.png)
 
-You can filter instances by name.
+You can filter instances by display name or name — either value the `Name` column may show. Sorting the `Name` column orders by the label it displays.
 
 ### Accessing an Instance
 

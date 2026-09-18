@@ -197,8 +197,7 @@ class Config(WorkerConfig, BaseSettings):
             which a disaggregated model's monitoring link goes to instead of the model one.
         grafana_cache_service_dashboard_uid: Grafana dashboard UID for cache service dashboard.
         gateway_plugin_server_url: URL to fetch gateway plugin manifest for embedded gateway.
-        shuihua_api_base_url: Base URL of the Shuihua API. Has no default; Shuihua clusters
-                            and credentials cannot be created until it is set.
+        shuihua_api_base_url: Base URL of the Shuihua API.
     """
 
     # Server options
@@ -236,6 +235,12 @@ class Config(WorkerConfig, BaseSettings):
     allow_methods: Optional[List[str]] = ['GET', 'POST']
     allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type', 'X-API-Key']
     external_auth_type: Optional[str] = None  # external auth type
+    # Human-readable name of the identity provider behind the active SSO
+    # provider (e.g. "Okta"), shown on the login page's SSO button. When
+    # it is unset or blank, the login page falls back to the protocol
+    # name in ``external_auth_type``. Global rather than per-provider
+    # because ``init_auth`` activates at most one provider.
+    external_auth_provider_name: Optional[str] = None
     external_auth_name: Optional[str] = None  # external auth name
     external_auth_full_name: Optional[str] = None  # external auth full name
     external_auth_avatar_url: Optional[str] = None  # external auth avatar url
@@ -321,12 +326,7 @@ class Config(WorkerConfig, BaseSettings):
     # ``gpustack.gateway.plugins.plugin_spec_overrides``.
     gateway_plugin: Dict[str, GatewayPluginEntry] = {}
 
-    # Base URL of the Shuihua API. Deliberately no default: that provider serves
-    # its integration and production environments from different hosts, so a
-    # built-in guess would point provisioning at the wrong account while looking
-    # like it worked. Creating a Shuihua cluster or credential is rejected until
-    # this is set.
-    shuihua_api_base_url: Optional[str] = None
+    shuihua_api_base_url: str = "https://hub.do.top"
 
     disable_builtin_observability: bool = False
     builtin_prometheus_port: int = 19090

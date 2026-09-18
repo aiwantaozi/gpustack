@@ -295,10 +295,15 @@ class ModelInstanceSnapshot(ModelInstanceRuntimeInfo):
     run_command: Optional[str] = Field(sa_type=Text, default=None)
     env: Optional[Dict[str, str]] = Field(sa_type=JSON, default=None)
 
-    # Extended KV Cache configuration. Currently maps to LMCache config in vLLM and SGLang.
+    # Extended KV Cache configuration. Maps to LMCache in vLLM, and to SGLang's native HiCache (LMCache in shared mode).
     extended_kv_cache: Optional[ExtendedKVCacheConfig] = Field(
         sa_type=pydantic_column_type(ExtendedKVCacheConfig), default=None
     )
+
+    cache_service_name: Optional[str] = None
+    """Name of the attached shared cache service at benchmark time — the
+    config above stores only the id, and the snapshot must keep naming
+    the service after it is deleted."""
 
     speculative_config: Optional[SpeculativeConfig] = Field(
         sa_type=pydantic_column_type(SpeculativeConfig), default=None

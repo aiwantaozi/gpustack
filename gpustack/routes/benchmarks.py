@@ -25,6 +25,7 @@ from gpustack.api.tenant import (
     cluster_scoped_system,
     scoped_cluster_row_visible,
 )
+from gpustack.schemas.cache_services import CacheService
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
@@ -1080,6 +1081,32 @@ async def _snapshot_members(
     return sorted(same_group, key=lambda m: m.id)
 
 
+async def _attached_cache_service_name(
+    session: SessionDep,
+    model: Model,
+    resolved: Dict[int, Optional[str]],
+) -> Optional[str]:
+    """The name of the shared cache service `model` attaches to, if any.
+
+    `model` here is the *effective* model of one member: `extended_kv_cache` is
+    a per-role override, so a group can point prefill and decode at different
+    services, or only one of them at a service at all.
+
+    The config carries only the id; the snapshot keeps the name so a report
+    still says what it ran against after the service is deleted. `resolved`
+    memoizes across the members of one snapshot.
+    """
+    ext = model.extended_kv_cache
+    if not (ext and ext.is_shared() and ext.cache_service_id):
+        return None
+    if ext.cache_service_id not in resolved:
+        cache_service = await CacheService.one_by_id(session, ext.cache_service_id)
+        resolved[ext.cache_service_id] = (
+            cache_service.name if cache_service is not None else None
+        )
+    return resolved[ext.cache_service_id]
+
+
 async def get_benchmark_snapshot(
     session: SessionDep,
     mi: ModelInstance,
@@ -1091,6 +1118,8 @@ async def get_benchmark_snapshot(
     worker_snapshots = {}
     gpu_snapshots = {}
     instance_snapshots = {}
+
+    cache_service_names: Dict[int, Optional[str]] = {}
 
     for member in await _snapshot_members(session, mi, model):
         # Project the role's overrides before snapshotting, rather than handing
@@ -1106,7 +1135,11 @@ async def get_benchmark_snapshot(
         # to project, so a plain deployment snapshots byte-for-byte as before.
         effective = role_effective_model(model, getattr(member, "role", None))
         instance_snapshots[member.name] = create_model_instance_snapshot(
-            member, effective
+            member,
+            effective,
+            cache_service_name=await _attached_cache_service_name(
+                session, effective, cache_service_names
+            ),
         )
 
         if member.worker_id is None:

@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from typing import List, NamedTuple, Optional, Tuple, Union, Set
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -151,6 +152,16 @@ class UserService:
             await delete_cache_by_key(self.get_by_username, old_name)
 
     async def delete(self, user: User):
+        # The keys have to be read before the delete and invalidated by hand:
+        # ``Principal.api_keys`` is ``lazy="noload"``, so ``_handle_cascade_delete``
+        # sees an empty list and ``ApiKey.delete`` — which would otherwise drop
+        # each entry — never runs. The rows themselves do go: both principal FKs
+        # on ``api_keys`` carry ``ON DELETE CASCADE`` in the schema the
+        # migrations build (``c45e397531d1``, ``7c5e3f9a2d18``), whatever the
+        # model's own ``user_id`` declaration says — nothing ever builds this
+        # table from the model. That is exactly why the cache is what's left:
+        # losing this loop leaves every key of a deleted user authenticating
+        # from its cached entry for the rest of the TTL.
         apikeys = await APIKeyService(self.session).get_by_user_id(user.id)
         result = await user.delete(self.session)
         await delete_cache_by_key(self.get_by_id, user.id)
@@ -456,7 +467,27 @@ class APIKeyService:
 
     @locked_cached()
     async def get_by_access_key(self, access_key: str) -> Optional[ApiKey]:
-        result = await ApiKey.one_by_field(self.session, "access_key", access_key)
+        """Look up a live key by its access key, for authentication.
+
+        ``deleted_at IS NULL`` is part of the predicate, not a caller's
+        responsibility. This is the query behind ``/token-auth``'s credential
+        path, which is what every request falls back to when the gateway's own
+        local key table cannot answer -- and that table is built with the same
+        filter (``build_local_auth_tables``). Without it here, a soft-deleted
+        row keeps authenticating on the fallback path forever while the gateway
+        has already stopped honouring it, so revocation never converges.
+
+        No caller soft-deletes a key today: ``ApiKey.delete()`` hard-deletes
+        unless asked otherwise, and an owner's removal never reaches the row
+        through the ORM at all -- ``Principal.api_keys`` is ``lazy="noload"``,
+        so the cascade reads an empty list. The filter is here because a
+        revocation that depends on which delete path ran is not a revocation --
+        the first ``soft=True`` caller must not silently keep the credential
+        alive on the one path that still answers when the gateway cannot.
+        """
+        result = await ApiKey.one_by_fields(
+            self.session, {"access_key": access_key, "deleted_at": None}
+        )
         if result is None:
             return None
         self.session.expunge(result)
@@ -870,6 +901,35 @@ class ModelService:
                 )
             )
 
+        route_service = ModelRouteService(self.session)
+        # A route this model created (enable_model_route, plus the LoRA child
+        # routes) must not outlive the model: while one exists, the
+        # unique-name lookup in create_model resolves it and rejects a new
+        # model of that name. Delete it in the same transaction as the model,
+        # unless targets other than this model's still point at it — a shared
+        # route stays, and ModelRouteTargetController owns it from there.
+        created_routes = await ModelRoute.all_by_fields(
+            self.session,
+            fields={"created_model_id": model.id, "deleted_at": None},
+        )
+        for route in created_routes or []:
+            other_targets = (
+                await self.session.exec(
+                    select(func.count())
+                    .select_from(ModelRouteTarget)
+                    .where(
+                        ModelRouteTarget.route_id == route.id,
+                        ModelRouteTarget.deleted_at.is_(None),
+                        or_(
+                            ModelRouteTarget.model_id.is_(None),
+                            ModelRouteTarget.model_id != model.id,
+                        ),
+                    )
+                )
+            ).one()
+            if other_targets == 0:
+                await route_service.delete(route, auto_commit=False)
+
         result = await model.delete(self.session)
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
@@ -879,7 +939,6 @@ class ModelService:
         for instance_id in instance_ids:
             await delete_cache_by_key(instance_service.get_by_id, instance_id)
 
-        route_service = ModelRouteService(self.session)
         for route_name in route_names:
             await delete_cache_by_key(route_service.resolve_route_targets, route_name)
             await delete_cache_by_key(

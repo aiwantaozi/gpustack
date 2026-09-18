@@ -169,6 +169,7 @@ nav:
           - Model Provider Management: user-guide/model-provider-management.md
           - Inference Backend Management: user-guide/inference-backend-management.md
           - Built-in Inference Backends: user-guide/built-in-inference-backends.md
+          - Cache Service Management: user-guide/cache-service-management.md
           - OTA Content Updates: user-guide/ota-content-updates.md
           - Compatibility Check: user-guide/compatibility-check.md
           - Model File management: user-guide/model-file-management.md
@@ -202,6 +203,7 @@ nav:
           - Inference with Tool Calling: tutorials/inference-with-tool-calling.md
           - Using Custom Inference Backend: tutorials/using-custom-backends.md
           - Adding a GPU Cluster Using DigitalOcean: tutorials/adding-gpucluster-using-digitalocean.md
+          - Adding a GPU Cluster Using Shuihua: tutorials/adding-gpucluster-using-shuihua.md
           - Adding a GPU Cluster Using Kubernetes: tutorials/adding-gpucluster-using-kubernetes.md
           - Managing Model Routes: tutorials/managing-model-routes.md
           - Serving Models with LoRA Adapters: tutorials/serving-with-lora-adapters.md

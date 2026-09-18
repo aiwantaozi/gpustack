@@ -10,7 +10,8 @@
 # 2. gpustack target.
 #    - Install PostgreSQL.
 #    - Install Higress standalone components.
-#    - Install gpustack package from the mounted source code.
+#    - Install gpustack package from the mounted source code, packaging the
+#      served Helm chart with the operator image's Helm.
 #    - Setup entrypoint to gpustack command.
 
 # Argument usage:
@@ -22,7 +23,7 @@
 # - HIGRESS_APISERVER_VERSION: Version of Higress API server to use.
 ARG PYTHON_VERSION=3.11
 ARG GPUSTACK_BASE_IMAGE=base
-ARG GPUSTACK_OPERATOR_VERSION=v0.8.5
+ARG GPUSTACK_OPERATOR_VERSION=v0.8.6
 ARG GPUSTACK_RUNTIME_ROCM_VERSION=7.0.2
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
 ARG HIGRESS_VERSION=2.1.9
@@ -496,7 +497,15 @@ EOF
 
 ARG UI_DOWNLOAD=true
 
+# Helm is a build dependency, not a runtime one: hack/install.sh packages the
+# GPUStack chart into the UI's static tree, which the server then serves to a
+# registered cluster's bootstrap Job. It is borrowed from the operator image for
+# the duration of this step rather than installed, so it never reaches the
+# final image — and so the Helm that packages the chart is the same one that
+# installs it in a cluster, since the bootstrap Job runs that image.
+
 RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=bind,from=gpustack-operator,source=/usr/bin/helm,target=/usr/local/bin/helm \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
     # Install GPUStack
 
@@ -586,7 +595,7 @@ RUN --mount=type=bind,from=rocm-base,source=/opt/rocm/share,target=/opt/rocm/sha
     fi
 EOF
 ENV AMD_VISIBLE_DEVICES="all" \
-    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/rocm"
+    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/rocm;/opt/rocm/lib"
 
 ## Active all Ascend devices detection,
 ## works with (default) Ascend container runtime and privileged mode.
@@ -639,7 +648,7 @@ ENV CAMBRICON_VISIBLE_DEVICES="all" \
 ##   + Disallowing privileged, try with:
 ##     docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock --security-opt seccomp=unconfined -v /dev:/dev:ro --group-add video -v /opt/hyhal:/opt/hyhal:ro -v /opt/dtk:/opt/dtk:ro -e ROCM_SMI_LIB_PATH=/opt/hyhal/lib -e ROCM_PATH=/opt/dtk ...
 ENV HYGON_VISIBLE_DEVICES="all" \
-    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/dtk;${GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES}"
+    GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/dtk;/etc/dmi_mig_config;${GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES}"
 
 ## Active all Iluvatar devices detection,
 ## works with (default) Iluvatar container runtime and privileged mode.

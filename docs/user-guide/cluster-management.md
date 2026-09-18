@@ -6,7 +6,7 @@ GPUStack supports cluster-based worker management and provides multiple cluster 
 
 1. Go to the `Clusters` page.
 2. Click the `Add Cluster` button.
-3. Select a cluster provider. There are `Docker` and `Kubernetes` for the `Self-Host` provider and `DigitalOcean` for the `Cloud Provider`.
+3. Select a cluster provider. There are `Docker` and `Kubernetes` for the `Self-Host` provider, and `DigitalOcean` and `SHUIHUA FUTURE` for the `Cloud Provider`.
 4. Depending on the provider, different options need to be set in the `Base Configuration` and `Add Worker` steps.
 5. The `Advanced` cluster settings in the Base Configuration allow you to pre-configure the worker options using the `Worker Configuration YAML`.
 
@@ -61,11 +61,46 @@ The `Advanced` settings expose the following Kubernetes deployment options:
     - `Persistent Volume Claim (PVC)` — an existing `PVC Name`, optionally read-only.
     - `ConfigMap` — a `ConfigMap Name`, optionally marked optional.
 - `Image Credentials` — image pull secrets used to pull GPUStack images from a private registry. For each entry, specify a `Registry`, `Username`, and `Password`.
-- `Node Selector` — a pod `nodeSelector` applied to every worker DaemonSet; only nodes whose labels match are eligible to run the worker.
+- `Node Selector` — confines this cluster's GPUStack workloads to nodes whose labels match. It is passed as the chart's `global.nodeSelector`, which each component falls back to, so it reaches the worker DaemonSets and the operator, and the components the operator deploys (Kueue, Node Feature Discovery's control plane, the CSI controllers) from the operator release that honours it. Two kinds of workload are left out on purpose: the ones that have to cover the nodes they serve (Node Feature Discovery's labeller, the CSI node plugins), because confining those would leave every other node unlabelled — including with the labels the workers themselves select on — and the chart's install hooks, which run before the release exists and so cannot wait on a label the release itself applies. A worker DaemonSet keeps its GPU vendor label as well as these; a node has to match both.
 - `Default Container Registry` — the default registry used to resolve GPUStack images for this cluster. Falls back to the server default when unset (placeholder `docker.io`).
 - `Operator Image` — override for the GPUStack Operator container image. Leave empty to use the server default.
 - `GPU Service Static Access Address` — only shown when `Cluster Type` is `GPU Service`. The static address the operator uses to access GPU instances in this cluster (e.g. a LoadBalancer VIP). Optional.
 - `Worker Configuration YAML` — see [Worker Configuration YAML](#worker-configuration-yaml) below.
+
+#### Chart Values
+
+Registering a `Kubernetes` cluster installs the GPUStack Helm chart into it, and the options above are turned into values for that chart. `helmValues` reaches the same chart directly, for what those options do not cover: the keys are the chart's own, taken verbatim, so anything the chart or its sub-charts offer is configurable without waiting for an option of its own here.
+
+It has no field in the UI yet, so set it through the API. `PUT` replaces the whole cluster, so read the cluster first and send it back with `helmValues` added under `k8sOptions`:
+
+```bash
+# Read the cluster.
+curl -sS -H "Authorization: Bearer <api-key>" \
+  http://<server>/v2/clusters/<id> > cluster.json
+
+# Add the values. This one keeps the chart from installing the S3 CSI driver,
+# for a cluster that already provides its own storage.
+jq '.k8sOptions.helmValues = {
+      "gpustack-operator": {"csi-driver-s3": {"enabled": false}}
+    }' cluster.json > updated.json
+
+# Send it back.
+curl -sS -X PUT -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" --data @updated.json \
+  http://<server>/v2/clusters/<id>
+```
+
+The values are merged over the ones derived from the cluster, per key and depth-first; a list replaces rather than extends, as it does in Helm itself. Keys are documented by the charts: the GPUStack chart's `values.yaml`, and for anything under `gpustack-operator`, the [GPUStack Operator chart](https://github.com/gpustack/gpustack-operator).
+
+Some paths are refused rather than merged: the ones the server derives from this cluster's registration, which decide that the release matches the cluster it was issued for — where its workers report, which image they run, which registry that image comes from, which Secret carries the token. The API names the path it refused, and the `helmValues` field description carries the current list; this page does not repeat it, so the two cannot drift.
+
+!!! note
+
+    Saving the cluster changes nothing in Kubernetes on its own. Re-run `Register Cluster` and apply the manifest it gives you: the in-cluster Job compares what the manifest asks for against what the release was installed from, and upgrades only when they differ.
+
+!!! warning
+
+    Kueue and Node Feature Discovery are not optional. The operator derives its scheduling chain from them and waits for their CRDs at startup, so switching one off that the cluster does not already provide leaves the operator unable to start. Switching off one this release installed removes it — Kueue's CRDs come from its chart, and every `Workload` and `ClusterQueue` goes with them.
 
 ### Creating DigitalOcean Cluster
 
@@ -81,12 +116,24 @@ Additional worker pools can be added after the cluster is created.
 3. Click the ellipsis button in the operations column, then select `Add Worker Pool`
 4. Adding new worker pool with options from Step 3 above.
 
+### Creating SHUIHUA FUTURE Cluster
+
+1. In the `Basic Configuration` step, the `Name` field is required and `Description` is optional. Create or select a Cloud Credential for communicating with the Shuihua API. Shuihua has no regions, so there is none to select. You must also configure the `GPUStack Server URL`, which will be accessible from the newly created instances.
+2. `Default Container Registry` is required for this provider: Shuihua instances cannot reach Docker Hub, so a registry that resolves to one is rejected. The field suggests `quay.io` and `swr.cn-south-1.myhuaweicloud.com`, and accepts any other registry you can reach, such as your own Harbor or mirror.
+3. Click `Next`.
+4. Adding one or more `Worker Pools`. For each pool, `Name`, `Instance Type`, `OS Image`, `Replicas`, `Batch Size` and `Labels` can be specified. An `Instance Type` is a Shuihua spec template, listed with its GPU model, hourly price and remaining stock; a sold-out template cannot be selected. Volumes are not offered — Shuihua has no block storage API.
+5. Click `Save` after the worker pools are configured.
+
+Additional worker pools can be added after the cluster is created, the same way as for a DigitalOcean cluster.
+
+Shuihua instances sit behind NAT with only ports 22 and 80 mapped, so the cluster uses the `tunnel` proxy mode by default and its workers serve inference through the server's WebSocket tunnel. Their listed IP is the instance's private address; use `View SSH Access` on the worker to get the endpoint that is actually reachable. See [Adding a GPU Cluster Using Shuihua](../tutorials/adding-gpucluster-using-shuihua.md) for the full walkthrough.
+
 ### Operating Worker Pools
 
-You can manage worker pools for DigitalOcean clusters on the `Clusters` page:
+You can manage worker pools for cloud provider clusters on the `Clusters` page:
 
 1. Go to the `Clusters` page.
-2. Find the DigitalOcean cluster you want to manage and expand it to view its worker pools.
+2. Find the cloud provider cluster you want to manage and expand it to view its worker pools.
 3. To edit the replica count for a worker, modify it directly in the worker column.
 4. To edit a worker pool, click the `Edit` button and update the `Name`, `Replica`, `Batch Size`, and `Labels` as needed.
 5. To delete a worker pool, click the ellipsis button in the operations column for the worker pool, then select `Delete`.

@@ -7,7 +7,7 @@ from gpustack.client.worker_manager_clients import (
     WorkerRegistrationClient,
 )
 from gpustack.security import API_KEY_PREFIX
-from gpustack.utils.uuid import get_legacy_uuid, get_system_uuid
+from gpustack.utils.uuid import get_legacy_uuid
 from gpustack.utils.network import check_registry_reachable
 
 registration_token_filename = "token"
@@ -68,12 +68,13 @@ def registration_client(
             time.sleep(0.5)
     if registration_token:
         if not registration_token.startswith(API_KEY_PREFIX):
-            legacy_uuid = get_legacy_uuid(data_dir) or get_system_uuid()
-            if not legacy_uuid:
-                raise ValueError(
-                    "Legacy UUID not found, please re-register the worker."
+            # The server stores deployment registration tokens with an empty
+            # access key, so raw and legacy UUID-wrapped tokens resolve alike.
+            legacy_uuid = get_legacy_uuid(data_dir)
+            if legacy_uuid:
+                registration_token = (
+                    f"{API_KEY_PREFIX}_{legacy_uuid}_{registration_token}"
                 )
-            registration_token = f"{API_KEY_PREFIX}_{legacy_uuid}_{registration_token}"
         clientset = ClientSet(
             base_url=server_url,
             api_key=registration_token,

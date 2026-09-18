@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import shlex
 import socket
 import threading
@@ -33,11 +34,14 @@ from gpustack.config import registration
 from gpustack.config.config import Config
 from gpustack.schemas.cache_providers import (
     CUSTOM_VERSION,
+    DEFAULT_PORT_NAME,
     CacheProvider,
+    CacheProviderComponent,
     CacheProviderHealthCheck,
     CacheProviderVersionConfig,
+    render_argument,
     render_l2_adapter,
-    render_template,
+    resolved_field_values,
 )
 from gpustack.schemas.cache_services import (
     CacheServiceInstance,
@@ -46,7 +50,7 @@ from gpustack.schemas.cache_services import (
     CacheServiceStateEnum,
 )
 from gpustack.server.bus import Event, EventType
-from gpustack.server.cache_provider_catalog import get_cache_provider
+from gpustack.worker.cache_provider_manager import CacheProviderManager
 from gpustack.utils import network
 from gpustack.utils.attrs import set_attr
 from gpustack.utils.command import (
@@ -126,11 +130,11 @@ class CacheServiceManager:
     Guarded by _start_lock.
     """
 
-    _assigned_ports: Dict[int, Tuple[int, int]]
+    _assigned_ports: Dict[int, Tuple[int, ...]]
     """
-    (port, metrics_port) pairs allocated in this process, keyed by cache
-    service instance ID. Guarded by _port_lock so concurrent starts can't
-    hand out the same port.
+    Ports allocated in this process, keyed by cache service instance ID.
+    Guarded by _port_lock so concurrent starts can't hand out the same
+    port.
     """
 
     _clientset_getter: Callable[[], ClientSet]
@@ -139,12 +143,20 @@ class CacheServiceManager:
     def __init__(
         self,
         worker_id_getter: Callable[[], int],
+        worker_ip_getter: Callable[[], str],
         clientset_getter: Callable[[], ClientSet],
         cfg: Config,
+        provider_catalog: CacheProviderManager,
     ):
         self._worker_id_getter = worker_id_getter
+        # The detected address, which only the worker holds: the config
+        # field carries a user override and is empty otherwise.
+        self._worker_ip_getter = worker_ip_getter
         self._clientset_getter = clientset_getter
         self._config = cfg
+        # The catalog comes from the server: an admin may have replaced the
+        # packaged declarations with a document of their own.
+        self._provider_catalog = provider_catalog
 
         self._assigned_ports = {}
         self._starting = set()
@@ -251,18 +263,43 @@ class CacheServiceManager:
                 )
                 return
 
-            provider = get_cache_provider(cache_service.provider_name)
+            provider, catalog_read = self._provider_catalog.lookup(
+                cache_service.provider_name
+            )
             if provider is None:
+                # Told apart deliberately: a catalog this worker could not read
+                # is a connectivity problem to fix, while one that was read and
+                # does not carry the provider is a configuration one. Reporting
+                # the second for the first sends whoever reads the instance
+                # after a declaration that is probably there.
+                reason = (
+                    f"Unknown cache provider: {cache_service.provider_name}"
+                    if catalog_read
+                    else "Cannot read the cache provider catalog from the server."
+                )
                 self._update_cache_service_instance(
                     instance.id,
                     state=CacheServiceStateEnum.ERROR,
-                    state_message=f"Unknown cache provider: {cache_service.provider_name}",
+                    state_message=reason,
                 )
                 return
 
-            version_config, resolved_version, source_image = (
-                self._resolve_version_config(cache_service, provider)
-            )
+            try:
+                version_config, resolved_version, source_image = (
+                    self._resolve_version_config(cache_service, provider)
+                )
+            except ValueError:
+                # The copy on hand may predate the declaration this service was
+                # created against — the catalog is something an admin changes,
+                # and a placeholder the packaged one carries answers to the
+                # same name. Re-read before reporting what it cannot serve.
+                reread = self._provider_catalog.reread(cache_service.provider_name)
+                if reread is None or reread == provider:
+                    raise
+                provider = reread
+                version_config, resolved_version, source_image = (
+                    self._resolve_version_config(cache_service, provider)
+                )
 
             # Starting is idempotent: a stale workload left over from a
             # previous run of this instance (crash, manual restart) is removed
@@ -281,55 +318,60 @@ class CacheServiceManager:
                 )
             self._release_ports(instance.id)
 
-            port, metrics_port = self._allocate_ports(instance)
+            component_spec = provider.get_component(instance.component or "")
+            config_fields = (
+                cache_service.config.fields if cache_service.config else None
+            )
+            component = instance.component or ""
+            ports = self._allocate_ports(
+                instance, provider.enabled_port_names(component, config_fields)
+            )
+            # {{port}} and {{metrics_port}} address the allocation by
+            # role, which is the spelling a template outside the component
+            # (a version's launch slot, an engine's injection) has to use.
+            port = ports.get(provider.address_port_name(component))
+            metrics_name = provider.metrics_port_name(component)
+            metrics_port = ports.get(metrics_name) if metrics_name else None
             params = self._build_template_params(
                 cache_service, provider, port, metrics_port
             )
-
-            # A declared run command is the whole argument vector and takes
-            # the image's ENTRYPOINT slot; run_args instead keeps the
-            # image's own entrypoint and rides as the CMD arguments
-            # appended to it (container semantics: args alone append, a
-            # command replaces). The user parameters and L2 flags below
-            # join whichever vector the version declared.
-            overrides_entrypoint = bool(version_config.run_command)
-            launch_template = version_config.run_command or version_config.run_args
-            argv: Optional[List[str]] = None
-            if launch_template:
-                # Render per token so an optional placeholder resolving to
-                # None yields an empty token that is dropped together with
-                # the flag it belongs to.
-                rendered_tokens = [
-                    render_template(token, params)
-                    for token in shlex.split(launch_template)
-                ]
-                argv = drop_empty_flag_values(rendered_tokens)
-            user_parameters = (
-                cache_service.config.parameters if cache_service.config else None
-            )
-            if user_parameters:
-                argv = (
-                    merge_flag_arguments(argv, user_parameters)
-                    if argv
-                    else list(user_parameters)
+            # The same ports by the names the component gave them. One the
+            # configuration did not ask for resolves empty, so a flag
+            # carrying it drops with its value. The .url form is what a
+            # peer on another node would dial.
+            worker_ip = self._worker_ip_getter()
+            for name in provider.declared_port_names(component):
+                value = ports.get(name)
+                params[f"ports.{name}"] = value
+                params[f"ports.{name}.url"] = (
+                    f"{worker_ip}:{value}" if value and worker_ip else None
                 )
+            # The worker's own IP: a store advertises it to peers (the
+            # P2P handshake publishes it as local_hostname), where the
+            # bind-address 0.0.0.0 would be useless.
+            params["worker_ip"] = self._worker_ip_getter()
+            # Dependency addresses the controller stamped at creation
+            # (e.g. a master's host:port for a store). Every
+            # declared component gets a key either way: an unstamped one
+            # resolves empty rather than leaving its placeholder in the
+            # command, so the flag holding it drops instead.
+            stamped = instance.component_addresses or {}
+            for name in provider.components:
+                params[f"component.{name}.address"] = stamped.get(name)
+
+            argv, overrides_entrypoint = self._build_launch_argv(
+                cache_service, version_config, component_spec, component, params
+            )
 
             # L2 storage config renders after the user-parameters merge so
             # the structured config always wins over a hand-written flag.
-            argv, l2_env = self._apply_l2_storage(cache_service, provider, argv)
+            argv, l2_env = self._apply_l2_storage(
+                cache_service, provider, component_spec, argv
+            )
 
-            # Provider env templates render first; entries rendering empty are
-            # dropped so unset optional parameters don't produce invalid
-            # config. Service-level env overrides provider defaults, and the
-            # L2 storage credentials override both.
-            env: Dict[str, str] = {}
-            for key, value in (version_config.env or {}).items():
-                rendered = render_template(value, params)
-                if rendered:
-                    env[key] = rendered
-            if cache_service.config and cache_service.config.env:
-                env.update(cache_service.config.env)
-            env.update(l2_env)
+            env = self._build_env(
+                cache_service, version_config, component_spec, params, l2_env
+            )
 
             fallback_registry = registration.determine_default_registry(
                 self._config.system_default_container_registry
@@ -343,6 +385,7 @@ class CacheServiceManager:
                     f"{cache_service.provider_name} version {resolved_version}"
                 )
 
+            self._prepare_data_dirs(component_spec, params)
             run_container = Container(
                 image=image,
                 name="default",
@@ -355,20 +398,17 @@ class CacheServiceManager:
                 envs=[
                     ContainerEnv(name=name, value=value) for name, value in env.items()
                 ],
-                resources=self._gpu_resources(),
+                resources=(
+                    self._gpu_resources()
+                    if component_spec is None or component_spec.gpu_access
+                    else None
+                ),
             )
             workload_plan = WorkloadPlan(
                 name=deployment_metadata.name,
                 namespace=deployment_metadata.namespace,
                 host_network=True,
-                # Shares the host IPC namespace with the engine containers
-                # so the cache server can import their KV buffers by CUDA
-                # IPC handle (the lmcache_driven zero-copy path). Same
-                # escape hatch as the engine side: service env, then the
-                # worker-global GPUSTACK_HOST_IPC, overrides the default —
-                # e.g. Kubernetes PodSecurity baseline rejects hostIPC
-                # pods, and the CPU host-copy path works without it.
-                host_ipc=self._host_ipc_enabled(cache_service),
+                host_ipc=self._host_ipc_enabled(cache_service, component_spec),
                 containers=[run_container],
                 labels=deployment_metadata.labels,
             )
@@ -383,8 +423,8 @@ class CacheServiceManager:
             if self._update_cache_service_instance(
                 instance.id,
                 state=CacheServiceStateEnum.STARTING,
+                ports=ports or None,
                 port=port,
-                metrics_port=metrics_port,
                 state_message="",
             ):
                 logger.info(
@@ -439,10 +479,10 @@ class CacheServiceManager:
         """
         Resolve the (version config, version identifier, container image)
         the instance runs with. The reserved "custom" version keeps the
-        default version's run command and env templates but takes the
-        image from the service config, so the image must be
-        command-compatible with the default declaration. Raises ValueError
-        when the catalog or the service config cannot serve the request.
+        provider's run command and env templates but takes the image from
+        the service config, so the image must be command-compatible with
+        that declaration. Raises ValueError when the catalog or the service
+        config cannot serve the request.
         """
         if cache_service.provider_version == CUSTOM_VERSION:
             if not provider.custom_version:
@@ -450,7 +490,7 @@ class CacheServiceManager:
                     f"Cache provider {cache_service.provider_name} does not "
                     f"allow the custom version"
                 )
-            version_config, _ = provider.get_version_config(None)
+            version_config = provider.custom_version_config()
             if version_config is None:
                 raise ValueError(
                     f"Cache provider {cache_service.provider_name} has no "
@@ -523,23 +563,133 @@ class CacheServiceManager:
         return backend, version
 
     @staticmethod
-    def _host_ipc_enabled(cache_service: CacheServicePublic) -> bool:
-        """Host IPC defaults on for cache servers (the CUDA-IPC transfer
-        path needs it) but stays overridable: the service's env, then the
-        worker-global GPUSTACK_HOST_IPC, wins over the default."""
+    def _host_ipc_enabled(cache_service: CacheServicePublic, component_spec) -> bool:
+        """Whether the instance shares the host IPC namespace with the
+        engine containers, which is what lets a cache server import their
+        KV buffers by CUDA IPC handle (the zero-copy transfer path).
+
+        It follows the component's GPU access: importing an IPC handle
+        needs a CUDA context on the same device, so a component that
+        mounts no GPU can make no use of the namespace, and asking for it
+        anyway costs a privilege some clusters refuse outright
+        (Kubernetes PodSecurity baseline rejects hostIPC pods). The
+        escape hatch stays either way — the service's env, then the
+        worker-global GPUSTACK_HOST_IPC, overrides the default, since the
+        CPU host-copy path works without it."""
         service_env = (cache_service.config.env if cache_service.config else None) or {}
         if envs.HOST_IPC_ENV in service_env:
             return to_bool(service_env[envs.HOST_IPC_ENV])
         if envs.HOST_IPC is not None:
             return to_bool(envs.HOST_IPC)
-        return True
+        return component_spec.gpu_access if component_spec is not None else True
+
+    @staticmethod
+    def _build_launch_argv(
+        cache_service: CacheServicePublic,
+        version_config,
+        component_spec,
+        component: str,
+        params: Dict[str, Any],
+    ) -> Tuple[Optional[List[str]], bool]:
+        """The instance's rendered argument vector and whether it takes
+        the image's ENTRYPOINT slot. A declared run command is the whole
+        vector and replaces the entrypoint; run_args instead rides as the
+        CMD arguments appended to the image's own. A declared component
+        owns its launch (one version template cannot serve two roles);
+        the version launch serves single-component providers. The user
+        parameters filed under this component join its vector — flags
+        belong to the binary a role runs, and another's parser would
+        reject them (service-level env, by contrast, reaches every
+        component: env is namespaced by the consumer)."""
+        if component_spec is not None:
+            overrides_entrypoint = bool(component_spec.run_command)
+            launch_template = component_spec.run_command or component_spec.run_args
+        else:
+            overrides_entrypoint = bool(version_config.run_command)
+            launch_template = version_config.run_command or version_config.run_args
+        argv: Optional[List[str]] = None
+        if launch_template:
+            # Render per token so an optional placeholder resolving to
+            # None yields an empty token that is dropped together with
+            # the flag it belongs to.
+            rendered_tokens = [
+                render_argument(token, params) for token in shlex.split(launch_template)
+            ]
+            argv = drop_empty_flag_values(rendered_tokens)
+        parameters = (
+            cache_service.config.parameters if cache_service.config else None
+        ) or {}
+        user_parameters = parameters.get(component)
+        if user_parameters:
+            argv = (
+                merge_flag_arguments(argv, user_parameters)
+                if argv
+                else list(user_parameters)
+            )
+        return argv, overrides_entrypoint
+
+    @staticmethod
+    def _prepare_data_dirs(component_spec, params: Dict[str, Any]) -> None:
+        """Create the directories the component declares it keeps data in,
+        before its container starts.
+
+        A server told to keep data somewhere expects the directory to
+        exist and dies otherwise. The worker creates it on its own
+        filesystem, which is the cache container's too: a worker is
+        itself containerized and the runtime mirrors its mounts into the
+        workloads it creates — so a path the worker can write is a path
+        the cache server will find, and one the worker cannot reach would
+        not have been a host path for the cache server either.
+
+        A path whose placeholders have no value is skipped: the
+        configuration that would use it is off.
+        """
+        if component_spec is None:
+            return
+        seen: List[str] = []
+        for template in component_spec.data_dirs:
+            path = render_argument(template, params)
+            if not path or path in seen:
+                continue
+            seen.append(path)
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                raise ValueError(f"Failed to create data directory '{path}': {e}")
+
+    @staticmethod
+    def _build_env(
+        cache_service: CacheServicePublic,
+        version_config,
+        component_spec,
+        params: Dict[str, Any],
+        l2_env: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Provider env templates render first (the component's over the
+        version's); entries rendering empty are dropped so unset optional
+        parameters don't produce invalid config. Service-level env
+        overrides provider defaults, and the L2 storage credentials
+        override both."""
+        env: Dict[str, str] = {}
+        component_env = component_spec.env if component_spec else {}
+        for key, value in {
+            **(version_config.env or {}),
+            **component_env,
+        }.items():
+            rendered = render_argument(value, params)
+            if rendered:
+                env[key] = rendered
+        if cache_service.config and cache_service.config.env:
+            env.update(cache_service.config.env)
+        env.update(l2_env)
+        return env
 
     @staticmethod
     def _build_template_params(
         cache_service: CacheServicePublic,
         provider: CacheProvider,
-        port: int,
-        metrics_port: int,
+        port: Optional[int],
+        metrics_port: Optional[int],
     ) -> Dict[str, Any]:
         """
         Build the placeholder namespace the version templates render
@@ -551,27 +701,22 @@ class CacheServiceManager:
             "host": "0.0.0.0",
             "port": port,
             "metrics_port": metrics_port,
-            "ram_size": (
-                cache_service.config.ram_size if cache_service.config else None
-            ),
-            "chunk_size": (
-                cache_service.config.chunk_size if cache_service.config else None
-            ),
+            "service_id": cache_service.id,
         }
         field_values = (
             cache_service.config.fields if cache_service.config else None
         ) or {}
-        for field in provider.managed_fields:
-            value = field_values.get(field.name, field.default)
+        for name, value in resolved_field_values(provider.fields, field_values).items():
             if isinstance(value, bool):
                 value = str(value).lower()
-            params.setdefault(field.name, value)
+            params.setdefault(name, value)
         return params
 
     def _apply_l2_storage(
         self,
         cache_service: CacheServicePublic,
         provider: CacheProvider,
+        component_spec: Optional[CacheProviderComponent],
         argv: Optional[List[str]],
     ) -> Tuple[Optional[List[str]], Dict[str, str]]:
         """
@@ -581,6 +726,10 @@ class CacheServiceManager:
         server prefers the earliest tier for reads and writes to all of them.
         A version running the image's own entrypoint has no vector of its
         own; the flags become its arguments.
+        The tiers are a property of the cache rather than of a role, so
+        they need no component of their own to be filed under: they go to
+        the component engines attach to, the one holding the cache, whose
+        binary is the only one that takes the flag.
         Secret-bearing fields go to the returned env; because env vars are
         process-global, two entries delivering a value through the same env
         var cannot coexist. Hand-written occurrences of the flag in the
@@ -589,6 +738,8 @@ class CacheServiceManager:
         entries, so the UI-visible order keeps the higher read priority.
         Raises ValueError when the provider can't serve the config.
         """
+        if component_spec is not None and not component_spec.attach_endpoint:
+            return argv, {}
         l2_storages = cache_service.config.l2_storages if cache_service.config else None
         if not l2_storages:
             return argv, {}
@@ -598,7 +749,10 @@ class CacheServiceManager:
         env_sources: Dict[str, str] = {}
         for l2_storage in l2_storages:
             entry_args, entry_env = render_l2_adapter(
-                provider, l2_storage.backend, l2_storage.params or {}
+                provider,
+                l2_storage.backend,
+                l2_storage.params or {},
+                l2_storage.adapter_flag_enabled,
             )
             for env_name, value in entry_env.items():
                 if env_name in env_sources:
@@ -623,19 +777,22 @@ class CacheServiceManager:
             )
         return remaining + l2_args + hand_written, l2_env
 
-    def _allocate_ports(self, instance: CacheServiceInstance) -> Tuple[int, int]:
+    def _allocate_ports(
+        self, instance: CacheServiceInstance, names: List[str]
+    ) -> Dict[str, int]:
         """
-        Allocate the instance's (port, metrics_port) pair on this worker.
+        Allocate one port on this worker per name the instance's component
+        declares.
 
         Ports already handed out by this process and ports recorded on other
         cache service instances of this worker are both treated as
         unavailable, so a restarted worker can't re-issue a port an existing
-        instance holds. The metrics port additionally excludes the service
-        port picked just before it.
+        instance holds. Each port picked excludes the ones picked before it.
         """
+        names = list(names)
         with CacheServiceManager._port_lock:
             unavailable_ports = {
-                port for pair in self._assigned_ports.values() for port in pair
+                port for ports in self._assigned_ports.values() for port in ports
             }
             try:
                 instances_page = self._clientset.cache_service_instances.list(
@@ -646,46 +803,45 @@ class CacheServiceManager:
                 for existing in instances_page.items or []:
                     if existing.id == instance.id:
                         continue
-                    if existing.port:
-                        unavailable_ports.add(existing.port)
-                    if existing.metrics_port:
-                        unavailable_ports.add(existing.metrics_port)
+                    for existing_port in (existing.ports or {}).values():
+                        if existing_port:
+                            unavailable_ports.add(existing_port)
             except Exception as e:
                 logger.warning(
                     f"Failed to list cache service instances for port "
                     f"allocation: {e}"
                 )
 
-            # Prefer the ports already recorded on the instance: engines
-            # attached to this cache server carry them in denormalized
-            # snapshots that nothing refreshes, so a restart that changed
-            # ports would strand every running deployment on a dead
-            # endpoint until its model instances are recreated.
-            if (
-                instance.port
-                and instance.metrics_port
-                and instance.port not in unavailable_ports
-                and instance.metrics_port not in unavailable_ports
-                and network.is_port_available(instance.port)
-                and network.is_port_available(instance.metrics_port)
-            ):
-                self._assigned_ports[instance.id] = (
-                    instance.port,
-                    instance.metrics_port,
+            def take() -> int:
+                port = network.get_free_port(
+                    port_range=self._config.service_port_range,
+                    unavailable_ports=unavailable_ports,
                 )
-                return instance.port, instance.metrics_port
+                unavailable_ports.add(port)
+                return port
 
-            port = network.get_free_port(
-                port_range=self._config.service_port_range,
-                unavailable_ports=unavailable_ports,
-            )
-            unavailable_ports.add(port)
-            metrics_port = network.get_free_port(
-                port_range=self._config.service_port_range,
-                unavailable_ports=unavailable_ports,
-            )
-            self._assigned_ports[instance.id] = (port, metrics_port)
-            return port, metrics_port
+            # Each port the instance already holds is kept where it still
+            # can be: engines attached to this cache server carry them in
+            # denormalized snapshots that nothing refreshes, and peers
+            # dial what it published, so a port that moves strands both
+            # until they are recreated. A name that gains a port — a
+            # configuration turning one on — takes a fresh one and leaves
+            # the rest alone.
+            recorded = instance.ports or {}
+            ports: Dict[str, int] = {}
+            for name in names:
+                port = recorded.get(name)
+                if (
+                    port
+                    and port not in unavailable_ports
+                    and network.is_port_available(port)
+                ):
+                    unavailable_ports.add(port)
+                    ports[name] = port
+                else:
+                    ports[name] = take()
+            self._assigned_ports[instance.id] = tuple(ports.values())
+            return ports
 
     def _release_ports(self, instance_id: int):
         with CacheServiceManager._port_lock:
@@ -825,6 +981,14 @@ class CacheServiceManager:
             return
 
         ready = self._probe_ready(instance, cache_service.provider_name)
+        if ready is None:
+            # Nothing was learned about this instance, so nothing is written:
+            # the next pass probes again with a catalog it could read.
+            logger.debug(
+                f"Skipped the health probe of cache service instance "
+                f"{instance.name}: the cache provider catalog could not be read"
+            )
+            return
         now = datetime.now(timezone.utc)
         if ready:
             updates = {}
@@ -942,18 +1106,38 @@ class CacheServiceManager:
             healthy=False,
         )
 
-    def _probe_ready(self, instance: CacheServiceInstance, provider_name: str) -> bool:
+    def _probe_ready(
+        self, instance: CacheServiceInstance, provider_name: str
+    ) -> Optional[bool]:
         """
         Probe the cache server per the provider's health check declaration.
         Managed cache servers run with host networking on this worker, so
         loopback reaches them directly.
+
+        ``None`` means the probe could not be made rather than that it failed:
+        the declaration says which port to reach and how, and without a catalog
+        to read it from, a component binding anything but the default port
+        would be called unreachable for want of a declaration this worker could
+        not fetch.
         """
-        provider = get_cache_provider(provider_name)
-        health_check = provider.health_check if provider else CacheProviderHealthCheck()
-        host = "127.0.0.1"
-        port = (
-            instance.metrics_port if health_check.target == "metrics" else instance.port
+        provider, catalog_read = self._provider_catalog.lookup(provider_name)
+        if provider is None and not catalog_read:
+            return None
+        # A declared component may probe differently from the provider
+        # default (e.g. a master's HTTP metrics endpoint vs a store's
+        # plain TCP port).
+        health_check = (
+            provider.health_check_for(instance.component)
+            if provider
+            else CacheProviderHealthCheck()
         )
+        host = "127.0.0.1"
+        target = (
+            provider.probe_port_name(instance.component)
+            if provider
+            else DEFAULT_PORT_NAME
+        )
+        port = (instance.ports or {}).get(target)
         if not port:
             return False
 

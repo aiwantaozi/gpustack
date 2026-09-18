@@ -46,9 +46,11 @@ from gpustack.utils.command import resolve_executor_backend
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.custom import CustomServer
-from gpustack.routes.worker.logs import (
+from gpustack.worker.log_sources import (
+    existing_legacy_main_log,
     extract_container_restart_count,
     extract_restart_count,
+    legacy_main_log_path,
 )
 from gpustack.worker.model_meta import get_meta_from_running_instance
 from gpustack.client import ClientSet
@@ -93,6 +95,15 @@ _WORKLOAD_FAILED_MESSAGE = "Inference server exited or unhealthy."
 # One health-check cycle (+2s margin) to let a container return after a stream
 # EOF; beyond that gpustack marks it ERROR and takes over recovery.
 LOG_RECONNECT_GRACE_SECONDS = envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL + 2
+
+# Tail read when seeding a resumed anchor; widened up to the max for a record
+# longer than one read.
+_LOG_TAIL_CHUNK_SIZE = 8192
+_LOG_TAIL_MAX_READ = 1 << 20
+
+# How long a seeded anchor may hold back a followed stream before rewriting.
+# A line count cannot bound this: live output reaches the same skip as replay.
+_LOG_RESUME_SKIP_TIMEOUT = 30.0
 
 # Global lock for port assignment to avoid pickle serialization issues
 _port_lock = threading.Lock()
@@ -177,6 +188,135 @@ def _parse_allocated_accelerators(annotations: Optional[Dict[str, str]]) -> List
     return accelerators
 
 
+def _tail_lines(log_path: str, count: int) -> List[str]:
+    """The last `count` complete lines of a log file, or [] if unreadable.
+
+    Splits on '\\n' alone to match the runtime's log framing: str.splitlines()
+    also splits on '\\r', so one progress-bar line would become several pieces
+    that can never equal one streamed line.
+
+    Args:
+        log_path: Path to the log file.
+        count: Maximum number of lines to return.
+
+    Returns:
+        The trailing lines, newlines included, oldest first.
+    """
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = _LOG_TAIL_CHUNK_SIZE
+            while True:
+                f.seek(max(0, size - read_size))
+                text = f.read().decode('utf-8', errors='replace')
+
+                # Drop whatever follows the final '\n', and the first line when
+                # the read boundary cut it.
+                lines = [line + '\n' for line in text.split('\n')[:-1]]
+                if read_size < size and lines:
+                    lines.pop(0)
+
+                # Widen instead of reporting "no anchor": the caller would then
+                # reopen in 'w' and delete the history it is adopting.
+                if lines or read_size >= size or read_size >= _LOG_TAIL_MAX_READ:
+                    return lines[-count:]
+                read_size *= 2
+    except OSError:
+        return []
+
+
+def _drop_partial_last_line(log_path: str):
+    """Truncate a log file's trailing line when it carries no newline.
+
+    A worker killed mid-write leaves a fragment; the runtime replays that line
+    whole, so appending after the fragment would join the two.
+
+    Args:
+        log_path: Path to the log file.
+    """
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return
+            f.seek(size - 1)
+            if f.read(1) == b'\n':
+                return
+            f.seek(max(0, size - _LOG_TAIL_CHUNK_SIZE))
+            chunk = f.read()
+
+        last_newline = chunk.rfind(b'\n')
+        if last_newline < 0:
+            # No boundary within reach; resume degrades to a rewrite anyway.
+            return
+        os.truncate(log_path, size - (len(chunk) - last_newline - 1))
+    except OSError as e:
+        logger.warning(f"Failed to trim the partial last line of {log_path}: {e}")
+
+
+class _LogPersistence:
+    """The threads and stop events of one generation of a model instance's log
+    persistence.
+
+    A sidecar thread only mutates its own generation's record, never the shared
+    registry -- which is what lets the registry be swapped under a lock while
+    threads are joined, with no joined thread waiting on that lock.
+    """
+
+    def __init__(self, stop_event: threading.Event, main_thread: threading.Thread):
+        self.stop_event = stop_event
+        self.main_thread = main_thread
+        self._lock = threading.Lock()
+        self._stopping = False
+        self._aux_threads: List[threading.Thread] = []
+        self._aux_stop_events: List[threading.Event] = []
+
+    def add_aux_thread(
+        self, thread: threading.Thread, stop_event: Optional[threading.Event] = None
+    ):
+        """Track a thread of this generation, or stop it if teardown has begun.
+
+        Args:
+            thread: The thread to track.
+            stop_event: Its own stop event, if it has one.
+        """
+        with self._lock:
+            if not self._stopping:
+                self._aux_threads.append(thread)
+                if stop_event is not None:
+                    self._aux_stop_events.append(stop_event)
+                return
+        if stop_event is not None:
+            stop_event.set()
+
+    def stop(self, model_instance_id: int, timeout: float):
+        """Signal every thread of this generation and wait for it to finish.
+
+        Args:
+            model_instance_id: The model instance ID, for logging.
+            timeout: Maximum time to wait for each thread (seconds).
+        """
+        self.stop_event.set()
+        with self._lock:
+            self._stopping = True
+            stop_events = list(self._aux_stop_events)
+            threads = [self.main_thread] + list(self._aux_threads)
+
+        for stop_event in stop_events:
+            stop_event.set()
+
+        for thread in threads:
+            if thread and thread.is_alive():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    logger.warning(
+                        f"Log persistence thread {thread.name} for model instance "
+                        f"{model_instance_id} did not stop within {timeout}s"
+                    )
+
+
 def _describe_workload_failure(workload) -> str:
     """
     Explain why a workload stopped serving, for the instance's state message.
@@ -259,15 +399,16 @@ class ServeManager:
     When the (sub)process is alive, the model instance is provisioning.
     If the (sub)process exited, the model instance is either running or failed.
     """
-    _log_persistence_threads: Dict[int, List[threading.Thread]]
+    _log_persistence: Dict[int, _LogPersistence]
     """
-    The mapping of model instance ID to log persistence threads.
-    Each model instance may have multiple threads (one per loggable container).
+    The mapping of model instance ID to the current generation of its log
+    persistence threads. Replacing an entry retires the previous generation.
     """
-    _log_persistence_stop_events: Dict[int, List[threading.Event]]
+    _log_persistence_lock: threading.Lock
     """
-    The mapping of model instance ID to stop events for log persistence threads.
-    Used to signal threads to stop gracefully.
+    Serializes starting and stopping log persistence, which both the watch
+    thread and the periodic sync thread do. A half-applied start would leave
+    threads running that nothing can ever signal.
     """
     _error_model_instances: Dict[int, ModelInstance]
     """
@@ -296,8 +437,8 @@ class ServeManager:
         self._clientset_getter = clientset_getter
 
         self._provisioning_processes = {}
-        self._log_persistence_threads = {}
-        self._log_persistence_stop_events = {}
+        self._log_persistence = {}
+        self._log_persistence_lock = threading.Lock()
         self._error_model_instances = {}
         self._model_cache_by_instance = {}
         self._model_instance_by_instance_id = {}
@@ -499,6 +640,17 @@ class ServeManager:
                         model_instances.append(model_instance)
                         break
 
+        # Retire log persistence the server no longer assigns here: a DELETED
+        # event landing mid-pass leaves a generation nothing will ever stop, and
+        # the persistence loop retries a missing workload forever.
+        assigned_instance_ids = {mi.id for mi in model_instances}
+        for stale_id in set(self._log_persistence) - assigned_instance_ids:
+            logger.debug(
+                f"Stopping log persistence for model instance {stale_id}, "
+                f"no longer assigned to this worker"
+            )
+            self._stop_container_log_persistence(stale_id)
+
         for model_instance in model_instances:
             # Skip if the provision process has not exited yet.
             if self._is_provisioning(model_instance):
@@ -598,6 +750,10 @@ class ServeManager:
                         # Update model instance.
                         self._update_model_instance(model_instance.id, **patch_dict)
                 continue
+
+            # The workload is alive and this worker did not necessarily start it,
+            # so reconcile the log persistence threads that belong to it.
+            self._ensure_container_log_persistence(model_instance)
 
             # Otherwise, update model instance state to RUNNING if everything is fine.
             model = self._get_model(model_instance)
@@ -1202,13 +1358,14 @@ class ServeManager:
         restart_count = mi.restart_count or 0
         return f"{self._serve_log_dir}/{mi.id}.{restart_count}.log"
 
-    def _persist_container_logs(
+    def _persist_container_logs(  # noqa: C901
         self,
         workload_name: str,
         log_path: str,
         stop_event: threading.Event,
         token: Optional[str] = None,
         namespace: Optional[str] = None,
+        resume: bool = False,
     ):
         """Persist container logs to local file (runs in a separate thread).
 
@@ -1227,12 +1384,27 @@ class ServeManager:
                 If None, logs from the default (index=0) container are fetched.
             namespace: Namespace the workload lives in. None lets the runtime
                 resolve it, at the cost of a cluster-wide lookup per attempt.
+            resume: Adopt a log file a previous worker process left behind,
+                appending to it instead of rewriting it from the runtime's replay.
         """
         retry_count = 0
         first_connect = True
         # Anchor: a window of the last lines written. Matching a run of lines
         # (not one) avoids false-matching a repeated line during replay.
         anchor_window = deque(maxlen=5)
+
+        # Only an anchor seeded from the file may be absent from the replay, so
+        # only it needs a deadline. Cleared once it matches or is retired, and
+        # each connection derives its deadline from it.
+        anchor_is_seeded = False
+
+        if resume:
+            # Seed the anchor from the file's tail so this connection behaves
+            # like a reconnect; an empty or unreadable file keeps first_connect.
+            _drop_partial_last_line(log_path)
+            anchor_window.extend(_tail_lines(log_path, anchor_window.maxlen))
+            first_connect = not anchor_window
+            anchor_is_seeded = not first_connect
 
         while not stop_event.is_set():
             try:
@@ -1251,6 +1423,13 @@ class ServeManager:
                     skip_until_anchor = not first_connect and bool(anchor)
                     replayed = deque(maxlen=len(anchor)) if anchor else None
                     received_lines = False
+                    # A followed stream never EOFs while the container lives, so
+                    # an unreplayable anchor would hold live output back forever.
+                    skip_deadline = (
+                        time.monotonic() + _LOG_RESUME_SKIP_TIMEOUT
+                        if anchor_is_seeded
+                        else None
+                    )
                     with open(
                         log_path,
                         'w' if first_connect else 'a',
@@ -1272,6 +1451,12 @@ class ServeManager:
                                 replayed.append(line)
                                 if list(replayed) == anchor:
                                     skip_until_anchor = False
+                                    anchor_is_seeded = False
+                                elif (
+                                    skip_deadline is not None
+                                    and time.monotonic() > skip_deadline
+                                ):
+                                    break
                                 continue
 
                             f.write(line)
@@ -1285,6 +1470,8 @@ class ServeManager:
                     if skip_until_anchor and received_lines:
                         first_connect = True
                         anchor_window.clear()
+                        # The rewrite rebuilds the anchor from the stream.
+                        anchor_is_seeded = False
 
                 # A restart briefly looks terminated at EOF; wait for the
                 # container to return before giving up, so logs aren't dropped.
@@ -1352,8 +1539,9 @@ class ServeManager:
         mi_id: int,
         workload_name: str,
         restart_count: int,
-        stop_event: threading.Event,
+        persistence: _LogPersistence,
         namespace: Optional[str] = None,
+        resume: bool = False,
     ):
         """Background thread that waits for sidecar containers to appear.
 
@@ -1365,9 +1553,12 @@ class ServeManager:
             mi_id: Model instance ID
             workload_name: Workload name
             restart_count: Current restart count for log file naming
-            stop_event: Event to signal thread to stop
+            persistence: The generation record this thread belongs to.
             namespace: Namespace the workload lives in
+            resume: Append to sidecar log files left behind by a previous worker
+                process instead of rewriting them.
         """
+        stop_event = persistence.stop_event
         while not stop_event.is_set():
             try:
                 workload = get_workload(workload_name, namespace=namespace)
@@ -1379,7 +1570,9 @@ class ServeManager:
                             workload_name,
                             workload.loggable,
                             restart_count,
+                            persistence,
                             namespace=namespace,
+                            resume=resume,
                         )
                         logger.debug(f"Sidecar discovery for {workload_name} complete")
                         return
@@ -1393,11 +1586,13 @@ class ServeManager:
         workload_name: str,
         loggable_ops: list,
         restart_count: int,
+        persistence: _LogPersistence,
         namespace: Optional[str] = None,
+        resume: bool = False,
     ):
         """Start additional log persistence threads for sidecar containers.
 
-        Called from the main log persistence thread once the workload is available
+        Called from the sidecar discovery thread once the workload is available
         and multiple loggable containers are discovered.
 
         Args:
@@ -1405,6 +1600,10 @@ class ServeManager:
             workload_name: Workload name
             loggable_ops: List of WorkloadStatusOperation from workload.loggable
             restart_count: Current restart count for log file naming
+            persistence: The generation record these threads belong to.
+            namespace: Namespace the workload lives in
+            resume: Append to sidecar log files left behind by a previous worker
+                process instead of rewriting them.
         """
         names = []
         for op in loggable_ops:
@@ -1419,15 +1618,15 @@ class ServeManager:
 
             thread = threading.Thread(
                 target=self._persist_container_logs,
-                args=(workload_name, log_path, stop_event, op.token, namespace),
+                args=(workload_name, log_path, stop_event, op.token),
+                kwargs={"namespace": namespace, "resume": resume},
                 daemon=True,
                 name=f"log-persist-{workload_name}-{op.name}",
             )
             thread.start()
 
-            # Append to existing tracking lists.
-            self._log_persistence_threads.setdefault(mi_id, []).append(thread)
-            self._log_persistence_stop_events.setdefault(mi_id, []).append(stop_event)
+            # Tracked on this generation's record, never on the shared registry.
+            persistence.add_aux_thread(thread, stop_event)
             names.append(op.name)
 
         if names:
@@ -1436,7 +1635,7 @@ class ServeManager:
                 f"{names}"
             )
 
-    def _start_container_log_persistence(self, mi: ModelInstance):
+    def _start_container_log_persistence(self, mi: ModelInstance, resume: bool = False):
         """Start a background thread to persist container logs.
 
         Starts a single "main" log persistence thread. The thread will
@@ -1445,11 +1644,9 @@ class ServeManager:
 
         Args:
             mi: The model instance.
+            resume: Append to log files left behind by a previous worker process
+                instead of rewriting them.
         """
-
-        # Stop and clean up existing threads if any
-        self._stop_container_log_persistence(mi.id)
-
         # Use deployment metadata name for the actual workload name,
         # which differs for subordinate workers (e.g., "model-f0").
         deployment_metadata = mi.get_deployment_metadata(self._worker_id)
@@ -1464,25 +1661,76 @@ class ServeManager:
         # Main container log thread.
         thread = threading.Thread(
             target=self._persist_container_logs,
-            args=(workload_name, log_path, stop_event, None, namespace),
+            args=(workload_name, log_path, stop_event),
+            kwargs={"namespace": namespace, "resume": resume},
             daemon=True,
             name=f"log-persist-{workload_name}",
         )
-        thread.start()
+        persistence = _LogPersistence(stop_event, thread)
 
         # Sidecar discovery thread — polls until sidecar containers appear,
         # then starts additional log threads for each.
         discovery_thread = threading.Thread(
             target=self._discover_sidecar_logs,
-            args=(mi.id, workload_name, restart_count, stop_event, namespace),
+            args=(mi.id, workload_name, restart_count, persistence),
+            kwargs={"namespace": namespace, "resume": resume},
             daemon=True,
             name=f"log-discover-{workload_name}",
         )
-        discovery_thread.start()
+        persistence.add_aux_thread(discovery_thread)
 
-        self._log_persistence_threads[mi.id] = [thread, discovery_thread]
-        self._log_persistence_stop_events[mi.id] = [stop_event]
+        # Retire, register and start in one critical section: a concurrent start
+        # would otherwise leave one generation with nothing left to signal it.
+        with self._log_persistence_lock:
+            self._retire_log_persistence(mi.id)
+            self._log_persistence[mi.id] = persistence
+            thread.start()
+            discovery_thread.start()
         logger.debug(f"Started container log persistence thread for {mi.name}")
+
+    def _ensure_container_log_persistence(self, mi: ModelInstance):
+        """Re-attach container log persistence to an instance being adopted.
+
+        The threads live in this process, so a worker restart ends them while the
+        workload keeps running, and the replayed CREATED event returns early for
+        an already-RUNNING instance. Runs every sync, so it must leave a live
+        thread alone.
+
+        Args:
+            mi: The model instance.
+        """
+        # Only the main log thread counts: the sidecar discovery thread beside it
+        # polls forever on a single-container workload.
+        with self._log_persistence_lock:
+            persistence = self._log_persistence.get(mi.id)
+        if persistence and persistence.main_thread.is_alive():
+            return
+
+        self._align_legacy_main_log(mi)
+        logger.info(
+            f"Re-attaching container log persistence for adopted model instance "
+            f"{mi.name}"
+        )
+        self._start_container_log_persistence(mi, resume=True)
+
+    def _align_legacy_main_log(self, mi: ModelInstance):
+        """Rename a pre-v2.2.0 main log to carry the current restart_count.
+
+        A {id}.log counts as restart 0, so the log viewer would otherwise file it
+        under a different restart than the container log adoption creates.
+
+        Args:
+            mi: The model instance.
+        """
+        try:
+            legacy_log = legacy_main_log_path(Path(self._serve_log_dir), mi.id)
+            numbered_log = Path(self._get_numbered_log_path(mi))
+            if not legacy_log.exists() or numbered_log.exists():
+                return
+            legacy_log.rename(numbered_log)
+            logger.info(f"Renamed legacy serve log {legacy_log} to {numbered_log}")
+        except Exception as e:
+            logger.warning(f"Failed to align legacy serve log for {mi.name}: {e}")
 
     def _stop_container_log_persistence(
         self, model_instance_id: int, timeout: float = 2.0
@@ -1493,21 +1741,22 @@ class ServeManager:
             model_instance_id: The model instance ID
             timeout: Maximum time to wait for each thread to stop (seconds)
         """
-        # Signal all threads to stop
-        stop_events = self._log_persistence_stop_events.pop(model_instance_id, [])
-        for stop_event in stop_events:
-            stop_event.set()
+        with self._log_persistence_lock:
+            self._retire_log_persistence(model_instance_id, timeout)
 
-        # Wait for all threads to finish
-        threads = self._log_persistence_threads.pop(model_instance_id, [])
-        for thread in threads:
-            if thread and thread.is_alive():
-                thread.join(timeout=timeout)
-                if thread.is_alive():
-                    logger.warning(
-                        f"Log persistence thread {thread.name} for model instance "
-                        f"{model_instance_id} did not stop within {timeout}s"
-                    )
+    def _retire_log_persistence(self, model_instance_id: int, timeout: float = 2.0):
+        """Drop a model instance's log persistence generation and wait it out.
+
+        The caller must hold ``_log_persistence_lock``; joining under it is safe
+        because no log persistence thread ever takes it.
+
+        Args:
+            model_instance_id: The model instance ID
+            timeout: Maximum time to wait for each thread to stop (seconds)
+        """
+        persistence = self._log_persistence.pop(model_instance_id, None)
+        if persistence:
+            persistence.stop(model_instance_id, timeout)
 
     def _cleanup_old_logs(self, model_instance_id: int, current_restart_count: int):
         """Keep serve logs for restart_count in {R, R-1}.
@@ -1527,6 +1776,11 @@ class ServeManager:
             all_main_logs = [
                 f for f in log_dir.glob(main_log_pattern) if '.container.' not in f.name
             ]
+
+            # The glob cannot match {id}.log; it takes part as restart 0.
+            legacy_log = existing_legacy_main_log(log_dir, model_instance_id)
+            if legacy_log:
+                all_main_logs.append(legacy_log)
 
             container_log_pattern = f"{model_instance_id}.container.*.log"
             all_container_files = list(log_dir.glob(container_log_pattern))
@@ -1592,7 +1846,14 @@ class ServeManager:
         """Delete all serve logs (main/container/sidecar) for a model instance id."""
         try:
             log_dir = Path(self._serve_log_dir)
-            for f in log_dir.glob(f"{model_instance_id}.*.log"):
+            files = list(log_dir.glob(f"{model_instance_id}.*.log"))
+
+            # The glob cannot match {id}.log, which a reused id would inherit.
+            legacy_log = existing_legacy_main_log(log_dir, model_instance_id)
+            if legacy_log:
+                files.append(legacy_log)
+
+            for f in files:
                 try:
                     f.unlink()
                     logger.info(f"Deleted serve log file: {f}")

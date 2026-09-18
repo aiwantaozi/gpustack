@@ -6,11 +6,16 @@
 # Template placeholders available in run_command / run_args / env /
 # injection:
 #   {{host}}         bind or connect address
-#   {{port}}         cache server port
-#   {{metrics_port}} Prometheus metrics port (managed mode)
+#   {{port}}         the port the component is addressed by
+#   {{metrics_port}} the port it serves its Prometheus exposition on
+#   {{ports.<name>}} any port the component declares, by its own name
 #   {{ram_size}}     cache capacity in GiB (service config)
 #   {{chunk_size}}   tokens per KV chunk (service or deployment config)
-# A provider's `managed_fields` add {{<name>}} placeholders carrying
+# A component binds a port named `port` and one named `metrics` unless it
+# declares `ports`, which then lists every port it binds; `address_port`
+# and `metrics_port` say which of them {{port}} and {{metrics_port}}
+# mean, and `health_check.target` names the one the probe hits.
+# A provider's `fields` add {{<name>}} placeholders carrying
 # UI-configured values (falling back to declared defaults); a flag whose
 # placeholder renders empty is dropped together with the flag.
 # Env entries whose rendered value is empty are dropped.
@@ -36,20 +41,21 @@
   display_name: LMCache
   source: built_in
   icon: /static/catalog_icons/lmcache.png
-  description: >-
-    LMCache is a KV cache layer for LLM serving. As a shared cache service it
-    runs a cache server on every worker; deployments and replicas on the same
-    node share KV cache through it, and a shared L2 storage backend extends
-    the reuse across nodes.
+  description:
+    default: >-
+      LMCache is a KV cache layer for LLM serving. As a shared cache service it
+      runs a cache server on every worker; deployments and replicas on the same
+      node share KV cache through it, and a shared L2 storage backend extends
+      the reuse across nodes.
+    zh-CN: >-
+      LMCache 是面向大模型推理的 KV Cache 层。作为共享缓存服务，它在每个 worker
+      上运行一个缓存服务端，同节点的部署与副本通过它共享 KV Cache，共享的 L2
+      存储后端把复用范围扩展到跨节点。
   links:
-    - { label: Documentation, url: "https://docs.lmcache.ai" }
+    - label: { default: Documentation, zh-CN: 文档 }
+      url: "https://docs.lmcache.ai"
+    # A brand name reads the same in every locale, so it stays bare.
     - { label: GitHub, url: "https://github.com/LMCache/LMCache" }
-  # Managed only: LMCache is the out-of-box single-container engine
-  # GPUStack runs itself. Its distributed form (operator + coordinator +
-  # per-node servers) is a self-deployed fleet that overlaps this managed
-  # per_node topology; genuinely reference-only distributed caches (e.g.
-  # Mooncake) are what external mode is for.
-  supported_modes: [managed]
   # The MP server keeps KV transfers node-local: every worker runs its
   # own cache server instance and engines attach to the one on their
   # node, so managed deployments follow the cluster's workers.
@@ -57,23 +63,100 @@
   # The MP connector's zero-copy path is CUDA IPC: engines can only
   # attach the cache server on their own node.
   attach_locality: node_local
-  default_version: "v0.5.4"
+  default_version: "v0.5.3"
   # A service may pin a user-supplied image ("custom" version); it runs
   # with the default version's run command and env templates, so the image
   # must be command-compatible.
   custom_version: true
-  default_run_command: "lmcache server --host {{host}} --port {{port}} --l1-size-gb {{ram_size}} --chunk-size {{chunk_size}} --http-host {{host}} --http-port {{metrics_port}} --supported-transfer-mode auto --worker-reap-timeout-seconds 60 --eviction-policy {{eviction_policy}} --eviction-trigger-watermark {{eviction_trigger_watermark}} --eviction-ratio {{eviction_ratio}}"
-  default_image: "lmcache/vllm-openai:{{version}}"
+  # The vLLM runner images, not upstream's lmcache/vllm-openai: P2P reads
+  # go through nixl, which upstream ships as an optional extra and its
+  # image does not carry. The runners bundle it, and sourcing the cache
+  # servers and the engines from one build keeps the connector and the
+  # server on the same LMCache release.
+  default_image: gpustack/runner:cuda12.9-vllm0.27.1
   default_runtime_images:
     cuda:
-      "13": "lmcache/vllm-openai:{{version}}"
-      "12": "lmcache/vllm-openai:{{version}}-cu129"
-  # Declared versions, each built from the layout above. A version off
-  # that tag scheme declares image / runtime_images itself instead.
+      "13": gpustack/runner:cuda13.0-vllm0.27.1
+      "12": gpustack/runner:cuda12.9-vllm0.27.1
+  # One declared version: the release the runner bundles. Version = the
+  # bundled wheel — a label that names something the image does not carry
+  # would misreport what a service runs.
   versions:
-    "v0.5.4": {}
     "v0.5.3": {}
-    "v0.5.2": {}
+  components:
+    # Peer discovery for P2P: cache servers register with it and poll it
+    # for peers. It holds no cache and no GPU — an in-memory registry,
+    # which is why upstream runs exactly one (its own operator says more
+    # replicas only help behind a shared durable backend, and none
+    # exists). Servers keep serving when it is unreachable; they lose
+    # their peers and fall back to local L1 plus static L2.
+    coordinator:
+      enabled_by: enable_p2p
+      gpu_access: false
+      # Its own flags, not the server's: the two run different binaries,
+      # and a hint that names the other's is a flag the parser rejects.
+      # Host and port are the platform's to set.
+      common_parameters:
+        - --chunk-size
+        - --hash-algorithm
+        - --instance-timeout
+        - --health-check-interval
+        - --eviction-check-interval
+        - --eviction-ratio
+        - --trigger-watermark
+        - --metadata-path
+        - --checkpoint-path
+        - --checkpoint-interval
+        - --enable-blend-lookup
+        - --blend-probe-stride
+        - --timeout-keep-alive
+        - --disable-metrics
+        - --otlp-endpoint
+        - --extra-config
+      # One listener, serving both the registry and its health endpoint:
+      # a role with nothing to scrape holds no metrics port.
+      ports: [port]
+      run_command: "lmcache coordinator --host {{host}} --port {{port}}"
+      health_check:
+        scheme: http
+        path: /healthz
+    # The registered address is the worker's own rather than the outbound
+    # IP the server would guess: a node with several routes (a CNI bridge,
+    # a second NIC) can register one its peers cannot reach, and a peer
+    # lookup that cannot reach its target is a silent miss, not an error.
+    # The cache server engines attach to, one per worker. Its ZMQ port is
+    # what peers dial for P2P control, so it binds every interface; the
+    # transfer channel's handshake listener takes a port of its own, and
+    # the address it advertises has to be the worker's routable one.
+    # --l1-align-bytes is fixed rather than offered: peers must agree on
+    # it and upstream does not check that they do. With P2P off the two
+    # P2P flags render empty and drop, leaving the node-local server
+    # this provider has always run.
+    server:
+      topology: per_node
+      attach_endpoint: true
+      metrics_port: metrics
+      depends_on: coordinator
+      ports:
+        - name: port
+        - name: metrics
+        - name: p2p
+          enabled_by: enable_p2p
+          enabled_when: true
+      resource_profile:
+        ram_gib: "{{ram_size}}"
+        cpu: 2
+      run_command: >-
+        lmcache server --host {{host}} --port {{port}}
+        --l1-size-gb {{ram_size}} --chunk-size {{chunk_size}}
+        --http-host {{host}} --http-port {{metrics_port}}
+        --supported-transfer-mode auto --worker-reap-timeout-seconds 60
+        --eviction-policy {{eviction_policy}}
+        --eviction-trigger-watermark {{eviction_trigger_watermark}}
+        --eviction-ratio {{eviction_ratio}} --l1-align-bytes 65536
+        --coordinator-url http://{{component.coordinator.address}}
+        --coordinator-advertise-ip {{worker_ip}}
+        --p2p-advertise-url {{ports.p2p.url}}
   resource_profile:
     ram_gib: "{{ram_size}}"
     cpu: 2
@@ -88,90 +171,201 @@
   # the run command via their {{name}} placeholders; values and defaults
   # follow the v0.5.2 storage-manager argument group. The eviction
   # policy is required upstream, so its default always renders.
-  managed_fields:
+  fields:
+    - name: ram_size
+      label: { default: RAM Size (GiB), zh-CN: 内存容量（GiB） }
+      description:
+        default: Cache capacity held in the cache server's memory.
+        zh-CN: 缓存服务端在内存中保留的缓存容量。
+      type: number
+      required: true
+      default: 20
+      min: 1
+      step: 1
     - name: eviction_policy
-      label: Eviction Policy
+      label: { default: Eviction Policy, zh-CN: 淘汰策略 }
       default: LRU
+      # Engine enum values: they reach the command line verbatim and stay
+      # untranslated, so what each one means lives in the description.
       options: [LRU, IsolatedLRU, noop]
-      description: >-
-        LRU evicts least-recently-used chunks. IsolatedLRU keeps one LRU
-        list per cache salt and requires per-salt quotas via the HTTP
-        API. noop never evicts.
+      description:
+        default: >-
+          LRU evicts least-recently-used chunks. IsolatedLRU keeps one LRU
+          list per cache salt and requires per-salt quotas via the HTTP
+          API. noop never evicts.
+        zh-CN: >-
+          LRU 淘汰最近最少使用的分块。IsolatedLRU 为每个 cache salt 维护独立的 LRU
+          列表，并需通过 HTTP API 为每个 salt 设置配额。noop 从不淘汰。
     - name: eviction_trigger_watermark
-      label: Eviction Trigger Watermark
+      label: { default: Eviction Trigger Watermark, zh-CN: 淘汰触发水位 }
       type: number
       default: 0.85
       min: 0
       max: 1
       step: 0.05
-      description: Memory usage fraction (0-1) that triggers eviction.
+      description:
+        default: Memory usage fraction (0-1) that triggers eviction.
+        zh-CN: 触发淘汰的内存使用率（0-1）。
     - name: eviction_ratio
-      label: Eviction Ratio
+      label: { default: Eviction Ratio, zh-CN: 淘汰比例 }
       type: number
       default: 0.1
       min: 0
       max: 1
       step: 0.05
-      description: Fraction of memory (0-1) evicted per trigger.
+      description:
+        default: Fraction of memory (0-1) evicted per trigger.
+        zh-CN: 每次触发所淘汰的内存比例（0-1）。
+    - name: chunk_size
+      label: { default: Chunk Size, zh-CN: 分块大小 }
+      description:
+        default: >-
+          Tokens per KV cache chunk. Smaller chunks reuse at finer
+          granularity but cost more overhead; empty uses the engine
+          default.
+        zh-CN: >-
+          每个 KV Cache 分块包含的 token
+          数。分块越小，复用的粒度越细，开销也越大；留空则使用引擎的默认值。
+      type: number
+      min: 1
+      step: 1
+    # Peer-to-peer reads: a server that misses locally pulls the chunk
+    # from a peer's cache over the transfer channel, so a deployment sees
+    # the fleet's pool rather than its node's. Off by default — it needs
+    # the coordinator component and one-sided RDMA through nixl.
+    - name: enable_p2p
+      label: { default: P2P Reads, zh-CN: P2P 读取 }
+      description:
+        default: >-
+          Let each cache server read chunks from its peers instead of
+          recomputing them, turning the per-node caches into one pool.
+          Brings up a coordinator component for peer discovery.
+        zh-CN: >-
+          让每个缓存服务从对端读取数据块，而不是重新计算，把各节点的缓存合成一个池。
+          会额外运行一个 coordinator 组件用于节点发现。
+      type: boolean
+      default: false
   l2_adapter_flag: "--l2-adapter"
   l2_backends:
     fs_native:
-      display_name: Local Filesystem
-      description: >-
-        Spills KV cache to a local directory (e.g. NVMe) on the worker.
-        max_capacity_gb caps disk usage; 0 or unset means uncapped.
+      display_name: { default: Local Filesystem, zh-CN: 本地文件系统 }
+      description:
+        default: >-
+          Spills KV cache to a local directory (e.g. NVMe) on the worker.
+          max_capacity_gb caps disk usage; 0 or unset means uncapped.
+        zh-CN: >-
+          将 KV Cache 溢出到 worker 上的本地目录（如 NVMe）。max_capacity_gb
+          限制磁盘用量；填 0 或留空表示不限制。
       fields:
         # Defaults into the platform data dir: on containerized workers
         # the mirrored deployment carries the worker's /var/lib/gpustack
         # host mount into the cache container, so spilled cache lands on
         # host disk and survives container recreation.
         - name: base_path
-          label: Base Path
+          label: { default: Base Path, zh-CN: 基础路径 }
           required: true
           default: /var/lib/gpustack/cache/lmcache/l2
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
-        - { name: num_workers, label: I/O Workers, type: number }
-        - { name: use_odirect, label: Direct I/O (O_DIRECT), type: boolean }
+        - name: max_capacity_gb
+          label: { default: Max Capacity (GiB), zh-CN: 最大容量（GiB） }
+          type: number
+        - name: num_workers
+          label: { default: I/O Workers, zh-CN: I/O 工作线程 }
+          description:
+            default: >-
+              Threads the connector reads and writes with, which is its
+              effective I/O queue depth. Raise it on storage whose total
+              bandwidth exceeds what a single stream reaches (a parallel
+              filesystem such as GPFS or Lustre); leave empty for a local
+              disk, where the connector's own default serves.
+            zh-CN: >-
+              连接器读写所用的线程数，也就是它实际的 I/O
+              队列深度。当存储的总带宽高于单流带宽时（如 GPFS、Lustre
+              等并行文件系统）可以调高；本地磁盘留空即可，连接器自带的默认值足够。
+          type: number
+        - name: use_odirect
+          label: { default: Direct I/O (O_DIRECT), zh-CN: 直接 I/O（O_DIRECT） }
+          description:
+            default: >-
+              Bypasses the page cache, so reads and writes hit the disk
+              itself. Takes effect only while each chunk is a multiple of
+              the filesystem block size — otherwise that transfer silently
+              falls back to buffered I/O. Leave off unless you are measuring
+              real disk bandwidth.
+            zh-CN: >-
+              绕过页缓存，直接读写磁盘。
+              仅当数据块的字节数是文件系统块大小的整数倍时才真正生效，否则该次传输会静默回退为带缓存的 I/O。
+              除非要测量真实磁盘带宽，否则保持关闭。
+          type: boolean
     resp:
+      # A brand name reads the same in every locale, so it stays bare.
       display_name: Redis / Valkey
       icon: /static/catalog_icons/redis.svg
-      description: Shared L2 in a Redis or Valkey server; cache survives cache-server restarts.
+      description:
+        default: Shared L2 in a Redis or Valkey server; cache survives cache-server restarts.
+        zh-CN: 以 Redis 或 Valkey 服务端作为共享 L2；缓存服务端重启后缓存仍然保留。
       fields:
-        - { name: host, label: Host, required: true }
-        - { name: port, label: Port, type: number, required: true }
-        - { name: username, label: Username, env_name: LMCACHE_RESP_USERNAME }
+        - { name: host, label: { default: Host, zh-CN: 主机 }, required: true }
+        - name: port
+          label: { default: Port, zh-CN: 端口 }
+          type: number
+          required: true
+        - name: username
+          label: { default: Username, zh-CN: 用户名 }
+          env_name: LMCACHE_RESP_USERNAME
         - name: password
-          label: Password
+          label: { default: Password, zh-CN: 密码 }
           type: password
           env_name: LMCACHE_RESP_PASSWORD
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
+        - name: max_capacity_gb
+          label: { default: Max Capacity (GiB), zh-CN: 最大容量（GiB） }
+          type: number
     s3:
       display_name: S3
       icon: /static/catalog_icons/s3.svg
-      description: >-
-        Shared L2 in an S3-compatible object store (AWS S3, MinIO, Ceph
-        RGW). The endpoint uses virtual-hosted style — the bucket name is
-        part of the host, e.g. "kvcache.s3.example.com"; path-style
-        addressing is not supported. max_capacity_gb caps aggregate
-        usage; 0 or unset means uncapped.
+      description:
+        default: >-
+          Shared L2 in an S3-compatible object store (AWS S3, MinIO, Ceph
+          RGW). The endpoint uses virtual-hosted style — the bucket name is
+          part of the host, e.g. "kvcache.s3.example.com"; path-style
+          addressing is not supported. max_capacity_gb caps aggregate
+          usage; 0 or unset means uncapped.
+        zh-CN: >-
+          以兼容 S3 的对象存储作为共享 L2（AWS S3、MinIO、Ceph RGW）。地址采用
+          virtual-hosted 风格——bucket 名是主机名的一部分，例如
+          "kvcache.s3.example.com"；不支持 path-style 寻址。max_capacity_gb
+          限制总用量；填 0 或留空表示不限制。
       fields:
-        - { name: s3_endpoint, label: Bucket Endpoint, required: true }
-        - { name: s3_region, label: Region, required: true }
+        - name: s3_endpoint
+          label: { default: Bucket Endpoint, zh-CN: Bucket 地址 }
+          required: true
+        - name: s3_region
+          label: { default: Region, zh-CN: 区域 }
+          required: true
+        # Access Key ID and Secret Access Key are the object store's own
+        # credential names; they stay bare, as every S3 console shows them.
         - { name: aws_access_key_id, label: Access Key ID, env_name: AWS_ACCESS_KEY_ID }
         - name: aws_secret_access_key
           label: Secret Access Key
           type: password
           env_name: AWS_SECRET_ACCESS_KEY
-        - { name: disable_tls, label: Disable TLS (HTTP Endpoint), type: boolean }
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
+        - name: disable_tls
+          label: { default: Disable TLS (HTTP Endpoint), zh-CN: 禁用 TLS（HTTP 端点） }
+          type: boolean
+        - name: max_capacity_gb
+          label: { default: Max Capacity (GiB), zh-CN: 最大容量（GiB） }
+          type: number
   # Completion hints for the extra-parameters editor. Deliberately
   # excludes the flags GPUStack always renders from structured config.
   common_parameters:
     - --l2-adapter
-    # CLI-entry-only groups (coordinator / P2P), valid again now that the
-    # run command uses `lmcache server` instead of the module entry.
+    # CLI-entry-only groups (coordinator / P2P), which the `lmcache
+    # server` entry point accepts.
     - --coordinator-url
     - --p2p-advertise-url
+    # A hybrid model (Mamba or Gated-DeltaNet layers beside full
+    # attention) needs each attention window stored as its own object
+    # group, and the server keeps that off by default.
+    - --separate-object-groups
     - --max-workers
     - --max-gpu-workers
     - --max-cpu-workers
@@ -202,7 +396,7 @@
     - --trace-output
   # /healthcheck verifies the engine is initialized (503 until then) —
   # a stronger signal than a TCP connect on the ZMQ port. It lives on
-  # the HTTP frontend, which is the metrics port in our port model.
+  # the HTTP frontend, the same listener the metrics come from.
   health_check:
     scheme: http
     path: /healthcheck
@@ -241,9 +435,14 @@
       l2_load: { histogram_avg: lmcache_mp_l2_load_throughput_GB_per_second }
   inference_backend_integrations:
     # The MP server speaks ZMQ: clients attach through the MP connector
-    # pointed at tcp://host:port (the server's --port), and the connector
-    # requires the non-hybrid KV cache manager. Engines attach node-local
-    # only (the per_node resolver degrades instead of crossing nodes:
+    # pointed at tcp://host:port (the server's --port). The connector
+    # advertises hybrid support, so vLLM keeps its hybrid KV cache manager
+    # on and none of the injected arguments touch it: forcing it off puts
+    # a hybrid model (Mamba or linear-attention layers beside full
+    # attention) on the unified-group path, where the two layer kinds have
+    # no common cache spec and the engine fails to start.
+    # Engines attach node-local only (the per_node resolver degrades
+    # instead of crossing nodes:
     # the engine-driven copy path measures slower than no cache at all),
     # so the placement fact always renders {{mp_transfer_mode}} "auto" —
     # the CUDA-IPC zero-copy path, both containers sharing the host IPC
@@ -276,7 +475,6 @@
             lmcache.mp.port: "{{port}}"
             lmcache.mp.mp_transfer_mode: "{{mp_transfer_mode}}"
         args:
-          - "--disable-hybrid-kv-cache-manager"
           # vLLM defaults --shutdown-timeout to 0: on SIGTERM the engine
           # dies without closing its CUDA IPC handles and the driver
           # keeps its KV VRAM charged to the cache server until the
@@ -310,233 +508,178 @@
           /tmp/gpustack-lmcache-sgl.yaml: |
             mp_host: "{{host}}"
             mp_port: {{port}}
+# A provider this installation does not carry. The card holds its place in
+# the catalog and reads like any other — what the provider is, what it
+# attaches to, where to read about it — with nothing behind it to launch:
+# the API refuses a service naming it. An extension that ships the
+# provider registers its own catalog asset, whose declaration replaces
+# this entry outright.
 - name: Mooncake
   display_name: Mooncake
   source: built_in
   icon: /static/catalog_icons/mooncake.png
-  description: >-
-    Mooncake Store is a distributed KV cache pool with a cluster-wide master
-    and per-node clients that transfer KV blocks peer-to-peer over RDMA/TCP.
-    It is deployed and operated outside GPUStack; register the master address
-    and GPUStack attaches inference engines to it, probes it, and (once
-    calibrated) scrapes its metrics.
+  description:
+    default: >-
+      Mooncake Store is a high-performance distributed KV cache pool for
+      LLM inference, built on Mooncake's Transfer Engine. It pools the CPU
+      DRAM and SSD of a GPU cluster and serves the reusable KV cache held
+      there to every engine in it, over TCP or RDMA.
+    zh-CN: >-
+      Mooncake Store 是面向大模型推理的高性能分布式 KV Cache
+      池，构建在 Mooncake Transfer Engine 之上。它把 GPU 集群中的 CPU 内存与 SSD
+      汇聚成缓存池，集群内任意引擎都可通过 TCP 或 RDMA 复用其中的 KV Cache。
   links:
-    - { label: Documentation, url: "https://kvcache-ai.github.io/Mooncake/" }
+    - label: { default: Documentation, zh-CN: 文档 }
+      url: "https://kvcache-ai.github.io/Mooncake/"
     - { label: GitHub, url: "https://github.com/kvcache-ai/Mooncake" }
-  # Provider-specific Grafana dashboard provisioned from
-  # docker-compose/grafana/grafana_dashboards/gpustack-mooncake.json,
-  # built on the master's pool/keys/eviction/request metrics.
-  dashboard_uid: gpustack-mooncake
-  supported_modes: [external]
-  # External connection parameters. The master address is the endpoint
-  # (host+port, default RPC port 50051); these feed the rest of the
-  # connector config. metadata_server P2PHANDSHAKE keeps peer discovery
-  # decentralized (no separate etcd/redis); a cluster with an external
-  # metadata service registers its "etcd://" / "http://" address instead.
-  external_fields:
-    - name: metadata_server
-      label: Metadata Server
-      description: >-
-        Transfer Engine peer-discovery backend: P2PHANDSHAKE (decentralized),
-        or an etcd:// / redis:// / http:// address.
-      default: P2PHANDSHAKE
-    - name: protocol
-      label: Transport Protocol
-      description: RDMA for production performance; TCP for functional setups.
-      default: tcp
-      options: [tcp, rdma]
-    - name: device_name
-      label: RDMA Device
-      description: NIC device(s) for the RDMA protocol; leave empty for TCP.
-    - name: local_buffer_size
-      label: Local Buffer Size
-      description: >-
-        Per-GPU staging buffer for the engine's own store operations
-        (e.g. 1GB).
-      default: 1GB
-  health_check:
-    scheme: tcp
-  # The master serves Prometheus text on its metrics port (GET /metrics,
-  # enable_metric_reporting defaults to true). Metric names follow
-  # mooncake-store's master_metric_manager. Lookup-hit accounting lives
-  # in the engine-side connector, not the master, so there is no
-  # hit_rate mapping; usage is the pool's allocated-vs-capacity view.
-  default_metrics:
-    path: /metrics
-    default_port: 9003
-    mappings:
-      l1_usage_bytes:
-        gauge: master_allocated_bytes
-      l1_usage_ratio:
-        gauge_ratio:
-          numerator: master_allocated_bytes
-          denominator: master_total_capacity_bytes
+  # The accelerators the card claims. A declaration that launches
+  # something states them through the images it publishes per
+  # accelerator; this one has no images, so it names what its engine
+  # integrations are scoped to — the same claim, and the same card.
   inference_backend_integrations:
-    # MooncakeStoreConnector uses the Mooncake distributed store as a
-    # shared KV pool. The connector reads its configuration solely from
-    # the JSON file MOONCAKE_CONFIG_PATH points at (no per-field env
-    # support), so the injection writes that file into the engine
-    # container. mode standalone-store with global_segment_size 0 makes
-    # the engine a pure requester: the externally deployed cluster owns
-    # the pool. The mode field is recent in vLLM; behavior on older
-    # connectors is a calibration surface for integration testing.
-    - backend: vLLM
-      frameworks: [cuda]
-      versions: ">=0.9.0"
-      injection:
-        env:
-          MOONCAKE_CONFIG_PATH: /tmp/gpustack-mooncake.json
-          # The TCP transport opens a fresh connection per transfer slice
-          # by default; under prefill bursts the client-side TIME_WAIT
-          # backlog exhausts ephemeral ports (connect() fails with
-          # EADDRNOTAVAIL). Pooling is the sane default for LLM traffic;
-          # the RDMA path never reads this switch.
-          MC_TCP_ENABLE_CONNECTION_POOL: "1"
-        files:
-          /tmp/gpustack-mooncake.json: |
-            {
-              "mode": "standalone-store",
-              "metadata_server": "{{metadata_server}}",
-              "master_server_address": "{{master_server_address}}",
-              "global_segment_size": 0,
-              "local_buffer_size": "{{local_buffer_size}}",
-              "protocol": "{{protocol}}",
-              "device_name": "{{device_name}}"
-            }
-        kv_transfer_config:
-          kv_connector: MooncakeStoreConnector
-          kv_role: kv_both
+    - { backend: vLLM, frameworks: [cuda] }
+    - { backend: vLLM, frameworks: [cann] }
+  unavailable_reason:
+    default: Available in GPUStack Enterprise
+    zh-CN: GPUStack 企业版可用
 # PLACEHOLDER. Change as needed.
 - name: XSKY MeshFusion
   display_name: XSKY MeshFusion
   source: partner
   icon: /static/catalog_icons/xsky.png
-  description: >-
-    XSKY MeshFusion is a KV cache layer for LLM serving. As a shared cache
-    service it runs a cache server on every worker; deployments and replicas
-    on the same node share KV cache through it, and a shared L2 storage
-    backend (e.g. XSKY's store) extends the reuse across nodes.
+  description:
+    default: >-
+      XSKY MeshFusion is a KV cache layer for LLM serving. As a shared cache
+      service it runs a cache server on every worker; deployments and replicas
+      on the same node share KV cache through it, and a shared L2 storage
+      backend (e.g. XSKY's store) extends the reuse across nodes.
+    zh-CN: >-
+      XSKY MeshFusion 是面向大模型推理的 KV Cache 层。作为共享缓存服务，它在每个 worker
+      上运行一个缓存服务端，同节点的部署与副本通过它共享 KV Cache，共享的 L2
+      存储后端（如 XSKY 的存储）把复用范围扩展到跨节点。
   links:
-    - { label: Product Page, url: "https://www.xsky.com" }
-  supported_modes: [managed]
+    - label: { default: Product Page, zh-CN: 产品主页 }
+      url: "https://www.xsky.com"
+  # XSKY ships the MeshFusion management console; declaring this makes
+  # the service form offer the management_url link field.
+  management_url: true
   topology: per_node
   # The MP connector's zero-copy path is CUDA IPC: engines can only
   # attach the cache server on their own node.
   attach_locality: node_local
-  default_version: "v0.5.2"
+  # MeshFusion images are not published: every service names the image it
+  # runs, so the catalog declares no release line and the form asks for an
+  # image instead of a version. The launch arguments stay here — they are
+  # the whole launch declaration such an entry has, and every image the
+  # user names must be compatible with them.
   custom_version: true
-  default_run_args: "--host {{host}} --port {{port}} --l1-size-gb {{ram_size}} --chunk-size {{chunk_size}} --http-host {{host}} --http-port {{metrics_port}} --supported-transfer-mode auto --worker-reap-timeout-seconds 60 --eviction-policy {{eviction_policy}} --eviction-trigger-watermark {{eviction_trigger_watermark}} --eviction-ratio {{eviction_ratio}}"
-  default_image: "lmcache/vllm-openai:{{version}}"
-  default_runtime_images:
-    cuda:
-      "13": "lmcache/vllm-openai:{{version}}"
-      "12": "lmcache/vllm-openai:{{version}}-cu129"
-    # PLACEHOLDER. Change as needed.
-    cann:
-      "8": "registry.example.com/lmcache/vllm-openai:{{version}}-cann"
-  versions:
-    "v0.5.2": {}
+  default_run_args: "--host {{host}} --port {{port}} --l1-size-gb {{ram_size}} --chunk-size {{chunk_size}} --http-host {{host}} --http-port {{metrics_port}} --eviction-policy {{eviction_policy}} --eviction-trigger-watermark {{eviction_trigger_watermark}} --eviction-ratio {{eviction_ratio}}"
   resource_profile:
     ram_gib: "{{ram_size}}"
     cpu: 2
-  managed_fields:
+  fields:
+    - name: ram_size
+      label: { default: RAM Size (GiB), zh-CN: 内存容量（GiB） }
+      description:
+        default: Cache capacity held in the cache server's memory.
+        zh-CN: 缓存服务端在内存中保留的缓存容量。
+      type: number
+      required: true
+      default: 20
+      min: 1
+      step: 1
     - name: eviction_policy
-      label: Eviction Policy
+      label: { default: Eviction Policy, zh-CN: 淘汰策略 }
       default: LRU
       options: [LRU, IsolatedLRU, noop]
-      description: >-
-        LRU evicts least-recently-used chunks. IsolatedLRU keeps one LRU
-        list per cache salt and requires per-salt quotas via the HTTP
-        API. noop never evicts.
+      description:
+        default: >-
+          LRU evicts least-recently-used chunks. IsolatedLRU keeps one LRU
+          list per cache salt and requires per-salt quotas via the HTTP
+          API. noop never evicts.
+        zh-CN: >-
+          LRU 淘汰最近最少使用的分块。IsolatedLRU 为每个 cache salt 维护独立的 LRU
+          列表，并需通过 HTTP API 为每个 salt 设置配额。noop 从不淘汰。
     - name: eviction_trigger_watermark
-      label: Eviction Trigger Watermark
+      label: { default: Eviction Trigger Watermark, zh-CN: 淘汰触发水位 }
       type: number
       default: 0.85
       min: 0
       max: 1
       step: 0.05
-      description: Memory usage fraction (0-1) that triggers eviction.
+      description:
+        default: Memory usage fraction (0-1) that triggers eviction.
+        zh-CN: 触发淘汰的内存使用率（0-1）。
     - name: eviction_ratio
-      label: Eviction Ratio
+      label: { default: Eviction Ratio, zh-CN: 淘汰比例 }
       type: number
       default: 0.1
       min: 0
       max: 1
       step: 0.05
-      description: Fraction of memory (0-1) evicted per trigger.
+      description:
+        default: Fraction of memory (0-1) evicted per trigger.
+        zh-CN: 每次触发所淘汰的内存比例（0-1）。
+    - name: chunk_size
+      label: { default: Chunk Size, zh-CN: 分块大小 }
+      description:
+        default: >-
+          Tokens per KV cache chunk. Smaller chunks reuse at finer
+          granularity but cost more overhead; empty uses the engine
+          default.
+        zh-CN: >-
+          每个 KV Cache 分块包含的 token
+          数。分块越小，复用的粒度越细，开销也越大；留空则使用引擎的默认值。
+      type: number
+      min: 1
+      step: 1
   l2_adapter_flag: "--l2-adapter"
+  # The store is the only L2 tier MeshFusion is deployed with; a lone
+  # declared backend is what the service form preselects.
   l2_backends:
-    fs_native:
-      display_name: Local Filesystem
-      description: >-
-        Spills KV cache to a local directory (e.g. NVMe) on the worker.
-        max_capacity_gb caps disk usage; 0 or unset means uncapped.
-      fields:
-        # Defaults into the platform data dir: on containerized workers
-        # the mirrored deployment carries the worker's /var/lib/gpustack
-        # host mount into the cache container, so spilled cache lands on
-        # host disk and survives container recreation.
-        - name: base_path
-          label: Base Path
-          required: true
-          default: /var/lib/gpustack/cache/lmcache/l2
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
-        - { name: num_workers, label: I/O Workers, type: number }
-        - { name: use_odirect, label: Direct I/O (O_DIRECT), type: boolean }
     xdfs:
       display_name: XSKY MeshFusion Store
       icon: /static/catalog_icons/xsky.png
-      description: >-
-        XSKY MeshFusion Store distributed storage as the L2 tier; capacity
-        and durability scale with the external storage cluster.
+      # The UI exposes this as a separate switch above the fields. It defaults
+      # to off because MeshFusion Store normally configures itself in the image.
+      adapter_flag_optional: true
+      adapter_flag_default: false
+      adapter_flag_label:
+        default: Enable L2 Adapter Flag
+        zh-CN: 启用 L2 适配器参数
+      description:
+        default: >-
+          XSKY MeshFusion Store distributed storage as the L2 tier; capacity
+          and durability scale with the external storage cluster.
+        zh-CN: >-
+          企业级 KV Cache 扩展加速方案，激活 GPU 节点本地 DRAM 与 SSD 加速模型推理。基于端到端的
+          NVMe 技术，提供跨节点共享、本地优先读写、自动淘汰策略、主动保护 SSD 寿命等多种能力。
+      # The XDFS plugin is exposed through NIXL's dynamic store adapter. Its
+      # plugin-specific values belong under backend_params and are strings,
+      # including max_capacity_gb.
+      adapter_type: nixl_store_dynamic
+      adapter_backend: XDFS_KV
+      adapter_params:
+        conf: conf
+        params_file: params_file
+        tenant_id: tenant_id
+        max_capacity_gb: max_capacity_gb
       fields:
-        - { name: metadata_endpoint, label: Metadata Endpoint, required: true }
-        - { name: sdk_config_file, label: SDK Config File, default: /opt/meshfusion/sdk.flags }
-        - { name: num_workers, label: Workers, type: number, default: 32 }
-        - { name: io_depth, label: IO Depth, type: number, default: 256 }
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number, default: 30720 }
-        - { name: policy_id, label: Policy ID, type: number, default: 1 }
-        - { name: timeout_ms, label: Timeout (ms), type: number, default: 60000 }
-        - { name: tenant_id, label: Tenant ID, default: nixl }
-        - { name: max_write_inflight_bytes, label: Max Write Inflight (Bytes), type: number, default: 536870912 }
-    resp:
-      display_name: Redis / Valkey
-      icon: /static/catalog_icons/redis.svg
-      description: Shared L2 in a Redis or Valkey server; cache survives cache-server restarts.
-      fields:
-        - { name: host, label: Host, required: true }
-        - { name: port, label: Port, type: number, required: true }
-        - { name: username, label: Username, env_name: LMCACHE_RESP_USERNAME }
-        - name: password
-          label: Password
-          type: password
-          env_name: LMCACHE_RESP_PASSWORD
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
-    s3:
-      display_name: S3
-      icon: /static/catalog_icons/s3.svg
-      description: >-
-        Shared L2 in an S3-compatible object store (AWS S3, MinIO, Ceph
-        RGW). The endpoint uses virtual-hosted style — the bucket name is
-        part of the host, e.g. "kvcache.s3.example.com"; path-style
-        addressing is not supported. max_capacity_gb caps aggregate
-        usage; 0 or unset means uncapped.
-      fields:
-        - { name: s3_endpoint, label: Bucket Endpoint, required: true }
-        - { name: s3_region, label: Region, required: true }
-        - { name: aws_access_key_id, label: Access Key ID, env_name: AWS_ACCESS_KEY_ID }
-        - name: aws_secret_access_key
-          label: Secret Access Key
-          type: password
-          env_name: AWS_SECRET_ACCESS_KEY
-        - { name: disable_tls, label: Disable TLS (HTTP Endpoint), type: boolean }
-        - { name: max_capacity_gb, label: Max Capacity (GiB), type: number }
+        # The image supplies the plugin files and capacity defaults; tenant is
+        # the only service-level override exposed by the form.
+        - name: tenant_id
+          label: { default: Tenant ID, zh-CN: 租户 ID }
+          default: nixl
   common_parameters:
     - --l2-adapter
-    # CLI-entry-only groups (coordinator / P2P), valid again now that the
-    # run command uses `lmcache server` instead of the module entry.
+    # CLI-entry-only groups (coordinator / P2P), which the `lmcache
+    # server` entry point accepts.
     - --coordinator-url
     - --p2p-advertise-url
+    # A hybrid model (Mamba or Gated-DeltaNet layers beside full
+    # attention) needs each attention window stored as its own object
+    # group, and the server keeps that off by default.
+    - --separate-object-groups
     - --max-workers
     - --max-gpu-workers
     - --max-cpu-workers
@@ -609,13 +752,13 @@
           node_local: { mp_transfer_mode: auto }
         kv_transfer_config:
           kv_connector: LMCacheMPConnector
+          kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector
           kv_role: kv_both
           kv_connector_extra_config:
             lmcache.mp.host: "tcp://{{host}}"
             lmcache.mp.port: "{{port}}"
             lmcache.mp.mp_transfer_mode: "{{mp_transfer_mode}}"
         args:
-          - "--disable-hybrid-kv-cache-manager"
           # vLLM defaults --shutdown-timeout to 0: on SIGTERM the engine
           # dies without closing its CUDA IPC handles and the driver
           # keeps its KV VRAM charged to the cache server until the
@@ -634,16 +777,16 @@
         env:
           PYTHONHASHSEED: "0"
         locality_params:
-          node_local: { mp_transfer_mode: auto }
+          node_local: { mp_transfer_mode: engine_driven }
         kv_transfer_config:
           kv_connector: LMCacheMPConnector
+          kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector
           kv_role: kv_both
           kv_connector_extra_config:
             lmcache.mp.host: "tcp://{{host}}"
             lmcache.mp.port: "{{port}}"
             lmcache.mp.mp_transfer_mode: "{{mp_transfer_mode}}"
         args:
-          - "--disable-hybrid-kv-cache-manager"
           # vLLM defaults --shutdown-timeout to 0: on SIGTERM the engine
           # dies without closing its CUDA IPC handles and the driver
           # keeps its KV VRAM charged to the cache server until the

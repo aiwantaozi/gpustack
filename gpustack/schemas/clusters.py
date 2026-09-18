@@ -399,6 +399,76 @@ class ClusterTopology(BaseModel):
     # field nobody was editing.
 
 
+# Value paths the server derives from the cluster's registration, and which a
+# caller therefore cannot set: each one decides what the deployment *is* rather
+# than how it is configured. Overriding `worker.serverURL` points the workers at
+# a different server than the one that issued the token; `server.enabled` adds a
+# second control plane to a cluster that registered with one; `image.tag` breaks
+# the pairing between the worker image and the templates that render it, which is
+# how an install ends up with an operator and a worker of different generations.
+# Every path that names an image is here, and for one reason: the chart composes
+# an image as `{global.hub}/{image.repository}:{image.tag}`, so leaving any part
+# of that writable would redirect what the release deploys while the parts that
+# are protected still read as issued. The operator's tree is included because the
+# registration manifest's Job runs `operatorImage` directly — an overlay moving
+# only the chart's copy would put the installer and the operator it installs on
+# different images, which is what requiring a tag on that field exists to stop.
+# `gpustack-operator.worker.image` is here for the same reason and not as an
+# afterthought: the operator chart resolves it *over* its chart-level image, so
+# protecting only the latter is a fence with a gate in it.
+#
+# The three name overrides are the other invariant this list carries. Adoption is
+# by name — the chart calls its sub-chart `operator` precisely so its objects
+# land on the names the pre-chart manifest used — so renaming them leaves the old
+# operator running, unowned, beside a new one, and leaves this manifest's cleanup
+# deleting objects that no longer exist. That is the line: a path is here when it
+# breaks how a cluster is adopted or which image it runs, not merely because it
+# can be set to something unwise. `worker.disableApplications` is unwise and is
+# not here; the operator chart documents what narrowing it costs.
+SERVER_OWNED_VALUE_PATHS = frozenset(
+    {
+        "appliedRevision",
+        "global.hub",
+        "gpustack-operator.fullnameOverride",
+        "gpustack-operator.global.imageNamespace",
+        "gpustack-operator.global.imageRegistry",
+        "gpustack-operator.image.repository",
+        "gpustack-operator.image.tag",
+        "gpustack-operator.nameOverride",
+        "gpustack-operator.namespaceOverride",
+        "gpustack-operator.worker.image",
+        "higress-core.enabled",
+        "image.repository",
+        "image.tag",
+        "imagePullSecret.create",
+        "registrationTokenSecretName",
+        "server.enabled",
+        "worker.enabled",
+        "worker.serverURL",
+    }
+)
+
+
+def _value_path_set(values: Dict[str, Any], path: str) -> bool:
+    """Whether ``path`` ("a.b.c") is claimed by ``values``.
+
+    True for the path itself, and for anything standing where the path would
+    have to go: ``{"image": "repo:tag"}`` claims ``image.repository`` as surely
+    as ``{"image": {"repository": ...}}`` does — the server can no longer put
+    its own value there. Refusing only the exact path would accept that one and
+    fail later, while merging, on a value the cluster record has already stored.
+    """
+    cursor: Any = values
+    for segment in path.split("."):
+        if not isinstance(cursor, dict):
+            # A scalar (or list) sits on the way to the path: it occupies it.
+            return True
+        if segment not in cursor:
+            return False
+        cursor = cursor[segment]
+    return True
+
+
 class K8sOptions(BaseModel):
     """
     All Kubernetes-side deployment knobs for a cluster's worker DaemonSets:
@@ -432,8 +502,10 @@ class K8sOptions(BaseModel):
         alias="volumeMounts",
         description=(
             "Pod spec volumes and volumeMounts applied to every worker "
-            "DaemonSet. The first entry is reserved for the gpustack data "
-            "dir; the route layer enforces that invariant."
+            "DaemonSet. The first entry is reserved for the gpustack data dir "
+            "and is required whenever k8s_options is submitted; the server owns "
+            "every field of it but the hostPath it points at, overwriting the "
+            "name, mountPath and readOnly it is sent with."
         ),
     )
     operator_image: Optional[str] = PydanticField(
@@ -441,7 +513,16 @@ class K8sOptions(BaseModel):
         alias="operatorImage",
         description=(
             "Override for the gpustack-operator container image. Falls back "
-            "to the server's GPUSTACK_OPERATOR_IMAGE / built-in default when unset."
+            "to the server's GPUSTACK_OPERATOR_IMAGE / built-in default when unset.\n\n"
+            "This image is also what the registration manifest's bootstrap Job "
+            "runs, so it has to carry the tools that Job needs — bash, helm, "
+            "kubectl, jq, curl and sha256sum — which the operator's own image "
+            "does. A stripped-down replacement fails in the cluster, naming the "
+            "missing one.\n\n"
+            "A tag is required when this is set: the same reference is read by "
+            "the Job, which needs a concrete image, and by the chart, whose "
+            "operator tag otherwise falls back to its own pin — one field "
+            "resolving to two different images."
         ),
     )
     gpu_instance_options: Optional[GpuInstanceOptions] = PydanticField(
@@ -464,6 +545,48 @@ class K8sOptions(BaseModel):
         alias="operator",
         description="Operator-specific deployment options for the cluster.",
     )
+    helm_values: Optional[Dict[str, Any]] = PydanticField(
+        default=None,
+        alias="helmValues",
+        description=(
+            "Values passed to the GPUStack chart the registration manifest "
+            "installs, merged over the ones the server derives from this "
+            "cluster. Keys are the chart's own, verbatim — see its values.yaml "
+            "and, for anything under `gpustack-operator`, the operator chart's.\n\n"
+            "Nothing is mirrored into a GPUStack-shaped schema here on purpose: "
+            "the chart and its sub-charts carry a large surface that moves with "
+            "their releases, and a field-by-field copy would have to be kept in "
+            "lockstep with it forever.\n\n"
+            "A cluster that already runs Kueue, for example, skips installing a "
+            "second one with "
+            '`{"gpustack-operator": {"kueue": {"enabled": false}}}`. Note what '
+            "that means: the operator still requires Kueue and Node Feature "
+            "Discovery to derive the scheduling chain and waits for their CRDs at "
+            "startup, so switching one off that is not actually present leaves "
+            "the operator unable to start. Switching off one this release "
+            "installed removes it — Kueue's CRDs come from its chart, and every "
+            "Workload and ClusterQueue goes with them.\n\n"
+            "Merging is per key and depth-first; a list replaces rather than "
+            "extends. The paths that decide what this deployment *is* are the "
+            f"server's and are refused here: {', '.join(sorted(SERVER_OWNED_VALUE_PATHS))}."
+        ),
+    )
+
+    @field_validator("helm_values")
+    def validate_helm_values(cls, v):
+        if not v:
+            return v
+        refused = sorted(
+            path for path in SERVER_OWNED_VALUE_PATHS if _value_path_set(v, path)
+        )
+        if refused:
+            raise ValueError(
+                f"{', '.join(refused)} cannot be set here: the server derives "
+                "them from this cluster's registration, and overriding them "
+                "would produce a release that does not match the cluster it was "
+                "issued for"
+            )
+        return v
 
 
 def is_gpu_service_k8s_options(k8s_options: Any) -> bool:
@@ -506,6 +629,103 @@ def is_gpu_service_cluster(cluster: "Cluster") -> bool:
     which carries the invariant and the reason for the shape.
     """
     return is_gpu_service_k8s_options(cluster.k8s_options)
+
+
+# The gpustack data dir volume mount is reserved and server-owned: it lives at
+# index 0 of ``volume_mounts``, the worker container always reads/writes its
+# data dir at DATA_DIR_MOUNT_PATH, and the entry always carries the reserved
+# name. Only the *host* path is the caller's to choose.
+#
+# Index 0 is the single locating rule, shared with the UI, which renders that
+# row with its name / mountPath / readOnly / source type locked and only the
+# host path editable. Nothing here searches the list for the data dir: one
+# definition of "which entry is it", asserted in both halves of the product.
+DATA_DIR_MOUNT_NAME = "gpustack-data-dir"
+DATA_DIR_MOUNT_PATH = "/var/lib/gpustack"
+# Host path the worker DaemonSet hardcoded before the mount became
+# configurable (v2.2.0). Clusters created back then hold their data here, so
+# it has to stay the default or an upgraded cluster would silently start over
+# on a fresh directory.
+DEFAULT_DATA_DIR_HOST_PATH = "/var/lib/gpustack"
+
+
+def claims_data_dir(volume_mount: K8sVolumeMount) -> bool:
+    """Whether a mount claims the reserved data dir, by name or mount path.
+
+    A *check*, not a locator: the data dir is always index 0. This answers two
+    questions about a submission — does the entry in the reserved slot actually
+    look like the data dir (rather than an unrelated mount the caller happened
+    to send first, which must not be silently rewritten into the data dir), and
+    is some other entry trying to claim the reserved name or path.
+    """
+    return (
+        volume_mount.name == DATA_DIR_MOUNT_NAME
+        or volume_mount.mount_path == DATA_DIR_MOUNT_PATH
+    )
+
+
+def mount_host_path(volume_mount: Optional[K8sVolumeMount]) -> Optional[str]:
+    """The host path a mount points at, or None if it isn't a hostPath mount."""
+    if volume_mount is None or volume_mount.volume_source is None:
+        return None
+    if volume_mount.volume_source.host_path is None:
+        return None
+    return volume_mount.volume_source.host_path.path or None
+
+
+def build_data_dir_mount(host_path: Optional[str] = None) -> K8sVolumeMount:
+    """The canonical data-dir mount for a host path."""
+    return K8sVolumeMount(
+        name=DATA_DIR_MOUNT_NAME,
+        mount_path=DATA_DIR_MOUNT_PATH,
+        read_only=False,
+        volume_source=VolumeSource(
+            host_path=HostPathVolumeSource(
+                path=host_path or DEFAULT_DATA_DIR_HOST_PATH,
+                type="DirectoryOrCreate",
+            )
+        ),
+    )
+
+
+def ensure_data_dir_mount(
+    volume_mounts: Optional[List[K8sVolumeMount]],
+) -> List[K8sVolumeMount]:
+    """Return the list with the reserved slot filled, defaulting the host path.
+
+    An empty list means the row predates the mount being configurable
+    (``volume_mounts`` did not exist before v2.2.0, and every write since then
+    goes through :func:`normalize_data_dir_mount`, so a non-empty list always
+    holds the data dir at index 0). This is the *render*-side backstop for such
+    a row: the DaemonSet template has no fallback of its own, so without this
+    it would render with no persistent data dir — worker data lost on every pod
+    restart, with nobody to report it to. A list that is already populated is
+    passed through untouched; rewriting stored values is the persist path's job.
+    """
+    mounts = list(volume_mounts or [])
+    if mounts:
+        return mounts
+    return [build_data_dir_mount()]
+
+
+def normalize_data_dir_mount(k8s_options: "K8sOptions") -> None:
+    """Rewrite the reserved slot of ``k8s_options.volume_mounts`` in place.
+
+    Index 0 is replaced with the canonical mount carrying its own host path:
+    name, mountPath, readOnly and the hostPath type are the server's, so
+    whatever the caller sent for them is dropped. The rest of the list is left
+    exactly as submitted — the caller's own mounts, in the caller's order.
+
+    Callers validate the slot first (the route layer refuses a submission whose
+    index 0 is missing, is not the data dir, or is not a hostPath mount), so an
+    absent host path falls back to :data:`DEFAULT_DATA_DIR_HOST_PATH` rather
+    than being an error here.
+    """
+    mounts = k8s_options.volume_mounts or []
+    k8s_options.volume_mounts = [
+        build_data_dir_mount(mount_host_path(mounts[0]) if mounts else None),
+        *mounts[1:],
+    ]
 
 
 class CloudOptions(BaseModel):

@@ -387,7 +387,7 @@ class VLLMServer(InferenceServer):
         env["RUNAI_STREAMER_LOG_LEVEL"] = env.pop("RUNAI_STREAMER_LOG_LEVEL", "INFO")
 
         # Persist the torch compile cache so repeated starts don't recompile.
-        self._set_cache_env(env)
+        self._set_cache_env(env, "VLLM_CACHE_ROOT", "vllm")
 
         # Apply LMCache environment variables if extended KV cache is enabled
         self._set_lmcache_env(env)
@@ -401,28 +401,6 @@ class VLLMServer(InferenceServer):
             self._set_ascend_env(env)
 
         return env
-
-    def _set_cache_env(self, env: Dict[str, str]):
-        """
-        Point VLLM_CACHE_ROOT at a persistent directory under gpustack's data dir
-        so the torch compile cache survives container restarts. The directory is
-        inherited by the inference container via gpustack-runtime's mirrored
-        deployment (worker's data-dir mount is replicated to the vLLM container).
-        """
-        if "VLLM_CACHE_ROOT" in env:
-            return
-        if not self._config or not self._config.cache_dir:
-            return
-        cache_dir = os.path.join(self._config.cache_dir, "vllm")
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-        except OSError as e:
-            logger.warning(
-                f"Failed to create vLLM cache dir {cache_dir}: {e}. "
-                "Torch compile cache will not be persisted."
-            )
-            return
-        env["VLLM_CACHE_ROOT"] = cache_dir
 
     def _set_lmcache_env(self, env: Dict[str, str]):
         """
@@ -794,7 +772,9 @@ class VLLMServer(InferenceServer):
         shapes based on the resolved topology:
 
         - ``dp_only``  → ``--data-parallel-*`` only; vLLM treats every node as
-          a DP engine head (no PP/TP spans nodes).
+          a DP engine head (no PP/TP spans nodes). Only followers carry
+          ``--data-parallel-start-rank``; on the leader it would select hybrid
+          LB instead of internal LB.
         - ``mp_only``  → ``--nnodes`` + ``--node-rank`` only; a single DP rank
           is spread across all nodes for cross-node TP/PP.
         - ``nested``   → both sets; vLLM derives node role internally via
@@ -830,9 +810,16 @@ class VLLMServer(InferenceServer):
         dp_rpc_port = str(self._model_instance.ports[1])
         master_port = str(self._model_instance.ports[2])
         if topology.shape == "dp_only":
+            # Since vLLM 0.28, --data-parallel-start-rank on the leader reads as
+            # an opt-in to hybrid LB, which then rejects the headless followers.
+            # The leader's DP rank is implicitly 0, so only followers send it.
+            if topology.start_rank > 0:
+                extend_args_no_exist(
+                    arguments,
+                    ("--data-parallel-start-rank", str(topology.start_rank)),
+                )
             extend_args_no_exist(
                 arguments,
-                ("--data-parallel-start-rank", str(topology.start_rank)),
                 ("--data-parallel-address", leader_ip),
                 ("--data-parallel-rpc-port", dp_rpc_port),
             )

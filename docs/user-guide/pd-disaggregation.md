@@ -68,6 +68,55 @@ inherits both. One image therefore carries your router beside the engine and
 dispatches on the role, which is the same work as naming it in two places
 without the second place to keep in sync.
 
+## SGLang request-rank routing
+
+!!! warning "Deferred development snapshot"
+
+    This integration is archived for future work and is not released support.
+    Downstream gateway contracts and real GPU KV transfer require validation
+    before resuming. Active branches retain endpoint-level PD routing.
+
+For SGLang 0.5.18, the managed Mooncake and NIXL recipes can route to individual
+request ranks behind each instance's single HTTP endpoint. Enable `--dp-aware`
+in the **router role's backend parameters**, then restart the whole deployment.
+This requires a runner containing `sglang-router 0.3.2+gpustack.dp1`. The router
+checks the installed package before starting and rejects an unpatched artifact.
+The published `0.3.2` wheel does not provide this PD dispatch contract.
+
+Set parallelism on the engine roles. Ordinary DP uses `--dp-size` for full
+model replicas; DPA uses `--dp-size` with `--enable-dp-attention` for attention
+groups within TP. Both layouts have one request-rank namespace. For example,
+ordinary `--tp 1 --dp 2` needs two GPUs per engine instance, while
+`--tp 4 --dp 2 --enable-dp-attention` needs four. P and D may have different
+DP sizes. A role-level backend parameter list replaces the deployment-level
+list; include all parallelism options needed by that role. The newer
+`--attn-dp-size` layout requires further engine and
+scheduler integration and is rejected by this opt-in path.
+
+GPUStack registers physical URLs and checks the gateway's complete `URL@rank`
+worker set, including roles and health. Logical rank URLs are never used as
+HTTP destinations. Removing an instance removes its entire rank group; ranks
+inside a shared DPA/EP group are not separate model instances.
+
+GPUStack also sets `SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1` on P
+and D. This lets the KV bootstrap use the selected P rank even when it differs
+from `bootstrap_room % P_DP`. Disabling this environment setting while enabling
+rank routing is rejected. Apply rank-routing changes with a whole-group restart
+so that the engines and router use matching configuration.
+
+P and D use independent policies. The default P `cache_aware` policy prefers
+cached prefixes; the default D `round_robin` policy can choose a different rank
+for repeated requests. For a stable session mapping, select `consistent_hashing`
+for the desired roles and send `X-SMG-Routing-Key` through the gateway. Stability
+depends on the key and available membership; it does not require equal P/D rank
+numbers. Removing `--dp-aware` restores endpoint-level routing.
+
+This integration has CPU contract coverage for registration, rank dispatch,
+streaming, affinity, and deletion. Validate actual rank execution and KV transfer
+on the selected GPU runner before accepting a deployment. vLLM IGW rank
+registration and vLLM external/hybrid deployment integration remain separate
+follow-up work.
+
 ## How a group starts
 
 The order is not incidental and is worth knowing, because it is what you will

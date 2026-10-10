@@ -38,6 +38,26 @@ from gpustack.worker.pd_injection import (
     PDInjectionError,
     render_pd_injection,
 )
+from tests.fixtures.pd_rank import model_with_ranks
+
+
+@pytest.mark.parametrize('role', ['prefill', 'decode'])
+@pytest.mark.parametrize('dpa', [False, True])
+def test_rank_routing_registers_actual_prefill_rank(role, dpa):
+    model = model_with_ranks(dpa=dpa)
+    injection = render_pd_injection(
+        model,
+        _instance(role, named_ports={'bootstrap': PortBand(base=41000, count=1)}),
+        _variables(),
+    )
+    assert injection.env['SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK'] == '1'
+
+
+def test_rank_bootstrap_cannot_be_disabled_by_an_env_override():
+    model = model_with_ranks()
+    model.roles[0].env = {'SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK': '0'}
+    with pytest.raises(PDInjectionError, match='requires'):
+        render_pd_injection(model, _instance(), _variables())
 
 
 def _model(mode=PDModeEnum.VLLM_NIXL, roles=None, **kwargs) -> Model:

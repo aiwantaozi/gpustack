@@ -543,12 +543,16 @@ modes:
         # given in vllm-nixl. This gateway's policy set is the vLLM fork's minus
         # consistent_hash and rendezvous_hash, plus `manual` (explicit routing
         # keys).
+        - flag: --dp-aware
+          description: >-
+            Route to individual request ranks. Requires the GPUStack-patched
+            gateway and matching P/D bootstrap configuration.
         - flag: --prefill-policy
           default: "cache_aware"
-          options: [random, round_robin, cache_aware, power_of_two, manual, bucket]
+          options: [random, round_robin, cache_aware, power_of_two, manual, bucket, consistent_hashing]
         - flag: --decode-policy
           default: "round_robin"
-          options: [random, round_robin, cache_aware, power_of_two, manual]
+          options: [random, round_robin, cache_aware, power_of_two, manual, consistent_hashing]
         # The same two values as vllm-nixl, and for the same reason:
         # `vllm-project/router` is a fork of this gateway, so its defaults are
         # this one's verbatim. Unlike that fork, here the breaker IS fed on the
@@ -600,6 +604,7 @@ modes:
         # upstream health-checks the peer before admitting it and drops it
         # silently on timeout.
         probe: GET /workers
+        rank_url_suffix: true
         body:
           bootstrap_port: "{{peer.ports.bootstrap}}"
         role_field: worker_type
@@ -680,12 +685,16 @@ modes:
       tunable_args:
         # Same policies, same values and same reasoning as sglang-mooncake: the
         # two recipes run the same router binary.
+        - flag: --dp-aware
+          description: >-
+            Route to individual request ranks. Requires the GPUStack-patched
+            gateway and matching P/D bootstrap configuration.
         - flag: --prefill-policy
           default: "cache_aware"
-          options: [random, round_robin, cache_aware, power_of_two, manual, bucket]
+          options: [random, round_robin, cache_aware, power_of_two, manual, bucket, consistent_hashing]
         - flag: --decode-policy
           default: "round_robin"
-          options: [random, round_robin, cache_aware, power_of_two, manual]
+          options: [random, round_robin, cache_aware, power_of_two, manual, consistent_hashing]
         - flag: --cb-failure-threshold
           default: "10"
           value_type: int
@@ -713,6 +722,7 @@ modes:
         add: POST /workers
         remove: DELETE /workers/{id}
         probe: GET /workers
+        rank_url_suffix: true
         body:
           bootstrap_port: "{{peer.ports.bootstrap}}"
         role_field: worker_type

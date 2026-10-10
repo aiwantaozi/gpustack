@@ -18,9 +18,16 @@ catalog entry keeps the router under `router:` and not under `roles:`.
 """
 
 import logging
+import shlex
 from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 from pydantic import BaseModel
+
+from gpustack.utils.pd_rank import (
+    SGLANG_DP_ROUTER_VERSION,
+    sglang_dp_aware,
+    sglang_request_rank_count,
+)
 
 from gpustack.schemas.pd_modes import (
     PDMode,
@@ -350,11 +357,24 @@ def apply_managed_router(
     if not (role and role.image_name):
         projected.image_name = plan.image
     if not (role and role.run_command):
-        # Joined rather than kept as a list because `run_command` is the field
-        # the custom backend reads, and it is a string there. The renderer
-        # produced already-separated tokens, so nothing here has to guess at
-        # quoting.
-        projected.run_command = " ".join(plan.command)
+        command = plan.command
+        if sglang_dp_aware(model):
+            for name in ('prefill', 'decode'):
+                sglang_request_rank_count(model, name)
+            # Check the installed artifact, since upstream and patched wheels
+            # can share the same public version while differing on PD dispatch.
+            check = (
+                'import importlib.metadata as m, runpy, sys; '
+                f'expected={SGLANG_DP_ROUTER_VERSION!r}; '
+                'actual=m.version("sglang-router"); '
+                'actual == expected or sys.exit('
+                '"DP-aware PD requires sglang-router " + expected + '
+                '"; installed " + actual); '
+                'sys.argv=["sglang_router.launch_router"]+sys.argv[1:]; '
+                'runpy.run_module("sglang_router.launch_router", run_name="__main__")'
+            )
+            command = ['python3', '-c', check] + command[3:]
+        projected.run_command = shlex.join(command)
     # Two different things arrive in this field and only one of them belongs
     # to the router.
     #

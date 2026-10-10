@@ -553,6 +553,11 @@ class PDMembershipAPI(BaseModel):
     the normal case; a non-empty list means the recipe's `command` must already
     carry them, and a mismatch is a catalog bug rather than a runtime one."""
 
+    rank_url_suffix: bool = False
+    """The probe exposes logical URL@rank workers for one physical endpoint.
+    Adds use the physical URL; deleting any rank ID must remove the entire
+    endpoint group. This requires a router with group deletion support."""
+
     @property
     def available(self) -> bool:
         """Whether scale-out can go through the API at all.

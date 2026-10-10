@@ -70,6 +70,11 @@ import aiohttp
 
 from gpustack.schemas.models import Model, ModelInstance, RoleNameEnum
 from gpustack.schemas.pd_modes import PDMembershipAPI, PDMode
+from gpustack.utils.pd_rank import (
+    sglang_dp_aware,
+    sglang_request_rank_count,
+    split_rank_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +145,7 @@ def member_url(instance: ModelInstance) -> Optional[str]:
 
 
 def desired_members(model: Model, instances: Sequence[ModelInstance]) -> Dict[str, str]:
-    """`{url: role}` for every member that should be in the router's registry.
+    """`{target: role}` for every physical or logical registry member.
 
     Only RUNNING GPU roles. The router is excluded because it is not its own
     upstream, and a member that is not RUNNING has nothing listening — adding
@@ -166,7 +171,11 @@ def desired_members(model: Model, instances: Sequence[ModelInstance]) -> Dict[st
             continue
         url = member_url(instance)
         if url:
-            members[url] = instance.role
+            if sglang_dp_aware(model):
+                for rank in range(sglang_request_rank_count(model, instance.role)):
+                    members[f"{url}@{rank}"] = instance.role
+            else:
+                members[url] = instance.role
     return members
 
 
@@ -211,6 +220,7 @@ class RegistryEntry(NamedTuple):
 
     role: str
     id: Optional[str] = None
+    healthy: Optional[bool] = None
 
 
 class RegistryRead(NamedTuple):
@@ -396,6 +406,7 @@ async def _read_registry(
         registry[str(peer)] = RegistryEntry(
             role=str(role or ""),
             id=str(member_id) if member_id else None,
+            healthy=row.get("is_healthy"),
         )
     return RegistryRead(entries=registry)
 
@@ -427,9 +438,14 @@ async def _add_missing(
     if add is None:
         return
     method, endpoint = add
-    for url, role in wanted.items():
-        if url in current:
+    added = set()
+    for target, role in wanted.items():
+        if target in current:
             continue
+        url = split_rank_url(target)[0] if api.rank_url_suffix else target
+        if url in added:
+            continue
+        added.add(url)
         try:
             async with client.request(
                 method,
@@ -457,23 +473,24 @@ async def _remove_stale(
 ) -> List[str]:
     """Drop members the group no longer has, and report what would not go.
 
-    A failure here is NOT fatal: upstream's removal gate is global -- it waits
-    for the in-flight count to reach zero -- so a member can legitimately
-    linger while traffic continues, and it takes no new requests meanwhile.
-    Parking a serving group in PARTIAL over such an entry would be worse.
-
-    The kept entries are returned rather than only logged, because that
-    leniency is what hides a broken call: an unencoded URL in the path gets
-    405 and the stale member stays, while the outcome still reads ok.
+    Rank workers are removed once per physical endpoint. The gateway resolves
+    any rank UUID to the entire group; the final read-back confirms removal.
+    Legacy endpoint routers may keep draining members without blocking service.
     """
     remove = _endpoint(api, base, api.remove)
     kept: List[str] = []
     if remove is None:
         return kept
     method, template = remove
+    wanted_endpoints = {
+        split_rank_url(url)[0] if api.rank_url_suffix else url for url in wanted
+    }
+    removed = set()
     for url, entry in current.items():
-        if url in wanted:
+        physical_url = split_rank_url(url)[0] if api.rank_url_suffix else url
+        if physical_url in wanted_endpoints or physical_url in removed:
             continue
+        removed.add(physical_url)
         # Percent-encoded, and that matters: on the routers that
         # key a member by its address, the member's id IS a URL, so
         # substituting it raw makes the path `/workers/http://host:port`,
@@ -510,6 +527,24 @@ async def _remove_stale(
     return kept
 
 
+def _unready_members(
+    api: PDMembershipAPI,
+    wanted: Dict[str, str],
+    current: Dict[str, RegistryEntry],
+) -> List[str]:
+    """Ranks must have the requested role and be healthy when reported."""
+    return sorted(
+        url
+        for url, role in wanted.items()
+        if url not in current
+        or (
+            api.role_field
+            and current[url].role != (api.role_values or {}).get(role, role)
+        )
+        or (split_rank_url(url)[1] is not None and current[url].healthy is not True)
+    )
+
+
 async def _await_registration(
     client: aiohttp.ClientSession,
     api: PDMembershipAPI,
@@ -532,7 +567,10 @@ async def _await_registration(
         read = await _read_registry(client, api, base, proxy=proxy, headers=headers)
         if read.absent or read.entries is None:
             return read
-        if not set(wanted) - set(read.entries):
+        unready = _unready_members(api, wanted, read.entries)
+        rank_aware = any(split_rank_url(url)[1] is not None for url in wanted)
+        stale = rank_aware and set(read.entries) - set(wanted)
+        if not unready and not stale:
             return read
         if asyncio.get_running_loop().time() >= deadline:
             return read
@@ -587,7 +625,10 @@ async def reconcile(  # noqa: C901
         )
 
     api = mode.router.membership_api
-    wanted = desired_members(model, instances)
+    try:
+        wanted = desired_members(model, instances)
+    except ValueError as e:
+        return MembershipOutcome(ok=False, reason=str(e))
     ports = desired_member_ports(instances)
     if not wanted:
         return MembershipOutcome(
@@ -623,6 +664,10 @@ async def reconcile(  # noqa: C901
                 client, api, base, proxy=proxy, headers=proxy_headers
             )
             if read.absent:
+                if sglang_dp_aware(model):
+                    return MembershipOutcome(
+                        ok=False, reason="DP-aware PD requires a readable rank registry"
+                    )
                 # This build serves no membership API, so its peers are the
                 # ones it was launched with and there is nothing to reconcile.
                 # Same answer as an undeclared API, for the same reason: the
@@ -651,17 +696,8 @@ async def reconcile(  # noqa: C901
                 headers=proxy_headers,
             )
 
-            # Stale entries are removed, and a failure to remove one is NOT
-            # fatal: upstream's removal gate is global (it waits for the
-            # in-flight count to reach zero), so a member can legitimately
-            # linger while traffic continues. Treating that as broken would
-            # park a serving group in PARTIAL over an entry that no longer
-            # takes new requests.
-            #
-            # That leniency is also what hides a broken call — an unencoded
-            # URL in the path gets 405 and the stale member stays, while the
-            # outcome still reads ok. So the failure is logged at INFO with the
-            # status, not swallowed: "lenient" has to still be visible.
+            # Rank-aware groups require stale targets to disappear before
+            # admission succeeds. Endpoint routers retain their draining tolerance.
             stale_kept = await _remove_stale(
                 client, api, base, wanted, current, proxy=proxy, headers=proxy_headers
             )
@@ -682,12 +718,12 @@ async def reconcile(  # noqa: C901
                     unreadable=True,
                     reason="the router's member list became unreadable",
                 )
-            missing = sorted(set(wanted) - set(final))
+            missing = _unready_members(api, wanted, final)
             if missing:
                 return MembershipOutcome(
                     ok=False,
                     reason=(
-                        "the router did not admit "
+                        "the router did not admit ready members "
                         f"{', '.join(missing)} within "
                         f"{int(_ADMISSION_WINDOW_SECONDS)}s — it health-checks "
                         "a peer before admitting it and drops it on timeout"
@@ -696,12 +732,10 @@ async def reconcile(  # noqa: C901
                 )
             extra = sorted(set(final) - set(wanted))
             if extra:
-                # Servable, so `ok` stays True — every wanted member is in.
-                # But the reason carries what did not leave, because a
-                # silently-lingering member is how the encoding bug above went
-                # unnoticed.
+                # Preserve legacy draining tolerance; rank-aware membership
+                # must exactly match the ready topology.
                 return MembershipOutcome(
-                    ok=True,
+                    ok=not sglang_dp_aware(model),
                     reason=(
                         "still registered after removal: "
                         f"{', '.join(stale_kept or extra)}"

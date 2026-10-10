@@ -25,6 +25,7 @@ from gpustack.server.pd_membership import (
     member_url,
     router_addresses,
 )
+from tests.fixtures.pd_rank import model_with_ranks
 
 
 def _instance(role, port, state=ModelInstanceStateEnum.RUNNING, ip="10.0.0.1"):
@@ -35,6 +36,170 @@ def _model():
     return SimpleNamespace(
         id=1, name="pd", disaggregation=SimpleNamespace(mode="vllm-nixl")
     )
+
+
+class RankRegistryClient:
+    """Model the gateway's async registration and physical-group deletion."""
+
+    def __init__(self, rows=None, admit=True, remove=True):
+        self.rows = list(rows or [])
+        self.admit = admit
+        self.remove = remove
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if method == 'POST' and self.admit:
+            body = kwargs['json']
+            size = 2 if body['worker_type'] == 'prefill' else 4
+            self.rows = [
+                row for row in self.rows if not row['url'].startswith(body['url'] + '@')
+            ]
+            self.rows.extend(
+                {
+                    'url': f"{body['url']}@{rank}",
+                    'id': f"{body['url']}@{rank}",
+                    'worker_type': body['worker_type'],
+                    'is_healthy': True,
+                }
+                for rank in range(size)
+            )
+        if method == 'DELETE' and self.remove:
+            from urllib.parse import unquote
+
+            worker_id = unquote(url.split('/workers/')[1])
+            physical, _ = pd_membership.split_rank_url(worker_id)
+            self.rows = [
+                row for row in self.rows if not row['url'].startswith(physical + '@')
+            ]
+
+        rows = list(self.rows)
+
+        class Response:
+            status = 200 if method == 'GET' else 202
+
+            async def json(self):
+                return {'workers': rows}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return Response()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dpa', [False, True])
+async def test_rank_registration_is_complete_and_idempotent(dpa):
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    model = model_with_ranks(dpa=dpa)
+    mode = get_pd_mode('sglang-mooncake')
+    instances = [_instance('prefill', 40010), _instance('decode', 40011)]
+    instances[0].named_ports = {'bootstrap': SimpleNamespace(base=41000)}
+    client = RankRegistryClient()
+    for _ in range(2):
+        outcome = await pd_membership.reconcile(
+            model, mode, instances, 'router:80', client=client
+        )
+        assert outcome.ok, outcome.reason
+        assert len(outcome.registered) == 6
+    adds = [kwargs['json'] for method, _, kwargs in client.calls if method == 'POST']
+    assert adds == [
+        {
+            'url': 'http://10.0.0.1:40010',
+            'worker_type': 'prefill',
+            'bootstrap_port': 41000,
+        },
+        {'url': 'http://10.0.0.1:40011', 'worker_type': 'decode'},
+    ]
+    assert not any(method == 'DELETE' for method, _, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_stale_rank_group_is_deleted_once_and_read_back():
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    client = RankRegistryClient(
+        [
+            {
+                'url': f'http://old:80@{rank}',
+                'id': f'http://old:80@{rank}',
+                'worker_type': 'prefill',
+                'is_healthy': True,
+            }
+            for rank in range(2)
+        ]
+    )
+    outcome = await pd_membership.reconcile(
+        model_with_ranks(),
+        get_pd_mode('sglang-mooncake'),
+        [_instance('prefill', 40010), _instance('decode', 40011)],
+        'router:80',
+        client=client,
+    )
+    assert outcome.ok, outcome.reason
+    assert sum(method == 'DELETE' for method, _, _ in client.calls) == 1
+    assert not any('old' in url for url in outcome.registered)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fault', ['missing', 'role', 'health', 'unknown_health', 'stale']
+)
+async def test_rank_registry_cannot_claim_ready_without_coverage(monkeypatch, fault):
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    model = model_with_ranks()
+    instances = [_instance('prefill', 40010), _instance('decode', 40011)]
+    rows = [
+        {'url': url, 'id': url, 'worker_type': role, 'is_healthy': True}
+        for url, role in desired_members(model, instances).items()
+    ]
+    if fault == 'missing':
+        rows.pop()
+    elif fault == 'role':
+        rows[0]['worker_type'] = 'decode'
+    elif fault == 'health':
+        rows[0]['is_healthy'] = False
+    elif fault == 'unknown_health':
+        rows[0].pop('is_healthy')
+    else:
+        rows.append({'url': 'http://old:80@0', 'id': 'old', 'worker_type': 'prefill'})
+    monkeypatch.setattr(pd_membership, '_ADMISSION_WINDOW_SECONDS', 0)
+    client = RankRegistryClient(rows, admit=False, remove=False)
+    outcome = await pd_membership.reconcile(
+        model, get_pd_mode('sglang-mooncake'), instances, 'router:80', client=client
+    )
+    assert not outcome.ok
+    assert outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_partial_rank_registration_is_repaired_without_duplicate_posts():
+    from gpustack.server.pd_mode_catalog import get_pd_mode
+
+    client = RankRegistryClient(
+        [
+            {
+                'url': 'http://10.0.0.1:40010@0',
+                'id': 'rank0',
+                'worker_type': 'prefill',
+                'is_healthy': True,
+            }
+        ]
+    )
+    outcome = await pd_membership.reconcile(
+        model_with_ranks(),
+        get_pd_mode('sglang-mooncake'),
+        [_instance('prefill', 40010), _instance('decode', 40011)],
+        'router:80',
+        client=client,
+    )
+    assert outcome.ok, outcome.reason
+    assert sum(method == 'POST' for method, _, _ in client.calls) == 2
 
 
 def test_only_running_gpu_roles_are_registered():

@@ -53,6 +53,7 @@ from gpustack.utils.vllm_topology import (
     validate_multinode_topology,
 )
 from gpustack.utils.template import render, render_values
+from gpustack.utils.pd_rank import sglang_dp_aware, sglang_request_rank_count
 from gpustack.worker.kv_transfer import KV_TRANSFER_CONFIG_FLAG
 
 logger = logging.getLogger(__name__)
@@ -355,6 +356,14 @@ def render_pd_injection(
     where = f"PD mode '{mode.name}' role '{role_name}'"
 
     env = dict(render_values(role.env, context) or {})
+    if sglang_dp_aware(model):
+        sglang_request_rank_count(model, role_name)
+        force_query = 'SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK'
+        override = (effective.env or {}).get(force_query, '1')
+        if str(override).lower() not in ('1', 'true'):
+            raise PDInjectionError(f'{where} requires {force_query}=1 for rank routing')
+        # Register the actual prefill rank even when it differs from room % DP.
+        env[force_query] = '1'
     _apply_kv_lease_env(mode, env, where)
 
     args = [render(token, context, context=f"{where} args") for token in role.args]

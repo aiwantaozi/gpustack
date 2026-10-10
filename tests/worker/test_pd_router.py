@@ -20,6 +20,8 @@ The properties pinned here are the ones whose absence produces a router that
 
 import pytest
 
+from tests.fixtures.pd_rank import model_with_ranks
+
 from gpustack.server.pd_mode_catalog import get_pd_mode, load_pd_modes
 from gpustack.schemas.pd_modes import (
     PDMode,
@@ -34,6 +36,42 @@ from gpustack.worker.pd_router import (
 )
 
 load_pd_modes()
+
+
+@pytest.mark.parametrize(
+    'installed,accepted',
+    [('0.3.2', False), ('0.2.2', False), ('0.3.2+gpustack.dp1', True)],
+)
+def test_rank_router_checks_installed_artifact(monkeypatch, installed, accepted):
+    import importlib.metadata
+    import runpy
+    import shlex
+    import sys
+
+    from gpustack.worker.pd_router import apply_managed_router
+
+    model = model_with_ranks()
+    peers = {
+        'prefill': [PeerAddress('host', 80, {'bootstrap': 41000})],
+        'decode': [PeerAddress('host', 81)],
+    }
+    projected = apply_managed_router(model, 'router', peers=peers, variables=VARIABLES)
+    argv = shlex.split(projected.run_command)
+    assert argv[:2] == ['python3', '-c']
+    called = []
+    monkeypatch.setattr(importlib.metadata, 'version', lambda _: installed)
+    monkeypatch.setattr(runpy, 'run_module', lambda *a, **kw: called.append((a, kw)))
+    monkeypatch.setattr(sys, 'argv', ['-c'] + argv[3:] + projected.backend_parameters)
+    if accepted:
+        exec(argv[2], {})
+        assert len(called) == 1
+        assert '--dp-aware' in sys.argv
+        assert 'http://host:80' in sys.argv
+    else:
+        with pytest.raises(SystemExit, match='DP-aware PD requires'):
+            exec(argv[2], {})
+        assert not called
+
 
 VARIABLES = {
     "worker_ip": "192.168.50.15",

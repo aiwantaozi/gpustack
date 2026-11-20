@@ -27,8 +27,8 @@ from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack.schemas import Principal
 from gpustack.schemas.common import PaginatedList, Pagination
 from gpustack.schemas.config import (
+    ClusterWorkerConfig,
     ModelInstanceProxyModeEnum,
-    PredefinedConfigNoDefaults,
     parse_base_model_to_env_vars,
 )
 from gpustack.api.tenant import (
@@ -444,7 +444,7 @@ def apply_shuihua_defaults(
     if input.worker_config is None:
         if not isinstance(input, ClusterCreate):
             return
-        input.worker_config = PredefinedConfigNoDefaults(proxy_mode=fallback)
+        input.worker_config = ClusterWorkerConfig(proxy_mode=fallback)
         return
     if input.worker_config.proxy_mode is None:
         input.worker_config.proxy_mode = fallback
@@ -453,7 +453,7 @@ def apply_shuihua_defaults(
 def _post_update_worker_config(
     input: Union[ClusterCreate, ClusterUpdate],
     existing: Optional[Cluster] = None,
-) -> Optional[PredefinedConfigNoDefaults]:
+) -> Optional[ClusterWorkerConfig]:
     """
     The worker_config once the update lands.
 

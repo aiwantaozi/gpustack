@@ -28,6 +28,11 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from gpustack.server.cache_service_resources import load_resource_view
+from gpustack.server.pd_network import (
+    kv_transfer_ifname_from_settings,
+    model_kv_transfer_ifnames_stale,
+)
+from gpustack.utils.pd_network import uses_kv_transfer_ifname
 from gpustack.schemas.models import DistributedServers
 from gpustack.utils.vllm_topology import vllm_lb_mode, manual_dp_enabled
 from gpustack.config.config import (
@@ -2387,9 +2392,12 @@ async def model_members_stale(
         instances: The deployment's current instance records to compare.
 
     Returns:
-        True if a stamped member differs from the current configuration, False
-        if all stamped members match, or None if no member has a stamp.
+        True if the placement's KV interfaces or a member's recorded spec
+        differ from the current configuration, False if all stamped members
+        match, or None if no member has a stamp.
     """
+    if await model_kv_transfer_ifnames_stale(session, model, instances):
+        return True
     digested = [i for i in instances if i.spec_digest]
     if not digested:
         return None
@@ -5749,8 +5757,11 @@ class WorkerController:
             or bool(address_changes)
             or event.type == EventType.DELETED
         )
+        kv_transfer_changed = "kv_transfer_ifname" in (
+            changed_fields or {}
+        ) or _kv_transfer_setting_changed(event, "status")
 
-        if not should_notify_parents and not should_notify_children:
+        if not (should_notify_parents or should_notify_children or kv_transfer_changed):
             return
         async with async_session() as session:
             if should_notify_parents and worker.worker_pool_id is not None:
@@ -5787,7 +5798,7 @@ class WorkerController:
                         ),
                     )
 
-            if should_notify_children:
+            if should_notify_children or kv_transfer_changed:
                 instances = await ModelInstance.all_by_fields(
                     session,
                     fields={"cluster_id": worker.cluster_id, "deleted_at": None},
@@ -5829,6 +5840,10 @@ class WorkerController:
                 if proxy_mode_changed is not None:
                     worker_changed_fields["worker_proxy_mode"] = proxy_mode_changed
                 for model in models:
+                    if not should_notify_children and not uses_kv_transfer_ifname(
+                        model
+                    ):
+                        continue
                     copied_model = Model(**model.model_dump())
                     await event_bus.publish(
                         copied_model.__class__.__name__.lower(),
@@ -7247,6 +7262,7 @@ class ClusterController:
         Reconcile the cluster state.
         """
         await self._sync_cluster_state(event)
+        await _notify_cluster_kv_transfer_change(event)
         if self._disable_gateway:
             return
         await self._ensure_worker_mcp_bridge(event)
@@ -7319,6 +7335,33 @@ def _changed_scalar(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return value[0] if value else None
     return value
+
+
+def _kv_transfer_setting_changed(event: Event, field: str) -> bool:
+    before, after = (event.changed_fields or {}).get(field, (None, None))
+    return kv_transfer_ifname_from_settings(
+        _changed_scalar(before)
+    ) != kv_transfer_ifname_from_settings(_changed_scalar(after))
+
+
+async def _notify_cluster_kv_transfer_change(event: Event) -> None:
+    if event.type != EventType.UPDATED or not _kv_transfer_setting_changed(
+        event, "worker_config"
+    ):
+        return
+    cluster_id = resolve_event_id(event)
+    if cluster_id is None:
+        return
+    async with async_session() as session:
+        models = await Model.all_by_fields(
+            session, fields={"cluster_id": cluster_id, "deleted_at": None}
+        )
+        for model in models:
+            if uses_kv_transfer_ifname(model):
+                await event_bus.publish(
+                    Model.__name__.lower(),
+                    Event(type=EventType.UPDATED, data=Model(**model.model_dump())),
+                )
 
 
 async def notify_model_ai_proxy_change(

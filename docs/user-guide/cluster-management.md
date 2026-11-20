@@ -324,6 +324,7 @@ image_name_override: "gpustack/gpustack:main"
 image_repo: "gpustack/gpustack"
 # ========= service & networking ===========
 worker_ifname: en0
+# kv_transfer_ifname: "ens5f0"
 worker_port: 10150
 worker_metrics_port: 10151
 disable_worker_metrics: false
@@ -342,6 +343,8 @@ insecure_tls: false
 ```
 
 The above YAML lists all currently supported options for the `Worker Configuration YAML`. For the meaning of each option, refer to the full GPUStack [config file documentation](../cli-reference/start.md#config-file). The `proxy_mode` option controls how the server reaches the worker — see [Worker Connection Modes](#worker-connection-modes).
+
+`kv_transfer_ifname` sets the cluster default for [NIXL KV transfer](pd-disaggregation.md#the-kv-transfer-interface). Use **Edit Worker** to select a local device on nodes with different interface names.
 
 `container_namespace` replaces the default `gpustack` namespace for GPUStack's default worker, runner, and runtime images. For example, with the cluster's `Default Container Registry` set to `registry.example.com` and `container_namespace: gpustack-ai`, the default worker image resolves to `registry.example.com/gpustack-ai/gpustack:<version>`, while runner and runtime images resolve under `registry.example.com/gpustack-ai/runner` and `registry.example.com/gpustack-ai/runtime`. An explicit `image_name_override` takes precedence over this setting. An explicit cluster `image_repo` overrides it for the worker image only; runner and runtime images continue to use `container_namespace`.
 

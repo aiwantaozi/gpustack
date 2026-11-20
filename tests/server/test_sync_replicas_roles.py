@@ -193,6 +193,7 @@ async def _run(model, instances, instance_type_snapshot=None, worker_ips=None):
     recorder = _Recorder()
     if worker_ips is None:
         worker_ips = {1: "10.0.0.1"}
+    workers = [SimpleNamespace(id=id_, ip=ip) for id_, ip in worker_ips.items()]
     matched = (
         [SimpleNamespace(snapshot=instance_type_snapshot)]
         if instance_type_snapshot
@@ -238,11 +239,14 @@ async def _run(model, instances, instance_type_snapshot=None, worker_ips=None):
         patch("gpustack.server.controllers.ModelInstanceService", recorder),
         patch(
             "gpustack.schemas.workers.Worker.all_by_field",
-            AsyncMock(
-                return_value=[
-                    SimpleNamespace(id=id_, ip=ip) for id_, ip in worker_ips.items()
-                ]
-            ),
+            AsyncMock(return_value=workers),
+        ),
+        patch(
+            "gpustack.schemas.workers.Worker.all_by_ids",
+            AsyncMock(return_value=workers),
+        ),
+        patch(
+            "gpustack.schemas.clusters.Cluster.one_by_id", AsyncMock(return_value=None)
         ),
         # Soft scale-down marks the surplus instead of deleting it, and the
         # mark is a row write. Recorded rather than performed, for the same

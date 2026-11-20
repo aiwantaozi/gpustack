@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -107,6 +108,11 @@ from gpustack.scheduler.calculator import (
     check_diffusers_model_index_from_workers,
 )
 from gpustack.server.cache_services import resolve_instance_cache_config_safe
+from gpustack.server.pd_network import (
+    configured_worker_kv_transfer_ifnames,
+    kv_transfer_ifnames_changed,
+    kv_transfer_members,
+)
 from gpustack.validation.pd.parameters import DIFFER
 from gpustack.validation.pd.environment import (
     PDPairingError,
@@ -452,7 +458,9 @@ class Scheduler:
             admission = await _lock_scheduling_admission(
                 session, model, group_instances, by_instance, instances=model_instances
             )
-            locked = list(admission.values()) if admission is not None else None
+            locked = (
+                list(admission.instances.values()) if admission is not None else None
+            )
         if locked is None:
             logger.debug(
                 "Group placement was fenced by a concurrent lifecycle or Worker change "
@@ -631,6 +639,12 @@ _MANAGED_WORKER_MESSAGE = (
 )
 
 
+@dataclass
+class _SchedulingAdmission:
+    instances: Dict[int, ModelInstance]
+    kv_transfer_ifnames: Optional[Dict[str, Optional[str]]] = None
+
+
 def _model_cohort(instances, model_id):
     return [row for row in instances if getattr(row, 'model_id', None) == model_id]
 
@@ -705,13 +719,20 @@ async def _lock_scheduling_admission(
     worker_ids = set(candidate_ids)
     if required:
         worker_ids |= _cohort_worker_ids(discovery)
+    group_ids = {row.group_id for row in expected if row.group_id is not None}
+    tracked = kv_transfer_members(
+        model, [row for row in discovery if row.group_id in group_ids]
+    )
+    locked_worker_ids = worker_ids | _cohort_worker_ids(tracked)
     workers = await Worker.all_by_ids(
-        session, worker_ids, for_update=True, refresh=True
+        session, locked_worker_ids, for_update=True, refresh=True
     )
     indexed = {worker.id: worker for worker in workers}
-    if set(indexed) != worker_ids or any(
-        not _worker_admitted(w, model, required, require_ready=w.id in candidate_ids)
-        for w in workers
+    if any(
+        not _worker_admitted(
+            indexed.get(wid), model, required, require_ready=wid in candidate_ids
+        )
+        for wid in worker_ids
     ):
         await session.rollback()
         return None
@@ -724,9 +745,9 @@ async def _lock_scheduling_admission(
         (required and not _cohort_worker_ids(current).issubset(worker_ids))
         or any(
             not _worker_admitted(
-                w, model, required, require_ready=w.id in candidate_ids
+                indexed[wid], model, required, require_ready=wid in candidate_ids
             )
-            for w in workers
+            for wid in worker_ids
         )
         or any(
             identity not in rows
@@ -741,13 +762,30 @@ async def _lock_scheduling_admission(
     ):
         await session.rollback()
         return None
+    tracked = kv_transfer_members(
+        model, [row for row in current if row.group_id in group_ids]
+    )
+    configured = None
+    if tracked:
+        if not _cohort_worker_ids(tracked).issubset(locked_worker_ids):
+            await session.rollback()
+            return None
+        configured = await configured_worker_kv_transfer_ifnames(
+            session, model.cluster_id, workers
+        )
+        if kv_transfer_ifnames_changed(tracked, workers, configured):
+            await session.rollback()
+            return None
     for candidate in candidates.values():
         candidate.worker = indexed[candidate.worker.id]
         for subordinate in candidate.subordinate_workers or []:
             worker = indexed[subordinate.worker_id]
             subordinate.worker_name, subordinate.worker_ip = worker.name, worker.ip
             subordinate.worker_ifname = worker.ifname
-    return {identity: rows[identity] for identity in identities}
+    return _SchedulingAdmission(
+        instances={identity: rows[identity] for identity in identities},
+        kv_transfer_ifnames=configured,
+    )
 
 
 async def _lock_scheduling_instances(session, expected):
@@ -779,7 +817,7 @@ async def apply_candidate_to_instance(
     candidate: ModelInstanceScheduleCandidate,
     *,
     commit: bool = True,
-    admission: Optional[Dict[int, ModelInstance]] = None,
+    admission: Optional[_SchedulingAdmission] = None,
 ) -> bool:
     """Write a chosen candidate onto its instance row.
 
@@ -799,9 +837,9 @@ async def apply_candidate_to_instance(
         )
         if admission is None:
             return False
-    if model_instance.id not in admission:
+    if model_instance.id not in admission.instances:
         return False
-    model_instance = admission[model_instance.id]
+    model_instance = admission.instances[model_instance.id]
     # Recovery retires a registered manifest before its allocation can change.
     if (
         model_instance.draining_since is not None
@@ -816,6 +854,15 @@ async def apply_candidate_to_instance(
     model_instance.worker_ip = candidate.worker.ip
     model_instance.worker_advertise_address = candidate.worker.advertise_address
     model_instance.worker_ifname = candidate.worker.ifname
+    model_instance.kv_transfer_ifnames = (
+        {
+            str(worker_id): admission.kv_transfer_ifnames[str(worker_id)]
+            for worker_id in member_worker_ids(candidate)
+        }
+        if admission.kv_transfer_ifnames is not None
+        and kv_transfer_members(model, [model_instance])
+        else None
+    )
     model_instance.computed_resource_claim = candidate.computed_resource_claim
     model_instance.gpu_type = candidate.gpu_type
     model_instance.gpu_indexes = candidate.gpu_indexes

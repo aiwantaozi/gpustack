@@ -6,6 +6,7 @@ import pytest
 
 from gpustack.schemas.cache_services import CacheServiceStateEnum
 from gpustack.schemas.models import (
+    DisaggregationSpec,
     DistributedServerCoordinateModeEnum,
     DistributedServers,
     ModelInstanceSubordinateWorker,
@@ -16,6 +17,7 @@ from gpustack.schemas.models import (
     ModelInstanceWorkload,
     ModelInstanceComponent,
     ComputedResourceClaim,
+    PDModeEnum,
 )
 from gpustack.schemas.workers import Maintenance, Worker, WorkerStateEnum
 from gpustack.server.bus import Event, EventType, Subscriber
@@ -1229,7 +1231,9 @@ async def test_worker_delete_locks_worker_before_instances_and_invalidates_after
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('field', ['ip', 'unreachable', 'proxy_address'])
+@pytest.mark.parametrize(
+    'field', ['ip', 'unreachable', 'proxy_address', 'kv_transfer_ifname']
+)
 @pytest.mark.parametrize('matched', [False, True])
 async def test_worker_notifications_load_models_only_for_matched_instances(
     managed_worker, field, matched
@@ -1237,6 +1241,8 @@ async def test_worker_notifications_load_models_only_for_matched_instances(
     s = managed_worker
     instance = s.instance
     model = new_model(instance.model_id, 'affected', huggingface_repo_id='org/model')
+    if field == 'kv_transfer_ifname':
+        model.disaggregation = DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL)
     unrelated = new_model_instance(99, 'unrelated', 999, worker_id=99)
     duplicate = new_model_instance(2, 'same-model', model.id, worker_id=s.sub.id)
     instances = [unrelated] + ([instance, duplicate] if matched else [])
@@ -1267,7 +1273,7 @@ async def test_worker_notifications_load_models_only_for_matched_instances(
     # The direct notification only carries the synthetic ``worker_*``
     # fields; an `unreachable` flip rides the bare model event through
     # the Model controller instead of notifying twice.
-    assert notify.await_count == int(matched and field != 'unreachable')
+    assert notify.await_count == int(matched and field in ('ip', 'proxy_address'))
 
 
 @pytest.mark.asyncio

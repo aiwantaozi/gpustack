@@ -7,19 +7,32 @@ instead of a newer one. That write is deliberate, and it is not a config
 change — but it moves the digest, which is what `stale` compares.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gpustack.schemas.models import (
     BackendEnum,
+    DisaggregationSpec,
+    DistributedServers,
     Model,
     ModelInstance,
+    ModelInstanceSubordinateWorker,
     ModelInstanceStateEnum,
+    PDModeEnum,
     RoleSpec,
     SourceEnum,
 )
-from gpustack.server.controllers import model_members_stale, model_spec_digest
+from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.workers import Worker
+from gpustack.server.bus import Event, EventType
+from gpustack.server.controllers import (
+    ClusterController,
+    model_members_stale,
+    model_spec_digest,
+)
+from tests.utils.mock import mock_async_session
 
 
 def _model(**kwargs) -> Model:
@@ -75,6 +88,107 @@ def _pass():
 async def _digest(model, **kwargs):
     with _no_types:
         return await model_spec_digest(_pass(), model, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'snapshot, cluster_value, worker_value, manual_value, expected',
+    [
+        ({'1': 'eth0', '2': 'eth0'}, 'eth0', None, None, False),
+        ({'1': 'eth0', '2': 'eth0'}, 'eth1', None, None, True),
+        ({'1': 'eth0', '2': 'eth0'}, 'eth0', 'eth1', None, True),
+        ({'1': 'eth0', '2': 'eth0'}, 'eth1', None, 'eth2', False),
+        (None, None, None, None, False),
+        (None, 'eth1', None, None, True),
+    ],
+)
+async def test_nixl_effective_interfaces_detect_deployment_changes(
+    monkeypatch, snapshot, cluster_value, worker_value, manual_value, expected
+):
+    model = _model(
+        cluster_id=1,
+        disaggregation=DisaggregationSpec(mode=PDModeEnum.SGLANG_NIXL),
+        env={'UCX_NET_DEVICES': manual_value} if manual_value else None,
+    )
+    instance = ModelInstance(
+        id=1,
+        name='decode',
+        model_id=1,
+        model_name='m',
+        spec_digest=await _digest(model),
+        state=ModelInstanceStateEnum.RUNNING,
+        group_id='g',
+        role='decode',
+        worker_id=1,
+        kv_transfer_ifnames=snapshot,
+        distributed_servers=DistributedServers(
+            subordinate_workers=[ModelInstanceSubordinateWorker(worker_id=2)]
+        ),
+    )
+    monkeypatch.setattr(
+        Cluster,
+        'one_by_id',
+        AsyncMock(
+            return_value=SimpleNamespace(
+                worker_config=SimpleNamespace(kv_transfer_ifname=cluster_value)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        Worker,
+        'all_by_ids',
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id=1, status=SimpleNamespace(kv_transfer_ifname='eth0')
+                ),
+                SimpleNamespace(id=2, status=None, kv_transfer_ifname=worker_value),
+            ]
+        ),
+    )
+    with _no_types:
+        assert await model_members_stale(_pass(), model, [instance]) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('same_device', [False, True])
+async def test_cluster_default_change_notifies_only_nixl_models(same_device):
+    controller = object.__new__(ClusterController)
+    controller._disable_gateway = True
+    controller._sync_cluster_state = AsyncMock()
+    model = _model(
+        cluster_id=1, disaggregation=DisaggregationSpec(mode=PDModeEnum.SGLANG_NIXL)
+    )
+    unrelated = _model(cluster_id=1)
+    unrelated.id = 2
+    default = 'eth0' if same_device else 'eth1'
+    event = Event(
+        type=EventType.UPDATED,
+        data=SimpleNamespace(id=1),
+        changed_fields={
+            'worker_config': (
+                (SimpleNamespace(kv_transfer_ifname='eth0'),),
+                (SimpleNamespace(kv_transfer_ifname=default),),
+            )
+        },
+    )
+    with (
+        patch(
+            'gpustack.server.controllers.async_session',
+            return_value=mock_async_session(),
+        ),
+        patch.object(
+            Model, 'all_by_fields', AsyncMock(return_value=[model, unrelated])
+        ),
+        patch('gpustack.server.controllers.event_bus.publish', AsyncMock()) as publish,
+    ):
+        await controller._reconcile(event)
+
+    if same_device:
+        publish.assert_not_awaited()
+    else:
+        publish.assert_awaited_once()
+        assert publish.await_args.args[1].data.id == model.id
 
 
 async def _stale(model, instances):

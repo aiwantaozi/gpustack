@@ -1268,6 +1268,10 @@ async def create_model_instance(
         raise BadRequestException(
             message="Managed workloads are initialized by the Server"
         )
+    if model_instance_in.kv_transfer_ifnames is not None:
+        raise BadRequestException(
+            message="KV transfer interface placement is server-owned"
+        )
     try:
         model_instance = await ModelInstance.create(session, model_instance_in)
     except Exception as e:
@@ -1978,6 +1982,15 @@ async def _update_model_instance(session, ctx, id, model_instance_in):
                 session, model_instance, ctx, model_instance_in
             )
     else:
+        if "kv_transfer_ifnames" in model_instance_in.model_fields_set:
+            if (
+                model_instance_in.kv_transfer_ifnames
+                != model_instance.kv_transfer_ifnames
+            ):
+                raise ConflictException(
+                    message="KV transfer interface placement is server-owned"
+                )
+            model_instance_in.model_fields_set.discard("kv_transfer_ifnames")
         _preserve_download_state(model_instance, model_instance_in)
         legacy = False
         if requires_group_recovery(model_instance):

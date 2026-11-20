@@ -31,6 +31,7 @@ from gpustack.schemas.models import (
     PortBand,
     RoleSpec,
     SourceEnum,
+    role_effective_model,
 )
 from gpustack.utils.template import deployment_variables
 from gpustack.worker.pd_injection import (
@@ -101,6 +102,153 @@ def _connector(injection):
     """The rendered `--kv-transfer-config` document."""
     assert KV_TRANSFER_CONFIG_FLAG in injection.args
     return json.loads(injection.args[injection.args.index(KV_TRANSFER_CONFIG_FLAG) + 1])
+
+
+@pytest.fixture
+def render_worker_pd(monkeypatch):
+    from gpustack.worker import net_device
+    from gpustack.worker.backends.base import InferenceServer
+
+    monkeypatch.setattr(net_device, "candidate_kv_interfaces", lambda: ["eth0", "eth1"])
+    monkeypatch.setattr(
+        net_device.psutil,
+        "net_if_stats",
+        lambda: {
+            name: types.SimpleNamespace(isup=True)
+            for name in ("node-kv", "local-kv", "cluster-kv", "assigned-kv")
+        },
+    )
+
+    def render(*, worker_value=None, local_value=None, cluster_value=None, **kwargs):
+        model = kwargs.get("model") or _model()
+        instance = _instance(kwargs.get("role", "prefill"))
+        if "assignments" in kwargs:
+            instance = instance.model_copy(
+                update={"kv_transfer_ifnames": kwargs["assignments"]}
+            )
+
+        def variables(**overrides):
+            values = _variables(role=instance.role)
+            values.pop("net_device")
+            values.update(overrides)
+            return values
+
+        fake = types.SimpleNamespace(
+            _worker=types.SimpleNamespace(
+                id=2,
+                name="worker-b",
+                ifname="eth0",
+                kv_transfer_ifname=worker_value,
+                cluster_kv_transfer_ifname=cluster_value,
+            ),
+            _config=types.SimpleNamespace(kv_transfer_ifname=local_value),
+            _model_spec=model,
+            _model=role_effective_model(model, instance.role),
+            _model_instance=instance,
+            _pd_injection_resolved=False,
+            _resolve_image=lambda **_kw: (None, None),
+            _engine_inference_backend=lambda _spec: None,
+            _template_variables=variables,
+        )
+        fake._net_device_plane = lambda: InferenceServer._net_device_plane(fake)
+        fake._pd_template_variables = lambda: InferenceServer._pd_template_variables(
+            fake
+        )
+        return InferenceServer._pd_injection(fake)
+
+    return render
+
+
+@pytest.mark.parametrize(
+    "node,local,cluster,expected",
+    [
+        ("node-kv", "local-kv", "cluster-kv", "node-kv"),
+        (None, "local-kv", "cluster-kv", "local-kv"),
+        (None, " ", "cluster-kv", "cluster-kv"),
+    ],
+)
+def test_worker_kv_interface_sources_reach_nixl(
+    render_worker_pd, node, local, cluster, expected
+):
+    launch = render_worker_pd(
+        worker_value=node, local_value=local, cluster_value=cluster
+    )
+    assert launch.env["UCX_NET_DEVICES"] == expected
+
+
+def test_nixl_uses_the_local_workers_assigned_device(render_worker_pd):
+    launch = render_worker_pd(
+        role="decode",
+        worker_value="node-kv",
+        local_value="local-kv",
+        assignments={"1": "another-kv", "2": "assigned-kv"},
+    )
+    assert launch.env["UCX_NET_DEVICES"] == "assigned-kv"
+
+
+def test_nixl_assignment_for_automatic_selection_ignores_later_explicit_values(
+    render_worker_pd,
+):
+    with pytest.raises(PDInjectionError, match="net_device"):
+        render_worker_pd(local_value="local-kv", assignments={"2": None})
+
+
+def test_nixl_refuses_a_missing_configured_device(render_worker_pd):
+    with pytest.raises(PDInjectionError, match="missing-kv.*worker-b"):
+        render_worker_pd(worker_value="missing-kv", local_value="local-kv")
+
+
+def test_nixl_accepts_active_rdma_ports_and_refuses_a_down_port(
+    render_worker_pd, monkeypatch, tmp_path
+):
+    from gpustack.worker import net_device
+
+    monkeypatch.setattr(net_device, "_RDMA_SYSFS", tmp_path)
+    port_states = [
+        tmp_path / hca / "ports" / "1" / "state" for hca in ("mlx5_0", "mlx5_1")
+    ]
+    for state in port_states:
+        state.parent.mkdir(parents=True)
+        state.write_text("4: ACTIVE\n")
+
+    device = "mlx5_0:1,mlx5_1:1"
+    assert render_worker_pd(cluster_value=device).env["UCX_NET_DEVICES"] == device
+
+    port_states[1].write_text("1: DOWN\n")
+    with pytest.raises(PDInjectionError, match="mlx5_1:1.*worker-b"):
+        render_worker_pd(cluster_value=device)
+
+
+def test_nixl_rejects_a_nonliteral_assignment_before_probing_rdma(
+    render_worker_pd, monkeypatch, tmp_path
+):
+    from gpustack.worker import net_device
+
+    monkeypatch.setattr(net_device, "_RDMA_SYSFS", tmp_path)
+    state = tmp_path / "test" / "adapter" / "ports" / "1" / "state"
+    state.parent.mkdir(parents=True)
+    state.write_text("4: ACTIVE\n")
+    with pytest.raises(PDInjectionError, match="Invalid KV transfer device"):
+        render_worker_pd(assignments={"2": "test/adapter:1"})
+
+
+def test_model_env_can_supply_the_nixl_device_on_a_multi_nic_worker(render_worker_pd):
+    launch = render_worker_pd(model=_model(env={"UCX_NET_DEVICES": "custom-kv"}))
+    assert launch.env["UCX_NET_DEVICES"] == "custom-kv"
+
+
+def test_role_env_still_owns_the_nixl_device_when_worker_settings_change(
+    render_worker_pd,
+):
+    model = _model(
+        roles=[
+            RoleSpec(name="prefill", replicas=1, env={"UCX_NET_DEVICES": "role-kv"}),
+            RoleSpec(name="decode", replicas=1),
+        ],
+        env={"UCX_NET_DEVICES": "model-kv"},
+    )
+    launch = render_worker_pd(model=model, worker_value="missing-kv")
+    assert launch.env["UCX_NET_DEVICES"] == "role-kv"
 
 
 def test_vllm_nixl_prefill_renders_the_whole_launch():

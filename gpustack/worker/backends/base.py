@@ -77,6 +77,7 @@ from gpustack.utils.model_instance_workers import (
 )
 from gpustack.utils.config import apply_registry_override_to_image
 from gpustack.utils.envs import filter_env_vars
+from gpustack.utils.pd_network import uses_kv_transfer_ifname
 from gpustack.utils.template import deployment_variables, render, render_values
 from gpustack.utils.hub import get_pretrained_config
 from gpustack.utils.model_config import (
@@ -88,7 +89,11 @@ from gpustack.utils.profiling import time_decorator
 from gpustack.utils import platform
 from gpustack.utils.version import pick_runtime_version
 from gpustack.utils.runtime import transform_workload_plan
-from gpustack.worker.pd_injection import PDInjection, render_pd_injection
+from gpustack.worker.pd_injection import (
+    PDInjection,
+    PDInjectionError,
+    render_pd_injection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -871,11 +876,37 @@ class InferenceServer(ABC):
             # Imported where it is used: only a PD member ever needs a
             # `{{net_device}}` value, and every other backend start on this
             # worker should be unaffected by whether this module resolves.
-            from gpustack.worker.net_device import derive_net_device
-
-            net_device = derive_net_device(
-                self._worker, self._config, self._net_device_plane()
+            from gpustack.worker.net_device import (
+                derive_net_device,
+                resolve_kv_transfer_ifname,
             )
+
+            model = self._model_spec or getattr(self, "_model", None)
+            instance = getattr(self, "_model_instance", None)
+            if uses_kv_transfer_ifname(model) and getattr(instance, "role", None) in (
+                "prefill",
+                "decode",
+            ):
+                env = getattr(self._model, "env", None) or {}
+                manual_device = env.get("UCX_NET_DEVICES", "").strip()
+                if manual_device:
+                    net_device = render(
+                        manual_device,
+                        self._template_variables(),
+                        context="env UCX_NET_DEVICES",
+                    )
+                else:
+                    net_device = resolve_kv_transfer_ifname(
+                        self._worker,
+                        self._config,
+                        getattr(instance, "kv_transfer_ifnames", None),
+                    )
+            else:
+                net_device = derive_net_device(
+                    self._worker, self._config, self._net_device_plane()
+                )
+        except PDInjectionError:
+            raise
         except Exception as e:
             # Named for the placeholder rather than for what rides it. The
             # plane is the mode's to declare: on a `control` recipe the NIC

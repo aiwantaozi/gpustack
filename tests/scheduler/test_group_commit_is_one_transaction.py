@@ -14,13 +14,20 @@ import pytest
 
 from gpustack.schemas.models import (
     ComputedResourceClaim,
+    DisaggregationSpec,
     DistributedServers,
     Model,
     ModelInstance,
+    ModelInstanceSubordinateWorker,
     ModelInstanceWorkload,
+    PDModeEnum,
     SourceEnum,
 )
-from gpustack.scheduler.scheduler import apply_candidate_to_instance
+from gpustack.schemas.clusters import Cluster
+from gpustack.scheduler.scheduler import (
+    _SchedulingAdmission,
+    apply_candidate_to_instance,
+)
 from tests.utils.model import new_model_instance_workload
 
 
@@ -99,7 +106,7 @@ async def test_a_group_member_is_written_but_not_committed_on_its_own():
             instance,
             _candidate(),
             commit=False,
-            admission={instance.id: instance},
+            admission=_SchedulingAdmission({instance.id: instance}),
         )
 
     service.return_value.update.assert_not_awaited()
@@ -121,7 +128,7 @@ async def test_candidate_writeback_preserves_manifest(workloads):
         instance,
         _candidate(),
         commit=False,
-        admission={instance.id: instance},
+        admission=_SchedulingAdmission({instance.id: instance}),
     )
     assert instance.distributed_servers.workloads == expected
 
@@ -142,7 +149,7 @@ async def test_candidate_cannot_replace_a_registered_workload_allocation(state):
         instance,
         _candidate(),
         commit=False,
-        admission={instance.id: instance},
+        admission=_SchedulingAdmission({instance.id: instance}),
     )
     assert not accepted
     assert instance.model_dump() == before
@@ -157,7 +164,7 @@ async def test_scheduling_does_not_enable_managed_workloads():
         instance,
         _candidate(),
         commit=False,
-        admission={instance.id: instance},
+        admission=_SchedulingAdmission({instance.id: instance}),
     )
     assert instance.distributed_servers.workloads is None
 
@@ -347,6 +354,59 @@ def managed_admission(monkeypatch):
         lambda session: SimpleNamespace(update=state.write, batch_update=state.batch),
     )
     return state
+
+
+@pytest.mark.asyncio
+async def test_nixl_assignment_records_each_selected_workers_interface(
+    managed_admission, monkeypatch
+):
+    s = managed_admission
+    s.model.disaggregation = DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL)
+    s.target.role = 'prefill'
+    s.target.group_id = 'g'
+    s.candidate.worker.kv_transfer_ifname = 'ens2'
+    s.candidate.worker.status = SimpleNamespace(kv_transfer_ifname='eth0')
+    s.workers[8] = _registered_worker(8)
+    s.candidate.subordinate_workers = [ModelInstanceSubordinateWorker(worker_id=8)]
+    monkeypatch.setattr(
+        Cluster,
+        'one_by_id',
+        AsyncMock(
+            return_value=SimpleNamespace(
+                worker_config=SimpleNamespace(kv_transfer_ifname='eth1')
+            )
+        ),
+    )
+
+    assert await apply_candidate_to_instance(s.session, s.model, s.target, s.candidate)
+    assert s.target.kv_transfer_ifnames == {'7': 'ens2', '8': 'eth1'}
+
+
+@pytest.mark.asyncio
+async def test_nixl_scale_out_waits_for_restart_when_peer_selection_changed(
+    managed_admission, monkeypatch
+):
+    s = managed_admission
+    s.model.disaggregation = DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL)
+    s.target.role = 'prefill'
+    s.target.group_id = 'g'
+    peer = s.target.model_copy(update={'id': 2, 'worker_id': 8, 'role': 'decode'})
+    s.discovery = s.current = [s.target, peer]
+    s.workers[8] = _registered_worker(8)
+    monkeypatch.setattr(
+        Cluster,
+        'one_by_id',
+        AsyncMock(
+            return_value=SimpleNamespace(
+                worker_config=SimpleNamespace(kv_transfer_ifname='eth1')
+            )
+        ),
+    )
+
+    assert not await apply_candidate_to_instance(
+        s.session, s.model, s.target, s.candidate
+    )
+    s.write.assert_not_awaited()
 
 
 @pytest.mark.asyncio

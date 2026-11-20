@@ -1,15 +1,20 @@
 import ipaddress
 import logging
 import socket
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import psutil
 
 from gpustack.config.config import Config
+from gpustack.schemas.config import normalize_kv_transfer_ifname
 from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import Worker, WorkerPublic
+from gpustack.utils.pd_network import effective_kv_transfer_ifname
+from gpustack.worker.pd_injection import PDInjectionError
 
 logger = logging.getLogger(__name__)
+_RDMA_SYSFS = Path("/sys/class/infiniband")
 
 
 # Interfaces that exist only to move packets between namespaces on this host.
@@ -135,6 +140,8 @@ def derive_net_device(
     worker: Worker,
     config: Config,
     plane: PDNetDevicePlaneEnum = PDNetDevicePlaneEnum.DATA,
+    *,
+    use_startup_config: bool = True,
 ) -> Optional[str]:
     """The value of ``{{net_device}}``: the NIC this recipe's ``plane`` rides.
 
@@ -151,9 +158,9 @@ def derive_net_device(
     the platform already knows — or mistype it, which on Ascend puts
     ``HCCL_IF_IP`` on a NIC that does not hold it.
 
-    ``kv_transfer_ifname`` still wins on both planes. It is the per-worker escape hatch,
-    and a plane that could bypass it would make setting it a no-op exactly
-    where an operator went to the trouble of answering.
+    The startup value applies on both planes. A placement that selected
+    automatic detection calls this with ``use_startup_config=False`` to keep
+    the decision made for that placement.
 
     Do NOT invent a value when this returns ``None``. The renderer leaves an
     unresolved placeholder as-is and logs a WARNING, which is diagnosable;
@@ -209,7 +216,7 @@ def derive_net_device(
     # created with "" as a placeholder before the worker ever reports in, so
     # emptiness -- not absence -- is what marks "unknown" on both sources.
     kv_transfer_ifname = (config.kv_transfer_ifname or "").strip()
-    if kv_transfer_ifname:
+    if use_startup_config and kv_transfer_ifname:
         return kv_transfer_ifname
 
     worker_name = worker.name or "<unknown>"
@@ -268,3 +275,62 @@ def derive_net_device(
         worker_name,
     )
     return None
+
+
+def _kv_device_is_available(device: str) -> bool:
+    hca, separator, port = device.partition(":")
+    if not separator:
+        interface = psutil.net_if_stats().get(device)
+        return interface is not None and interface.isup
+    try:
+        return (
+            (_RDMA_SYSFS / hca / "ports" / port / "state").read_text().startswith("4:")
+        )
+    except OSError:
+        return False
+
+
+def resolve_kv_transfer_ifname(
+    worker: WorkerPublic,
+    config: Config,
+    assignments: Optional[Dict[str, Optional[str]]],
+) -> Optional[str]:
+    """Use the local placement's KV device, or resolve an unpinned launch."""
+    local_value = (config.kv_transfer_ifname or "").strip()
+    if assignments is None:
+        device = effective_kv_transfer_ifname(
+            getattr(worker, "kv_transfer_ifname", None),
+            local_value,
+            getattr(worker, "cluster_kv_transfer_ifname", None),
+        )
+    else:
+        key = str(worker.id)
+        if key not in assignments:
+            raise PDInjectionError(
+                f"The PD placement has no KV transfer interface assignment for worker "
+                f"{worker.name}."
+            )
+        device = assignments[key]
+
+    if device is None:
+        return derive_net_device(worker, config, use_startup_config=False)
+    if device != local_value:
+        # A placement can also have captured a legacy, unvalidated startup value.
+        # Validate the literal before making any RDMA sysfs path with it.
+        try:
+            device = normalize_kv_transfer_ifname(device)
+        except ValueError as error:
+            raise PDInjectionError(
+                f"Invalid KV transfer device on worker {worker.name}. {error}"
+            ) from error
+        if device is None:
+            return derive_net_device(worker, config, use_startup_config=False)
+        unavailable = [
+            name for name in device.split(",") if not _kv_device_is_available(name)
+        ]
+        if unavailable:
+            raise PDInjectionError(
+                f"KV transfer device(s) {', '.join(unavailable)} are unavailable on "
+                f"worker {worker.name}. Check its KV Transfer Interface or cluster default."
+            )
+    return device

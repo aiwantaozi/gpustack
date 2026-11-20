@@ -32,6 +32,7 @@ from .clusters import ClusterProvider, Cluster, WorkerPool
 if TYPE_CHECKING:
     from gpustack.schemas.principals import Principal
 from gpustack.schemas.config import (
+    KVTransferIfname,
     PredefinedConfigNoDefaults,
     ModelInstanceProxyModeEnum,
 )
@@ -314,8 +315,8 @@ class WorkerStatus(SystemInfo):
     here with a non-null `ifname` there means derived; non-null means the
     operator is still typing it in.
 
-    A worker-local setting, and deliberately not promoted to a cluster-wide
-    one: see `Config.kv_transfer_ifname` for why a NIC name must not be broadcast.
+    The startup value stays separate from the server's Worker override and
+    cluster default.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -383,11 +384,7 @@ class WorkerLabelsUpdate(BaseModel):
     labels: Dict[str, str]
 
 
-class WorkerUpdate(SQLModel):
-    """
-    WorkerUpdate: updatable fields for Worker
-    """
-
+class _WorkerEditableFields(SQLModel):
     name: str = Field(index=True, unique=True)
     labels: Dict[str, str] = Field(sa_column=Column(JSON), default={})
     maintenance: Optional[Maintenance] = Field(
@@ -396,7 +393,11 @@ class WorkerUpdate(SQLModel):
     )
 
 
-class WorkerCreate(WorkerStatusStored, WorkerUpdate):
+class WorkerUpdate(_WorkerEditableFields):
+    kv_transfer_ifname: KVTransferIfname = None
+
+
+class WorkerCreate(WorkerStatusStored, _WorkerEditableFields):
     cluster_id: Optional[int] = Field(
         sa_column=Column(Integer, ForeignKey("clusters.id"), nullable=False),
         default=None,
@@ -416,6 +417,9 @@ class WorkerCreate(WorkerStatusStored, WorkerUpdate):
 
 
 class WorkerBase(WorkerCreate):
+    kv_transfer_ifname: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     state: WorkerStateEnum = WorkerStateEnum.NOT_READY
     heartbeat_time: Optional[datetime] = Field(
         sa_column=Column(UTCDateTime), default=None
@@ -625,6 +629,7 @@ class WorkerPublic(
     updated_at: datetime
     me: Optional[bool] = None  # Indicates if the worker is the current worker
     provision_progress: Optional[str] = None  # Indicates the provisioning progress
+    cluster_kv_transfer_ifname: Optional[str] = None
 
     worker_uuid: Optional[str] = Field(default=None, exclude=True)
     machine_id: Optional[str] = Field(default=None, exclude=True)

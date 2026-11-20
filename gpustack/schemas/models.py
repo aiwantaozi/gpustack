@@ -2210,6 +2210,13 @@ class ModelInstanceBase(SQLModel, ModelSource):
     worker_advertise_address: Optional[str] = None
     worker_ip: Optional[str] = None
     worker_ifname: Optional[str] = None
+    kv_transfer_ifnames: Optional[Dict[str, Optional[str]]] = Field(
+        sa_column=Column(JSON, nullable=True), default=None
+    )
+    """NIXL interface settings at placement, keyed by Worker ID.
+
+    A null device selects automatic detection.
+    """
     pid: Optional[int] = None
     # FIXME: Migrate to ports.
     port: Optional[int] = None

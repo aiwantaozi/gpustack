@@ -205,6 +205,7 @@ async def test_update_rejects_binding_changes(api, fields):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_report", [False, True])
 async def test_update_accepts_unchanged_or_omitted_binding(api, full_report):
+    api.instance.kv_transfer_ifnames = {'7': 'eth0'}
     if full_report:
         api.ctx.user.kind = PrincipalType.SYSTEM
         api.ctx.scoped_cluster_id = 1
@@ -220,6 +221,7 @@ async def test_update_accepts_unchanged_or_omitted_binding(api, full_report):
     assert response.json()["owner_principal_id"] == 10
     assert response.json()["cluster_id"] == 1
     assert response.json()["state"] == "error"
+    assert response.json()["kv_transfer_ifnames"] == {'7': 'eth0'}
     api.update.assert_awaited_once()
     api.save.assert_awaited_once()
 
@@ -229,6 +231,15 @@ async def test_update_rejects_other_tenants_instance(api):
     api.instance.owner_principal_id = 20
     response = await _request(api, "PUT", owner_principal_id=10)
     assert response.status_code == 404
+    api.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['POST', 'PUT'])
+async def test_instance_writes_cannot_forge_kv_interface_selection(api, method):
+    response = await _request(api, method, kv_transfer_ifnames={'7': 'eth1'})
+    assert response.status_code == (400 if method == 'POST' else 409)
+    api.create.assert_not_awaited()
     api.update.assert_not_awaited()
 
 

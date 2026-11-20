@@ -24,7 +24,7 @@ from gpustack.schemas.clusters import (
     K8sOptions,
     build_data_dir_mount,
 )
-from gpustack.schemas.config import PredefinedConfigNoDefaults
+from gpustack.schemas.config import ClusterWorkerConfig
 from gpustack.schemas.principals import OrgRole, PrincipalType
 from gpustack.server.bus import Event, EventType
 from gpustack.server.db import get_session
@@ -51,7 +51,7 @@ def cluster():
         created_at=now,
         updated_at=now,
         registration_token="private-registration-token",
-        worker_config=PredefinedConfigNoDefaults(
+        worker_config=ClusterWorkerConfig(
             huggingface_token="private-hf-token", debug=False
         ),
         k8s_options=K8sOptions(

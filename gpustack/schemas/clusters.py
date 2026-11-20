@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING
 
 from gpustack.schemas.config import (
     SensitivePredefinedConfig,
-    PredefinedConfigNoDefaults,
-    PredefinedConfigPublic,
+    ClusterWorkerConfig,
+    ClusterWorkerConfigPublic,
 )
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import (
@@ -916,11 +916,11 @@ class ClusterUpdate(SQLModel):
     system_default_container_registry: Optional[str] = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
-    worker_config: Optional[PredefinedConfigNoDefaults] = Field(
+    worker_config: Optional[ClusterWorkerConfig] = Field(
         default=None,
         sa_column=Column(
             pydantic_column_type(
-                PredefinedConfigNoDefaults,
+                ClusterWorkerConfig,
                 exclude_none=True,
                 exclude_unset=True,
                 exclude_defaults=True,
@@ -1177,7 +1177,7 @@ class ClusterPublic(ClusterBase, PublicFields):
     ready_workers: int = Field(default=0)
     gpus: int = Field(default=0)
     models: int = Field(default=0)
-    worker_config: Optional[PredefinedConfigPublic] = Field(default=None)
+    worker_config: Optional[ClusterWorkerConfigPublic] = Field(default=None)
     k8s_options: Optional[K8sOptionsPublic] = Field(default=None)
 
 

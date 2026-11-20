@@ -1,6 +1,15 @@
+import re
 from enum import Enum
-from typing import Optional
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from typing import Annotated, Optional
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from gpustack import __benchmark_runner_version__
 
@@ -137,6 +146,49 @@ class PredefinedConfigPublic(PredefinedConfigNoDefaults):
 
     model_config = ConfigDict(from_attributes=True)
     huggingface_token: Optional[SecretStr] = None
+
+
+_KV_TRANSFER_DEVICE = re.compile(r"([A-Za-z0-9_.-]+)(:[1-9][0-9]*)?")
+
+
+def normalize_kv_transfer_ifname(value: Optional[str]) -> Optional[str]:
+    if value is None or not value.strip():
+        return None
+
+    devices = [device.strip() for device in value.split(",")]
+    for device in devices:
+        match = _KV_TRANSFER_DEVICE.fullmatch(device)
+        if (
+            match is None
+            or match[1] in {".", ".."}
+            or (match[2] is None and (len(devices) > 1 or match[1].lower() == "all"))
+        ):
+            raise ValueError(
+                "Specify one network interface or a comma-separated list of RDMA HCA ports."
+            )
+    return ",".join(devices)
+
+
+KVTransferIfname = Annotated[
+    Optional[str], AfterValidator(normalize_kv_transfer_ifname)
+]
+
+
+class ClusterWorkerConfig(PredefinedConfigNoDefaults):
+    """Cluster defaults, including settings consumed only by the server."""
+
+    kv_transfer_ifname: KVTransferIfname = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_predefined_config(cls, value: object) -> object:
+        if isinstance(value, PredefinedConfigNoDefaults) and not isinstance(value, cls):
+            return value.model_dump(exclude_unset=True)
+        return value
+
+
+class ClusterWorkerConfigPublic(PredefinedConfigPublic):
+    kv_transfer_ifname: KVTransferIfname = None
 
 
 def parse_base_model_to_env_vars(

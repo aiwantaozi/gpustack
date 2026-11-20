@@ -320,17 +320,20 @@ bridge (`docker0`, `br-*`, `flannel.1`) and advertise an address the peer cannot
 reach — which fails as a connector error at handshake time, not as a
 configuration error.
 
-GPUStack derives the interface per worker:
+For built-in vLLM and SGLang NIXL, GPUStack resolves each worker's KV interface
+in this order.
 
-- **One routable interface** — it is used. Nothing to configure.
-- **Several routable interfaces** — GPUStack refuses to guess. Set
-  `--kv-transfer-ifname` (or the `kv_transfer_ifname` worker config key, or
-  `GPUSTACK_KV_TRANSFER_IFNAME`) on that worker to the interface carrying KV traffic. The
-  worker log lists the candidates it found.
+1. **KV Transfer Interface** in **Edit Worker**.
+2. The worker startup setting (`--kv-transfer-ifname`,
+   `GPUSTACK_KV_TRANSFER_IFNAME`, or `kv_transfer_ifname` in its local YAML).
+3. `kv_transfer_ifname` in the cluster's **Worker Configuration** YAML.
+4. Automatic detection. A worker with several candidate interfaces reports them
+   in its log and requires an explicit choice.
 
-Set it explicitly on any machine with more than one fabric — a management NIC
-plus an RDMA NIC is the common case, and the management NIC is almost never the
-right answer.
+Use a Linux interface name such as `ens5f0` for TCP. For RDMA, use the local
+HCA and port, such as `mlx5_2:1`, or a comma-separated list of RDMA ports.
+Worker and cluster edits apply to newly deployed instances without restarting
+workers. Restart the affected PD deployment to apply a change to running instances.
 
 ### Ports
 

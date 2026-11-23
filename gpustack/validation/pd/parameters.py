@@ -172,68 +172,6 @@ def compare_max_model_len(
     return verdict, prefill_len, decode_len
 
 
-def selector_spans_workers(role) -> bool:
-    """Whether this role's own pin puts one replica on more than one machine.
-
-    Told apart from "not pinned at all", which `selector_cards_per_replica`
-    cannot do -- both answer None there, and a caller that reads None as
-    "nothing was said" will happily substitute a number of its own. For a
-    distributed member that number is wrong by construction: the world size is
-    split into tp and pp much further down the vLLM path, and a guess made here
-    lands in a descriptor the engine then contradicts.
-
-    False for an unpinned role, which is the ordinary case and says nothing
-    either way.
-    """
-    selector = getattr(role, "gpu_selector", None)
-    gpu_ids = getattr(selector, "gpu_ids", None) if selector is not None else None
-    if not gpu_ids:
-        return False
-    # "worker_name:device:index" -- more than one worker name and the member is
-    # distributed, so the card count is not the world size.
-    return len({str(gpu_id).rsplit(":", 2)[0] for gpu_id in gpu_ids}) > 1
-
-
-def selector_cards_per_replica(role) -> Optional[int]:
-    """How many cards one replica of this role is pinned to, when the pin is
-    unambiguous about it.
-
-    Read off the role's **own** `gpu_selector` and never the Model's. A
-    model-level selector is the pool the whole deployment draws from; dividing
-    it by one role's replica count would invent a per-role number, and invent
-    the same one for the other role.
-
-    Deliberately silent unless the count is exact, because everything this
-    feeds is a refusal.
-
-    `gpus_per_replica` is the authority when it is set, because that is the
-    field `_set_gpu_count` reads. When it is not, the count is `len(gpu_ids)`
-    and *not* `len(gpu_ids) // replicas`: the division belongs to
-    `set_model_gpus_per_replica`, which runs on the Model and deliberately does
-    not reach a role's projection, so a role's selector is read whole. Rather
-    than reproduce that asymmetry this answers only for a single-replica role,
-    where the two readings coincide and no arithmetic is being guessed at.
-
-    A pin spread over several workers is silent for a different reason: that is
-    a distributed member, and `cal_distributed_parallelism_arguments` splits its
-    world size into tp and pp much further down the vLLM path.
-    """
-    if selector_spans_workers(role):
-        return None
-
-    selector = getattr(role, "gpu_selector", None)
-    gpu_ids = getattr(selector, "gpu_ids", None) if selector is not None else None
-    if not gpu_ids:
-        return None
-
-    per_replica = getattr(selector, "gpus_per_replica", None)
-    if not per_replica:
-        if (getattr(role, "replicas", None) or 1) != 1:
-            return None
-        per_replica = len(gpu_ids)
-    return per_replica if per_replica >= 1 else None
-
-
 def _same(left: Optional[str], right: Optional[str]) -> bool:
     if left is None or right is None:
         return False

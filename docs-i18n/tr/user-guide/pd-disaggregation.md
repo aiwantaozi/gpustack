@@ -237,7 +237,7 @@ Varsayılan aralık **64 bağlantı noktası** içerir; bu çoğu dağıtım iç
 
 ## Kısıtlamalar { #constraints }
 
-Tensör paralelliği topolojisini çıkarım motoru ve KV bağlayıcısı doğrular.
+Desteklenen tensör paralelliği topolojileri çıkarım motorunun sürümüne, modele ve KV bağlayıcısına bağlıdır. Uyumsuz bir topoloji başlatma veya KV aktarımı sırasında hata verebilir. Her iki rol başladıktan sonra bir çıkarım isteği gönderin ve Decode rolünün uzak KV verisini aldığını doğrulayın.
 
 Yanlış yanıtlar sunan bir grup oluşturacak yapılandırma, çalışma zamanından ziyade kaydetme zamanında reddedilir:
 

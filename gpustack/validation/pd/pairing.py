@@ -110,7 +110,8 @@ def validate_role_pairing(  # noqa: C901
     """Reject provably incompatible parameter and environment configurations.
 
     Context lengths must agree even when the engine handshake accepts them.
-    The inference engine and its connector validate the parallel topology.
+    The engine and its connector check the parallel topology at startup or
+    during KV transfer.
     Unknown effective values of pairing factors are reported through
     ``pairing_unverified``.
 

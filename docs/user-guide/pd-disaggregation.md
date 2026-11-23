@@ -384,7 +384,11 @@ consumes nine of them. If you run several such members per host, widen
 
 ## Constraints
 
-The inference engine and its KV connector validate the tensor-parallel topology.
+Supported tensor-parallel topologies depend on the engine version, model, and KV
+connector. An unsupported topology can fail at startup or during KV transfer.
+After both roles start, send an inference request and confirm that Decode
+receives remote KV.
+
 GPUStack checks these settings when saving a deployment.
 
 - **Prefill and decode must declare the same context length.** No engine checks

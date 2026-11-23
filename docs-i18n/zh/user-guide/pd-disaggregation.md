@@ -237,7 +237,7 @@ NVIDIA Mooncake 要求推理镜像中包含其 transfer-engine 运行时和 RDMA
 
 ## 约束 { #constraints }
 
-张量并行拓扑由推理引擎及其 KV connector 校验。
+推理引擎版本、模型和 KV connector 决定支持哪些张量并行拓扑。不兼容的配置可能在启动时或传输 KV 时出错。两侧启动后，发起推理请求并确认 Decode 收到了远端 KV。
 
 可能导致组返回错误答案的配置，会在保存时被拒绝，而非等到运行时：
 
